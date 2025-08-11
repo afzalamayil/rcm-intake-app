@@ -101,7 +101,7 @@ UI_BRAND = st.secrets.get("ui", {}).get("brand", "")
 
 with st.sidebar:
     if os.path.exists(LOGO_PATH):
-        st.image(LOGO_PATH, use_column_width=True)
+        st.image(LOGO_PATH, use_container_width=True)
     if UI_BRAND:
         st.success(f"👋 {UI_BRAND}")
 
@@ -243,7 +243,7 @@ def build_authenticator():
 
 
 authenticator = build_authenticator()
-name, authentication_status, username = authenticator.login("Login", "sidebar")
+name, authentication_status, username = authenticator.login(location="sidebar", fields={"Form name":"Login","Username":"Username","Password":"Password","Login":"Login"})
 
 if not authentication_status:
     if authentication_status is False:
