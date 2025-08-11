@@ -1,0 +1,6 @@
+streamlit
+gspread
+google-auth
+pandas
+openpyxl
+streamlit-authenticator==0.3.1
