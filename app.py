@@ -1,21 +1,16 @@
-
 # ─────────────────────────────────────────────────────────────────────────────
-# File: app.py  (Streamlit — Option B: Free, low‑code stack)
+# File: app.py  — Streamlit (Option B) — RITE TECH BRANDED
 # ─────────────────────────────────────────────────────────────────────────────
-# Features
-# - Auth with roles (Super Admin / Admin / User) via streamlit-authenticator
-# - Client scoping: users only see/add data for Client IDs they’re allowed
-# - Master data (Pharmacies, Insurance, Submission Mode, Portal, Status) editable in-app
-# - Mandatory, validated intake form with dropdowns
-# - Google Sheets storage (service account)
-# - Export filtered data to Excel
-# - Email report (SMTP, e.g., Gmail App Password) + WhatsApp share links (free, no API)
-# - Bulk import/update Insurance masters from Excel (optional)
-# - ClientContacts mapping to auto-fill email recipients per ClientID
+# What’s new in this branded build
+# - Uses your transparent logo at assets/logo.png for page icon, header, and sidebar
+# - Theme colors pulled from your logo (primary #0c496f)
+# - Everything else unchanged: roles, client scoping, masters admin, email, WhatsApp, bulk import
 #
-# NOTE (Free constraints): Automated WhatsApp sending isn’t possible on Streamlit Cloud
-# without a paid API. We provide one-click WhatsApp share links with a prefilled message.
-# Email sending uses SMTP credentials you add to Streamlit `secrets`.
+# Folders expected in your repo:
+#   assets/logo.png
+#   .streamlit/config.toml  (theme)
+#
+# Tip: Create both folders directly in GitHub (Add file → Create new file) if you don’t want to upload a ZIP.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import io
@@ -40,15 +35,27 @@ from email.mime.text import MIMEText
 from email import encoders
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Config
+# Branding
 # ─────────────────────────────────────────────────────────────────────────────
+LOGO_PATH = "assets/logo.png"
+PAGE_ICON = LOGO_PATH if os.path.exists(LOGO_PATH) else "📋"
+
 st.set_page_config(
     page_title="RCM Intake (Option B)",
-    page_icon="📋",
+    page_icon=PAGE_ICON,
     layout="wide"
 )
 
-st.title("📋 RCM Intake — Streamlit (Option B)")
+# Header with logo + title
+try:
+    col_logo, col_title = st.columns([1, 8], vertical_alignment="center")
+except TypeError:
+    # Streamlit <1.33 compatibility (no vertical_alignment)
+    col_logo, col_title = st.columns([1, 8])
+if os.path.exists(LOGO_PATH):
+    col_logo.image(LOGO_PATH, use_column_width=True)
+col_title.markdown("### RCM Intake — Streamlit (Option B)")
+
 st.caption("Free stack: Streamlit Cloud + Google Sheets. Email via SMTP. WhatsApp via share links.")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -69,11 +76,13 @@ st.caption("Free stack: Streamlit Cloud + Google Sheets. Email via SMTP. WhatsAp
 # 
 # [gsheets]
 # spreadsheet_name = "RCM_Intake_DB"
-# # Paste service account JSON fields as strings (no newlines)
 # type = "service_account"
 # project_id = "..."
 # private_key_id = "..."
-# private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+# private_key = "-----BEGIN PRIVATE KEY-----
+...
+-----END PRIVATE KEY-----
+"
 # client_email = "...@...gserviceaccount.com"
 # client_id = "..."
 # auth_uri = "https://accounts.google.com/o/oauth2/auth"
@@ -82,12 +91,10 @@ st.caption("Free stack: Streamlit Cloud + Google Sheets. Email via SMTP. WhatsAp
 # client_x509_cert_url = "..."
 # 
 # [roles]
-# # Map usernames to role and allowed client IDs if not using Users sheet
 # mapping = "{}"
 # 
 # [ui]
-# brand = "Al Afiah Healthcare Services"
-
+# brand = "RiteTech Solutions"
 
 AUTH_SECRETS = st.secrets.get("auth", {})
 SMTP_SECRETS = st.secrets.get("smtp", {})
@@ -95,10 +102,13 @@ GS_SECRETS = st.secrets.get("gsheets", {})
 ROLE_MAP_JSON = st.secrets.get("roles", {}).get("mapping", "{}")
 UI_BRAND = st.secrets.get("ui", {}).get("brand", "")
 
-if UI_BRAND:
-    st.sidebar.success(f"👋 {UI_BRAND}")
+with st.sidebar:
+    if os.path.exists(LOGO_PATH):
+        st.image(LOGO_PATH, use_column_width=True)
+    if UI_BRAND:
+        st.success(f"👋 {UI_BRAND}")
 
-# Google cred
+# Google credentials
 REQUIRED_GS_KEYS = [
     "type","project_id","private_key_id","private_key","client_email","client_id",
     "auth_uri","token_uri","auth_provider_x509_cert_url","client_x509_cert_url"
@@ -119,10 +129,7 @@ if not missing_gs:
     try:
         sh = gc.open(SPREADSHEET_NAME)
     except gspread.SpreadsheetNotFound:
-        # Create with default tabs if missing
         sh = gc.create(SPREADSHEET_NAME)
-        # ⚠️ Optional: share with a human Google account if needed
-        # sh.share("youremail@domain.com", perm_type="user", role="writer")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sheet Tabs
@@ -136,21 +143,19 @@ MS_SUBMISSION_MODE = "SubmissionMode"
 MS_PORTAL = "Portal"
 MS_STATUS = "Status"
 MS_REMARKS = "Remarks"  # optional
-CLIENTS_TAB = "Clients"
+CLIENTS_TAB = "Clients"  # list of client IDs & names
 CLIENT_CONTACTS_TAB = "ClientContacts"  # ClientID | To | CC
 
-DEFAULT_TABS = [DATA_TAB, USERS_TAB, MASTERS_TAB, MS_PHARM, MS_INSURANCE,
-                MS_SUBMISSION_MODE, MS_PORTAL, MS_STATUS, MS_REMARKS,
-                CLIENTS_TAB, CLIENT_CONTACTS_TAB]
-
-def ws(title):
-    return sh.worksheet(title)
+DEFAULT_TABS = [DATA_TAB, USERS_TAB, MASTERS_TAB, MS_PHARM, MS_INSURANCE, MS_SUBMISSION_MODE, MS_PORTAL, MS_STATUS, MS_REMARKS, CLIENTS_TAB, CLIENT_CONTACTS_TAB]
 
 if not missing_gs:
     existing_titles = [ws.title for ws in sh.worksheets()]
     for t in DEFAULT_TABS:
         if t not in existing_titles:
             sh.add_worksheet(title=t, rows=200, cols=26)
+
+def ws(title):
+    return sh.worksheet(title)
 
 # Ensure headers for Data
 DATA_HEADERS = [
@@ -170,7 +175,7 @@ if not missing_gs:
     if not cur:
         wsd.insert_row(DATA_HEADERS, 1)
 
-# Ensure minimal masters
+# Preload basic masters
 DEFAULT_MASTER_VALUES = {
     MS_SUBMISSION_MODE: ["Walk-in", "Phone", "Email", "Portal"],
     MS_PORTAL: ["DHPO", "Riayati", "Insurance Portal"],
@@ -187,6 +192,7 @@ if not missing_gs:
 # ─────────────────────────────────────────────────────────────────────────────
 # Role + Client mapping
 # ─────────────────────────────────────────────────────────────────────────────
+
 def load_users_rolemap_from_sheet():
     try:
         df = pd.DataFrame(ws(USERS_TAB).get_all_records())
@@ -198,11 +204,7 @@ def load_users_rolemap_from_sheet():
         return None
 
 USERS_DF = load_users_rolemap_from_sheet()
-
-# If no USERS sheet mapping, fall back to secrets mapping
 ROLE_MAP = json.loads(ROLE_MAP_JSON or "{}")
-
-# For demo, if nothing exists, create a default user in memory
 if USERS_DF is None and not ROLE_MAP:
     ROLE_MAP = {
         "admin@example.com": {
@@ -211,16 +213,14 @@ if USERS_DF is None and not ROLE_MAP:
         }
     }
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Authentication setup
-# ─────────────────────────────────────────────────────────────────────────────
+
 def build_authenticator():
     cookie_name = AUTH_SECRETS.get("cookie_name", "rcm_intake_app")
     cookie_key = AUTH_SECRETS.get("cookie_key", "super-secret-key-change-me")
     cookie_expiry_days = int(AUTH_SECRETS.get("cookie_expiry_days", 30))
 
     if USERS_DF is not None and not USERS_DF.empty:
-        # Expect hashed passwords in column 'password'
         names = USERS_DF['name'].tolist()
         usernames = USERS_DF['username'].tolist()
         passwords = USERS_DF['password'].tolist()  # hashed
@@ -228,7 +228,6 @@ def build_authenticator():
         for n, u, p in zip(names, usernames, passwords):
             creds["usernames"][u] = {"name": n, "password": p}
     else:
-        # From secrets (plaintext, hashed on start) for demo only
         demo_users_json = AUTH_SECRETS.get("demo_users", "{}")
         demo_users = json.loads(demo_users_json)
         if not demo_users:
@@ -238,13 +237,13 @@ def build_authenticator():
             hashed = stauth.Hasher([info["password"]]).generate()[0]
             creds["usernames"][u] = {"name": info["name"], "password": hashed}
 
-    authenticator = stauth.Authenticate(
+    return stauth.Authenticate(
         creds,
-        cookie_name,
-        cookie_key,
-        cookie_expiry_days
+        AUTH_SECRETS.get("cookie_name", "rcm_intake_app"),
+        AUTH_SECRETS.get("cookie_key", "super-secret-key-change-me"),
+        int(AUTH_SECRETS.get("cookie_expiry_days", 30))
     )
-    return authenticator
+
 
 authenticator = build_authenticator()
 name, authentication_status, username = authenticator.login("Login", "sidebar")
@@ -255,6 +254,7 @@ if not authentication_status:
     st.stop()
 
 # Role & allowed clients
+
 def get_user_role_and_clients(u):
     if USERS_DF is not None and not USERS_DF.empty:
         row = USERS_DF[USERS_DF['username'] == u]
@@ -262,7 +262,6 @@ def get_user_role_and_clients(u):
             role = row.iloc[0]['role']
             clients = [c.strip() for c in str(row.iloc[0].get('clients', 'ALL')).split(',') if c.strip()]
             return role, clients or ["ALL"]
-    # fallback to secrets
     if u in ROLE_MAP:
         m = ROLE_MAP[u]
         return m.get("role", "User"), m.get("clients", ["ALL"])
@@ -279,8 +278,9 @@ with st.sidebar:
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Utility: load masters from sheets as lists / dataframes
+# Utility: load masters from sheets
 # ─────────────────────────────────────────────────────────────────────────────
+
 def sheet_to_list(title, value_col="Value"):
     df = pd.DataFrame(ws(title).get_all_records())
     if df.empty:
@@ -290,8 +290,8 @@ def sheet_to_list(title, value_col="Value"):
     vals = ws(title).col_values(1)
     return [v for v in vals if v and v != value_col]
 
+
 def insurance_list():
-    # Expect columns: Code, Name
     df = pd.DataFrame(ws(MS_INSURANCE).get_all_records())
     if df.empty:
         return [], pd.DataFrame()
@@ -299,8 +299,8 @@ def insurance_list():
     df['Display'] = df['Code'].astype(str).str.strip() + " - " + df['Name'].astype(str).str.strip()
     return df['Display'].tolist(), df
 
+
 def clients_list():
-    # Expect columns: ClientID, ClientName
     df = pd.DataFrame(ws(CLIENTS_TAB).get_all_records())
     if df.empty:
         return []
@@ -308,15 +308,15 @@ def clients_list():
         return df['ClientID'].dropna().astype(str).tolist()
     return []
 
+
 def client_contacts_map():
-    # Expect columns: ClientID | To | CC
     df = pd.DataFrame(ws(CLIENT_CONTACTS_TAB).get_all_records())
     mapping = {}
     if not df.empty:
         for _, row in df.iterrows():
             cid = str(row.get("ClientID","")).strip()
-            to = [e.strip() for e in str(row.get("To","")).split(",") if e.strip()]
-            cc = [e.strip() for e in str(row.get("CC","")).split(",") if e.strip()]
+            to = [e.strip() for e in str(row.get("To","")) .split(",") if e.strip()]
+            cc = [e.strip() for e in str(row.get("CC","")) .split(",") if e.strip()]
             if cid:
                 mapping[cid] = {"to": to, "cc": cc}
     return mapping
@@ -325,20 +325,12 @@ def client_contacts_map():
 # Sidebar: Navigation
 # ─────────────────────────────────────────────────────────────────────────────
 PAGES = ["Intake Form", "View / Export", "Email / WhatsApp", "Masters Admin", "Bulk Import Insurance"]
-if ROLE in ("Super Admin", "Admin"):
-    page = st.sidebar.radio("Navigation", PAGES)
-else:
-    page = st.sidebar.radio("Navigation", PAGES[:-2])
+page = st.sidebar.radio("Navigation", PAGES if ROLE in ("Super Admin", "Admin") else PAGES[:-2])
 
-# Allowed client IDs
-ALL_CLIENT_IDS = clients_list()
-if not ALL_CLIENT_IDS:
-    ALL_CLIENT_IDS = ["DEFAULT"]
+ALL_CLIENT_IDS = clients_list() or ["DEFAULT"]
 
 def filter_allowed_clients(candidates):
-    if "ALL" in ALLOWED_CLIENTS:
-        return candidates
-    return [c for c in candidates if c in ALLOWED_CLIENTS]
+    return candidates if "ALL" in ALLOWED_CLIENTS else [c for c in candidates if c in ALLOWED_CLIENTS]
 
 ALLOWED_CLIENT_CHOICES = filter_allowed_clients(ALL_CLIENT_IDS)
 
@@ -404,7 +396,6 @@ if page == "Intake Form":
         if missing:
             st.error("Missing required fields: " + ", ".join(missing))
         else:
-            # Split insurance code-name
             ins_code, ins_name = "", ""
             if " - " in insurance_display:
                 parts = insurance_display.split(" - ", 1)
@@ -448,7 +439,6 @@ if page == "View / Export":
         st.info("No records yet.")
         st.stop()
 
-    # Client scoping
     if "ALL" not in ALLOWED_CLIENTS:
         df = df[df['ClientID'].isin(ALLOWED_CLIENTS)]
 
@@ -479,7 +469,6 @@ if page == "View / Export":
 
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    # Excel export
     def to_excel_bytes(dataframe: pd.DataFrame) -> bytes:
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -487,9 +476,8 @@ if page == "View / Export":
         return output.getvalue()
 
     xbytes = to_excel_bytes(df)
-    st.download_button("⬇️ Download Excel", data=xbytes,
-                       file_name=f"RCM_Intake_Export_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    from datetime import datetime as _dt
+    st.download_button("⬇️ Download Excel", data=xbytes, file_name=f"RCM_Intake_Export_{_dt.now():%Y%m%d_%H%M%S}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page: Email / WhatsApp
@@ -502,12 +490,9 @@ if page == "Email / WhatsApp":
         st.info("No records to send.")
         st.stop()
 
-    # Client filter
-    sel_clients = st.multiselect("Client IDs", filter_allowed_clients(sorted(df['ClientID'].unique().tolist())),
-                                 default=filter_allowed_clients(sorted(df['ClientID'].unique().tolist())))
+    sel_clients = st.multiselect("Client IDs", sorted(set(df['ClientID'].unique()).intersection(ALLOWED_CLIENTS if "ALL" not in ALLOWED_CLIENTS else set(df['ClientID'].unique()))), default=sorted(set(df['ClientID'].unique()).intersection(ALLOWED_CLIENTS if "ALL" not in ALLOWED_CLIENTS else set(df['ClientID'].unique()))))
     df = df[df['ClientID'].isin(sel_clients)]
 
-    # Date window
     colr1, colr2 = st.columns(2)
     with colr1:
         r_from = st.date_input("From Date", value=None)
@@ -523,7 +508,6 @@ if page == "Email / WhatsApp":
     else:
         st.success(f"Filtered rows: {len(df)}")
 
-    # Prepare Excel attachment in memory
     xbytes = io.BytesIO()
     with pd.ExcelWriter(xbytes, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Data')
@@ -532,13 +516,11 @@ if page == "Email / WhatsApp":
     st.divider()
     st.markdown("**Email options** (uses SMTP from secrets)")
 
-    # Session-state fields allow auto-fill from ClientContacts mapping
     if 'to_emails' not in st.session_state:
         st.session_state['to_emails'] = ""
     if 'cc_emails' not in st.session_state:
         st.session_state['cc_emails'] = ""
 
-    # Autofill button if exactly one client is selected and mapping exists
     contacts = client_contacts_map()
     if len(sel_clients) == 1 and sel_clients[0] in contacts:
         if st.button("Load recipients from ClientContacts"):
@@ -572,7 +554,7 @@ if page == "Email / WhatsApp":
         part = MIMEBase('application', 'octet-stream')
         part.set_payload(attachment_bytes)
         encoders.encode_base64(part)
-        part.add_header('Content-Disposition', f'attachment; filename="{filename}"')
+        part.add_header('Content-Disposition', f'attachment; filename="{filename}")
         msg.attach(part)
 
         try:
@@ -606,7 +588,6 @@ if page == "Email / WhatsApp":
     st.markdown("**WhatsApp share** (free link with prefilled text)")
     wa_msg = st.text_area("Prefilled message", value=f"RCM Intake report — rows: {len(df)}. Please see attached in email.")
 
-    # Build a wa.me link (user will click and choose contact in WhatsApp)
     def wa_link(text):
         from urllib.parse import quote_plus
         return f"https://wa.me/?text={quote_plus(text)}"
@@ -620,8 +601,7 @@ if page == "Email / WhatsApp":
 if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
     st.subheader("Manage Masters & Clients")
 
-    tabs = st.tabs(["Pharmacies", "Insurance", "Submission Mode", "Portal", "Status",
-                    "Remarks", "Clients", "Client Contacts", "Users (view)"])
+    tabs = st.tabs(["Pharmacies", "Insurance", "Submission Mode", "Portal", "Status", "Remarks", "Clients", "Client Contacts", "Users (view)"])
 
     # Pharmacies
     with tabs[0]:
@@ -633,11 +613,11 @@ if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
             st.success("Added")
             st.rerun()
 
-    # Insurance (Code, Name)
+    # Insurance
     with tabs[1]:
         df = pd.DataFrame(ws(MS_INSURANCE).get_all_records())
         if df.empty:
-            df = pd.DataFrame(columns=["Code","Name"])  # enforce columns
+            df = pd.DataFrame(columns=["Code","Name"])
         st.dataframe(df, use_container_width=True)
         c1, c2 = st.columns(2)
         with c1:
@@ -654,7 +634,6 @@ if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
                 if not headers:
                     ws_ins.update("A1", [["Code","Name"]])
                     rows = [["Code","Name"]]
-                # check if code exists
                 found_row = None
                 for idx, r in enumerate(rows[1:], start=2):
                     if (len(r) >= 1 and r[0].strip().lower() == code.strip().lower()):
@@ -698,7 +677,7 @@ if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
             st.success("Added")
             st.rerun()
 
-    # Remarks (optional canned remarks)
+    # Remarks (optional)
     with tabs[5]:
         df = pd.DataFrame(ws(MS_REMARKS).get_all_records())
         st.dataframe(df if not df.empty else pd.DataFrame(columns=["Value"]), use_container_width=True)
@@ -712,7 +691,7 @@ if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
     with tabs[6]:
         df = pd.DataFrame(ws(CLIENTS_TAB).get_all_records())
         if df.empty:
-            df = pd.DataFrame(columns=["ClientID","ClientName"])  # enforce columns
+            df = pd.DataFrame(columns=["ClientID","ClientName"])
         st.dataframe(df, use_container_width=True)
         c1, c2 = st.columns(2)
         with c1:
@@ -729,7 +708,6 @@ if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
                 if not headers:
                     ws_c.update("A1", [["ClientID","ClientName"]])
                     rows = [["ClientID","ClientName"]]
-                # check if ClientID exists
                 found_row = None
                 for idx, r in enumerate(rows[1:], start=2):
                     if (len(r) >= 1 and r[0].strip().lower() == cid.strip().lower()):
@@ -747,7 +725,7 @@ if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
     with tabs[7]:
         df = pd.DataFrame(ws(CLIENT_CONTACTS_TAB).get_all_records())
         if df.empty:
-            df = pd.DataFrame(columns=["ClientID","To","CC"])  # enforce columns
+            df = pd.DataFrame(columns=["ClientID","To","CC"])
         st.dataframe(df, use_container_width=True)
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -779,7 +757,7 @@ if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
                     st.success("Added")
                 st.rerun()
 
-    # Users (view): manage in sheet including hashed passwords
+    # Users (view)
     with tabs[8]:
         st.info("Manage users in the 'Users' sheet with columns: username, name, password (hashed), role, clients (comma-separated).")
         df = pd.DataFrame(ws(USERS_TAB).get_all_records())
@@ -799,9 +777,7 @@ if page == "Bulk Import Insurance" and ROLE in ("Super Admin", "Admin"):
                 st.error("File must have columns: Code, Name")
             else:
                 ws_ins = ws(MS_INSURANCE)
-                # clear existing
                 ws_ins.clear()
-                # write headers + rows
                 rows = [["Code","Name"]] + df[['Code','Name']].fillna("").astype(str).values.tolist()
                 ws_ins.update("A1", rows)
                 st.success("Insurance master replaced ✔️")
@@ -809,11 +785,15 @@ if page == "Bulk Import Insurance" and ROLE in ("Super Admin", "Admin"):
             st.error(f"Import error: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# End of app.py
+# END — app.py (RiteTech Branded)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper (local, optional): hash a password for Users sheet
+# Add this file in your repo at: .streamlit/config.toml
 # ─────────────────────────────────────────────────────────────────────────────
-# from streamlit_authenticator import Hasher
-# Hasher(["plain_password_here"]).generate()[0]
+# [theme]
+# primaryColor = "#0c496f"
+# backgroundColor = "#ffffff"
+# secondaryBackgroundColor = "#f2f5f7"
+# textColor = "#0f172a"
