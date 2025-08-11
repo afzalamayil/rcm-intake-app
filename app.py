@@ -53,7 +53,7 @@ except TypeError:
     # Streamlit <1.33 compatibility (no vertical_alignment)
     col_logo, col_title = st.columns([1, 8])
 if os.path.exists(LOGO_PATH):
-    col_logo.image(LOGO_PATH, use_column_width=True)
+    col_logo.image(LOGO_PATH, use_container_width=True)
 col_title.markdown("### RCM Intake — Streamlit (Option B)")
 
 st.caption("Free stack: Streamlit Cloud + Google Sheets. Email via SMTP. WhatsApp via share links.")
