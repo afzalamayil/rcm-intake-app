@@ -79,10 +79,7 @@ st.caption("Free stack: Streamlit Cloud + Google Sheets. Email via SMTP. WhatsAp
 # type = "service_account"
 # project_id = "..."
 # private_key_id = "..."
-# private_key = "-----BEGIN PRIVATE KEY-----
-...
------END PRIVATE KEY-----
-"
+# private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
 # client_email = "...@...gserviceaccount.com"
 # client_id = "..."
 # auth_uri = "https://accounts.google.com/o/oauth2/auth"
@@ -554,7 +551,7 @@ if page == "Email / WhatsApp":
         part = MIMEBase('application', 'octet-stream')
         part.set_payload(attachment_bytes)
         encoders.encode_base64(part)
-        part.add_header('Content-Disposition', f'attachment; filename="{filename}")
+        part.add_header('Content-Disposition', f'attachment; filename="{filename}"')
         msg.attach(part)
 
         try:
