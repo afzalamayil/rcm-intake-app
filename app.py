@@ -1,14 +1,14 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# File: app.py  — Streamlit (Option B) — RITE TECH BRANDED
-# ─────────────────────────────────────────────────────────────────────────────
-# Folders expected in your repo:
+# File: app.py — Streamlit (Option B) — RITE TECH BRANDED
+# Folders expected:
 #   assets/logo.png
 #   .streamlit/config.toml  (theme)
-# Secrets expected in Streamlit Cloud → App → Settings → Secrets (see README/TOML you pasted)
+# Secrets expected (Streamlit Cloud → App → Settings → Secrets): see README/TOML
 # ─────────────────────────────────────────────────────────────────────────────
 
 import io
 import os
+import re
 import json
 import pandas as pd
 import streamlit as st
@@ -44,14 +44,14 @@ st.set_page_config(
 try:
     col_logo, col_title = st.columns([1, 8], vertical_alignment="center")
 except TypeError:
-    col_logo, col_title = st.columns([1, 8])
+    col_logo, col_title = st.columns([1, 8])  # Streamlit <1.33
 if os.path.exists(LOGO_PATH):
     col_logo.image(LOGO_PATH, use_container_width=True)
 col_title.markdown("### RCM Intake — Streamlit (Option B)")
 st.caption("Free stack: Streamlit Cloud + Google Sheets. Email via SMTP. WhatsApp via share links.")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Secrets & Google Auth
+# Secrets
 # ─────────────────────────────────────────────────────────────────────────────
 AUTH_SECRETS = st.secrets.get("auth", {})
 SMTP_SECRETS = st.secrets.get("smtp", {})
@@ -65,6 +65,9 @@ with st.sidebar:
     if UI_BRAND:
         st.success(f"👋 {UI_BRAND}")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Google Sheets auth + open/create spreadsheet
+# ─────────────────────────────────────────────────────────────────────────────
 REQUIRED_GS_KEYS = [
     "type","project_id","private_key_id","private_key","client_email","client_id",
     "auth_uri","token_uri","auth_provider_x509_cert_url","client_x509_cert_url"
@@ -78,12 +81,20 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+def _extract_sheet_id(id_or_url: str) -> str:
+    """Accepts plain ID or any Google Sheets URL; returns the raw ID."""
+    if not id_or_url:
+        return ""
+    # Match /d/<ID>
+    m = re.search(r"/d/([a-zA-Z0-9-_]+)", id_or_url)
+    return m.group(1) if m else id_or_url.strip()
+
 sh = None
 if not missing_gs:
     creds = Credentials.from_service_account_info(dict(GS_SECRETS), scopes=SCOPES)
     gc = gspread.authorize(creds)
 
-    SPREADSHEET_ID = GS_SECRETS.get("spreadsheet_id", "").strip()
+    SPREADSHEET_ID = _extract_sheet_id(GS_SECRETS.get("spreadsheet_id", "").strip())
     SPREADSHEET_NAME = GS_SECRETS.get("spreadsheet_name", "RCM_Intake_DB").strip()
 
     try:
@@ -92,16 +103,16 @@ if not missing_gs:
         else:
             sh = gc.open(SPREADSHEET_NAME)
     except gspread.SpreadsheetNotFound:
+        # If ID missing or named sheet not found, create a new one
         if not SPREADSHEET_ID:
             sh = gc.create(SPREADSHEET_NAME)
-            # Optional: reveal URL of created spreadsheet so you can open & share it
             st.info(f"Created new spreadsheet under the service account: {sh.url}")
         else:
             st.error("Spreadsheet ID not found or no access. Share the sheet with the service account in [gsheets].client_email.")
             st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sheet Tabs
+# Sheet tabs & base structure
 # ─────────────────────────────────────────────────────────────────────────────
 DATA_TAB = "Data"
 USERS_TAB = "Users"
@@ -130,7 +141,7 @@ if not missing_gs:
         if t not in existing_titles:
             sh.add_worksheet(title=t, rows=200, cols=26)
 
-# Ensure headers for Data (robust: use update instead of insert_row)
+# Ensure headers for Data (safe: use .update not insert_row)
 DATA_HEADERS = [
     "Timestamp","SubmittedBy","Role","ClientID",
     "EmployeeName","SubmissionDate","PharmacyName","SubmissionMode",
@@ -142,11 +153,10 @@ DATA_HEADERS = [
 if not missing_gs:
     wsd = ws(DATA_TAB)
     try:
-        existing = wsd.get('A1:T1')  # read minimal header row
+        existing = wsd.get('A1:T1')  # minimal read
     except Exception:
         st.error("Could not read the Data sheet. Check service account access & APIs enabled.")
         st.stop()
-
     if not existing or not any(existing[0]):
         try:
             wsd.update('A1', [DATA_HEADERS])
@@ -154,7 +164,7 @@ if not missing_gs:
             st.error("Could not write headers to Data sheet. Verify Editor access for the service account.")
             st.stop()
 
-# Preload basic masters (ensure there's at least a single 'Value' column with defaults)
+# Seed simple masters if empty
 DEFAULT_MASTER_VALUES = {
     MS_SUBMISSION_MODE: ["Walk-in", "Phone", "Email", "Portal"],
     MS_PORTAL: ["DHPO", "Riayati", "Insurance Portal"],
@@ -168,23 +178,19 @@ if not missing_gs:
             wsx.update("A1", [["Value"]] + [[v] for v in values])
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Role + Client mapping
+# Users/roles
 # ─────────────────────────────────────────────────────────────────────────────
 def load_users_rolemap_from_sheet():
     try:
         df = pd.DataFrame(ws(USERS_TAB).get_all_records())
-        if df.empty:
-            return None
-        return df
+        return None if df.empty else df
     except Exception:
         return None
 
 USERS_DF = load_users_rolemap_from_sheet()
 ROLE_MAP = json.loads(ROLE_MAP_JSON or "{}")
 if USERS_DF is None and not ROLE_MAP:
-    ROLE_MAP = {
-        "admin@example.com": {"role": "Super Admin", "clients": ["ALL"]}
-    }
+    ROLE_MAP = {"admin@example.com": {"role": "Super Admin", "clients": ["ALL"]}}
 
 def build_authenticator():
     if USERS_DF is not None and not USERS_DF.empty:
@@ -199,7 +205,6 @@ def build_authenticator():
         for u, info in demo_users.items():
             hashed = stauth.Hasher([info["password"]]).generate()[0]
             creds["usernames"][u] = {"name": info["name"], "password": hashed}
-
     return stauth.Authenticate(
         creds,
         AUTH_SECRETS.get("cookie_name", "rcm_intake_app"),
@@ -256,17 +261,13 @@ def sheet_to_list(title, prefer_cols=("Value","Name","Mode","Portal")):
 def pharmacy_list():
     df = pd.DataFrame(ws(MS_PHARM).get_all_records())
     if df.empty:
-        # fallback to single-column list (Value/Name)
         return sheet_to_list(MS_PHARM)
     df = df.fillna("")
-    # Prefer ID + Name if present
     if {"ID","Name"}.issubset(df.columns):
         df["Display"] = df["ID"].astype(str).str.strip() + " - " + df["Name"].astype(str).str.strip()
         return df["Display"].tolist()
-    # Else use Name column if available
     if "Name" in df.columns:
-        return df["Name"].dropna().astype(str).str.strip().tolist()
-    # Fallback to first column
+        return df["Name"].dropna().astype(str).tolist()
     return sheet_to_list(MS_PHARM)
 
 def insurance_list():
@@ -562,12 +563,10 @@ if page == "Email / WhatsApp":
 
     st.divider()
     st.markdown("**WhatsApp share** (free link with prefilled text)")
-    wa_msg = st.text_area("Prefilled message", value=f"RCM Intake report — rows: {len(df)}. Please see attached in email.")
-
     def wa_link(text):
         from urllib.parse import quote_plus
         return f"https://wa.me/?text={quote_plus(text)}"
-
+    wa_msg = st.text_area("Prefilled message", value=f"RCM Intake report — rows: {len(df)}. Please see attached in email.")
     st.link_button("Open WhatsApp with message", wa_link(wa_msg))
     st.caption("Note: Attachments can’t be auto-sent for free; send the Excel from your email above.")
 
@@ -686,7 +685,7 @@ if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
             st.success("Added")
             st.rerun()
 
-    # Remarks (optional)
+    # Remarks
     with tabs[5]:
         df = pd.DataFrame(ws(MS_REMARKS).get_all_records())
         st.dataframe(df if not df.empty else pd.DataFrame(columns=["Value"]), use_container_width=True)
@@ -792,5 +791,5 @@ if page == "Bulk Import Insurance" and ROLE in ("Super Admin", "Admin"):
             st.error(f"Import error: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# END — app.py (RiteTech Branded)
+# END — app.py
 # ─────────────────────────────────────────────────────────────────────────────
