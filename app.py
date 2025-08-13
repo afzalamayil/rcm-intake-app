@@ -115,18 +115,30 @@ if missing_gs:
     st.warning("Google Sheets credentials not fully configured in secrets. Configure [gsheets].")
 
 SCOPES = [
-    'https://www.googleapis.com/auth/spreadsheets',
-    'https://www.googleapis.com/auth/drive'
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
 ]
 
+sh = None
 if not missing_gs:
     creds = Credentials.from_service_account_info(dict(GS_SECRETS), scopes=SCOPES)
     gc = gspread.authorize(creds)
-    SPREADSHEET_NAME = GS_SECRETS.get("spreadsheet_name", "RCM_Intake_DB")
+
+    SPREADSHEET_ID = GS_SECRETS.get("spreadsheet_id", "").strip()
+    SPREADSHEET_NAME = GS_SECRETS.get("spreadsheet_name", "RCM_Intake_DB").strip()
+
     try:
-        sh = gc.open(SPREADSHEET_NAME)
+        if SPREADSHEET_ID:
+            sh = gc.open_by_key(SPREADSHEET_ID)
+        else:
+            sh = gc.open(SPREADSHEET_NAME)
     except gspread.SpreadsheetNotFound:
-        sh = gc.create(SPREADSHEET_NAME)
+        # create by name (only if ID not provided)
+        if not SPREADSHEET_ID:
+            sh = gc.create(SPREADSHEET_NAME)
+        else:
+            st.error("Spreadsheet ID not found or no access. Share the sheet with the service account.")
+            st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sheet Tabs
@@ -146,7 +158,7 @@ CLIENT_CONTACTS_TAB = "ClientContacts"  # ClientID | To | CC
 DEFAULT_TABS = [DATA_TAB, USERS_TAB, MASTERS_TAB, MS_PHARM, MS_INSURANCE, MS_SUBMISSION_MODE, MS_PORTAL, MS_STATUS, MS_REMARKS, CLIENTS_TAB, CLIENT_CONTACTS_TAB]
 
 if not missing_gs:
-    existing_titles = [ws.title for ws in sh.worksheets()]
+    existing_titles = [wst.title for wst in sh.worksheets()]
     for t in DEFAULT_TABS:
         if t not in existing_titles:
             sh.add_worksheet(title=t, rows=200, cols=26)
@@ -278,14 +290,35 @@ with st.sidebar:
 # Utility: load masters from sheets
 # ─────────────────────────────────────────────────────────────────────────────
 
-def sheet_to_list(title, value_col="Value"):
-    df = pd.DataFrame(ws(title).get_all_records())
-    if df.empty:
+
+def sheet_to_list(title, prefer_cols=("Value","Name","Mode","Portal")):
+    rows = ws(title).get_all_values()
+    if not rows:
         return []
-    if value_col in df.columns:
-        return df[value_col].dropna().astype(str).tolist()
-    vals = ws(title).col_values(1)
-    return [v for v in vals if v and v != value_col]
+    header = rows[0] if rows else []
+    # Try to find a preferred column
+    for colname in prefer_cols:
+        if colname in header:
+            idx = header.index(colname)
+            return [r[idx] for r in rows[1:] if len(r) > idx and r[idx]]
+    # Fallback: take column A, skip header
+    return [r[0] for r in rows[1:] if r and r[0]]
+
+def pharmacy_list():
+    df = pd.DataFrame(ws(MS_PHARM).get_all_records())
+    if df.empty:
+        # fallback to single-column list (Value/Name)
+        return sheet_to_list(MS_PHARM)
+    df = df.fillna("")
+    # Prefer ID + Name if present
+    if {"ID","Name"}.issubset(df.columns):
+        df["Display"] = df["ID"].astype(str).str.strip() + " - " + df["Name"].astype(str).str.strip()
+        return df["Display"].tolist()
+    # Else use Name column if available
+    if "Name" in df.columns:
+        return df["Name"].dropna().astype(str).tolist()
+    # Fallback to first column
+    return sheet_to_list(MS_PHARM)
 
 
 def insurance_list():
@@ -345,7 +378,7 @@ if page == "Intake Form":
         submission_date = st.date_input("Submission Date*", value=date.today())
         submission_mode = st.selectbox("Submission Mode*", sheet_to_list(MS_SUBMISSION_MODE))
     with col2:
-        pharmacy_name = st.selectbox("Pharmacy Name*", sheet_to_list(MS_PHARM))
+        pharmacy_name = st.selectbox("Pharmacy Name*", pharmacy_list())
         portal = st.selectbox("Portal* (DHPO / Riayati / Insurance Portal)", sheet_to_list(MS_PORTAL))
         erx_number = st.text_input("ERX Number*")
     with col3:
@@ -595,20 +628,59 @@ if page == "Email / WhatsApp":
 # ─────────────────────────────────────────────────────────────────────────────
 # Page: Masters Admin (Super Admin/Admin)
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Page: Masters Admin (Super Admin/Admin)
+# ─────────────────────────────────────────────────────────────────────────────
 if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
     st.subheader("Manage Masters & Clients")
 
-    tabs = st.tabs(["Pharmacies", "Insurance", "Submission Mode", "Portal", "Status", "Remarks", "Clients", "Client Contacts", "Users (view)"])
+    tabs = st.tabs([
+        "Pharmacies", "Insurance", "Submission Mode", "Portal",
+        "Status", "Remarks", "Clients", "Client Contacts", "Users (view)"
+    ])
 
     # Pharmacies
     with tabs[0]:
         df = pd.DataFrame(ws(MS_PHARM).get_all_records())
-        st.dataframe(df if not df.empty else pd.DataFrame(columns=["Value"]), use_container_width=True)
-        new_val = st.text_input("Add Pharmacy")
-        if st.button("Add Pharmacy") and new_val.strip():
-            ws(MS_PHARM).append_row([new_val.strip()])
-            st.success("Added")
-            st.rerun()
+        has_id_name = {"ID", "Name"}.issubset(df.columns)
+
+        if has_id_name:
+            st.dataframe(df if not df.empty else pd.DataFrame(columns=["ID","Name"]), use_container_width=True)
+            c1, c2 = st.columns(2)
+            with c1:
+                new_pid = st.text_input("Pharmacy ID")
+            with c2:
+                new_pname = st.text_input("Pharmacy Name")
+            if st.button("Add / Update Pharmacy"):
+                if not new_pid.strip() or not new_pname.strip():
+                    st.error("Both ID and Name required")
+                else:
+                    ws_p = ws(MS_PHARM)
+                    all_vals = ws_p.get_all_values()
+                    if not all_vals:
+                        ws_p.update("A1", [["ID","Name"]])
+                        all_vals = [["ID","Name"]]
+                    # find row by ID (case-insensitive)
+                    found_row = None
+                    for idx, r in enumerate(all_vals[1:], start=2):
+                        if len(r) >= 1 and r[0].strip().lower() == new_pid.strip().lower():
+                            found_row = idx
+                            break
+                    if found_row:
+                        ws_p.update(f"A{found_row}:B{found_row}", [[new_pid.strip(), new_pname.strip()]])
+                        st.success("Updated")
+                    else:
+                        ws_p.append_row([new_pid.strip(), new_pname.strip()])
+                        st.success("Added")
+                    st.rerun()
+        else:
+            # Single-column fallback (Value or Name)
+            st.dataframe(df if not df.empty else pd.DataFrame(columns=["Value"]), use_container_width=True)
+            new_val = st.text_input("Add Pharmacy (single column)")
+            if st.button("Add Pharmacy") and new_val.strip():
+                ws(MS_PHARM).append_row([new_val.strip()])
+                st.success("Added")
+                st.rerun()
 
     # Insurance
     with tabs[1]:
