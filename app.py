@@ -1,9 +1,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # File: app.py — Streamlit (Option B) — RITE TECH BRANDED
-# Folders expected:
+# ─────────────────────────────────────────────────────────────────────────────
+# Folders expected in your repo:
 #   assets/logo.png
 #   .streamlit/config.toml  (theme)
-# Secrets expected (Streamlit Cloud → App → Settings → Secrets): see README/TOML
+# Secrets expected in Streamlit Cloud → App → Settings → Secrets
 # ─────────────────────────────────────────────────────────────────────────────
 
 import io
@@ -44,20 +45,21 @@ st.set_page_config(
 try:
     col_logo, col_title = st.columns([1, 8], vertical_alignment="center")
 except TypeError:
-    col_logo, col_title = st.columns([1, 8])  # Streamlit <1.33
+    # Streamlit <1.33 compatibility
+    col_logo, col_title = st.columns([1, 8])
 if os.path.exists(LOGO_PATH):
     col_logo.image(LOGO_PATH, use_container_width=True)
 col_title.markdown("### RCM Intake — Streamlit (Option B)")
 st.caption("Free stack: Streamlit Cloud + Google Sheets. Email via SMTP. WhatsApp via share links.")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Secrets
+# Secrets & Google Auth
 # ─────────────────────────────────────────────────────────────────────────────
-AUTH_SECRETS = st.secrets.get("auth", {})
-SMTP_SECRETS = st.secrets.get("smtp", {})
-GS_SECRETS   = st.secrets.get("gsheets", {})
+AUTH_SECRETS  = st.secrets.get("auth", {})
+SMTP_SECRETS  = st.secrets.get("smtp", {})
+GS_SECRETS    = st.secrets.get("gsheets", {})
 ROLE_MAP_JSON = st.secrets.get("roles", {}).get("mapping", "{}")
-UI_BRAND = st.secrets.get("ui", {}).get("brand", "")
+UI_BRAND      = st.secrets.get("ui", {}).get("brand", "")
 
 with st.sidebar:
     if os.path.exists(LOGO_PATH):
@@ -65,9 +67,6 @@ with st.sidebar:
     if UI_BRAND:
         st.success(f"👋 {UI_BRAND}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Google Sheets auth + open/create spreadsheet
-# ─────────────────────────────────────────────────────────────────────────────
 REQUIRED_GS_KEYS = [
     "type","project_id","private_key_id","private_key","client_email","client_id",
     "auth_uri","token_uri","auth_provider_x509_cert_url","client_x509_cert_url"
@@ -81,53 +80,55 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-def _extract_sheet_id(id_or_url: str) -> str:
-    """Accepts plain ID or any Google Sheets URL; returns the raw ID."""
-    if not id_or_url:
+def extract_sheet_id(maybe_url: str) -> str:
+    """Accept a bare ID or a full URL and return the spreadsheet ID only."""
+    if not maybe_url:
         return ""
-    # Match /d/<ID>
-    m = re.search(r"/d/([a-zA-Z0-9-_]+)", id_or_url)
-    return m.group(1) if m else id_or_url.strip()
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", maybe_url)
+    return m.group(1) if m else maybe_url.strip()
 
 sh = None
 if not missing_gs:
     creds = Credentials.from_service_account_info(dict(GS_SECRETS), scopes=SCOPES)
     gc = gspread.authorize(creds)
 
-    SPREADSHEET_ID = _extract_sheet_id(GS_SECRETS.get("spreadsheet_id", "").strip())
-    SPREADSHEET_NAME = GS_SECRETS.get("spreadsheet_name", "RCM_Intake_DB").strip()
+    SPREADSHEET_ID_RAW = GS_SECRETS.get("spreadsheet_id", "").strip()
+    SPREADSHEET_ID     = extract_sheet_id(SPREADSHEET_ID_RAW)
+    SPREADSHEET_NAME   = GS_SECRETS.get("spreadsheet_name", "RCM_Intake_DB").strip()
 
     try:
         if SPREADSHEET_ID:
             sh = gc.open_by_key(SPREADSHEET_ID)
         else:
-            sh = gc.open(SPREADSHEET_NAME)
+            # open by name (must exist or we create it)
+            try:
+                sh = gc.open(SPREADSHEET_NAME)
+            except gspread.SpreadsheetNotFound:
+                sh = gc.create(SPREADSHEET_NAME)
+                st.info(f"Created new spreadsheet under the service account: {sh.url}")
     except gspread.SpreadsheetNotFound:
-        # If ID missing or named sheet not found, create a new one
-        if not SPREADSHEET_ID:
-            sh = gc.create(SPREADSHEET_NAME)
-            st.info(f"Created new spreadsheet under the service account: {sh.url}")
-        else:
-            st.error("Spreadsheet ID not found or no access. Share the sheet with the service account in [gsheets].client_email.")
-            st.stop()
+        st.error("Spreadsheet ID not found or no access. Share the sheet with the service account in [gsheets].client_email.")
+        st.stop()
+    except Exception as e:
+        st.error(f"Could not connect to Google Sheets: {e}")
+        st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sheet tabs & base structure
+# Sheet Tabs
 # ─────────────────────────────────────────────────────────────────────────────
-DATA_TAB = "Data"
-USERS_TAB = "Users"
-MASTERS_TAB = "Masters"
-MS_PHARM = "Pharmacies"
+DATA_TAB   = "Data"
+USERS_TAB  = "Users"
+MS_PHARM   = "Pharmacies"
 MS_INSURANCE = "Insurance"
 MS_SUBMISSION_MODE = "SubmissionMode"
-MS_PORTAL = "Portal"
-MS_STATUS = "Status"
+MS_PORTAL  = "Portal"
+MS_STATUS  = "Status"
 MS_REMARKS = "Remarks"
 CLIENTS_TAB = "Clients"
 CLIENT_CONTACTS_TAB = "ClientContacts"
 
 DEFAULT_TABS = [
-    DATA_TAB, USERS_TAB, MASTERS_TAB, MS_PHARM, MS_INSURANCE,
+    DATA_TAB, USERS_TAB, MS_PHARM, MS_INSURANCE,
     MS_SUBMISSION_MODE, MS_PORTAL, MS_STATUS, MS_REMARKS,
     CLIENTS_TAB, CLIENT_CONTACTS_TAB
 ]
@@ -141,7 +142,7 @@ if not missing_gs:
         if t not in existing_titles:
             sh.add_worksheet(title=t, rows=200, cols=26)
 
-# Ensure headers for Data (safe: use .update not insert_row)
+# Ensure headers for Data (robust)
 DATA_HEADERS = [
     "Timestamp","SubmittedBy","Role","ClientID",
     "EmployeeName","SubmissionDate","PharmacyName","SubmissionMode",
@@ -153,10 +154,12 @@ DATA_HEADERS = [
 if not missing_gs:
     wsd = ws(DATA_TAB)
     try:
-        existing = wsd.get('A1:T1')  # minimal read
+        # read only the header row
+        existing = wsd.get('A1:T1')
     except Exception:
         st.error("Could not read the Data sheet. Check service account access & APIs enabled.")
         st.stop()
+
     if not existing or not any(existing[0]):
         try:
             wsd.update('A1', [DATA_HEADERS])
@@ -164,7 +167,7 @@ if not missing_gs:
             st.error("Could not write headers to Data sheet. Verify Editor access for the service account.")
             st.stop()
 
-# Seed simple masters if empty
+# Preload minimal masters if empty
 DEFAULT_MASTER_VALUES = {
     MS_SUBMISSION_MODE: ["Walk-in", "Phone", "Email", "Portal"],
     MS_PORTAL: ["DHPO", "Riayati", "Insurance Portal"],
@@ -178,7 +181,7 @@ if not missing_gs:
             wsx.update("A1", [["Value"]] + [[v] for v in values])
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Users/roles
+# Role + Client mapping
 # ─────────────────────────────────────────────────────────────────────────────
 def load_users_rolemap_from_sheet():
     try:
@@ -188,9 +191,11 @@ def load_users_rolemap_from_sheet():
         return None
 
 USERS_DF = load_users_rolemap_from_sheet()
-ROLE_MAP = json.loads(ROLE_MAP_JSON or "{}")
+ROLE_MAP  = json.loads(ROLE_MAP_JSON or "{}")
 if USERS_DF is None and not ROLE_MAP:
-    ROLE_MAP = {"admin@example.com": {"role": "Super Admin", "clients": ["ALL"]}}
+    ROLE_MAP = {
+        "admin@example.com": {"role": "Super Admin", "clients": ["ALL"]}
+    }
 
 def build_authenticator():
     if USERS_DF is not None and not USERS_DF.empty:
@@ -205,6 +210,7 @@ def build_authenticator():
         for u, info in demo_users.items():
             hashed = stauth.Hasher([info["password"]]).generate()[0]
             creds["usernames"][u] = {"name": info["name"], "password": hashed}
+
     return stauth.Authenticate(
         creds,
         AUTH_SECRETS.get("cookie_name", "rcm_intake_app"),
@@ -264,8 +270,8 @@ def pharmacy_list():
         return sheet_to_list(MS_PHARM)
     df = df.fillna("")
     if {"ID","Name"}.issubset(df.columns):
-        df["Display"] = df["ID"].astype(str).str.strip() + " - " + df["Name"].astype(str).str.strip()
-        return df["Display"].tolist()
+        disp = df["ID"].astype(str).str.strip() + " - " + df["Name"].astype(str).str.strip()
+        return disp.tolist()
     if "Name" in df.columns:
         return df["Name"].dropna().astype(str).tolist()
     return sheet_to_list(MS_PHARM)
@@ -685,7 +691,7 @@ if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
             st.success("Added")
             st.rerun()
 
-    # Remarks
+    # Remarks (optional)
     with tabs[5]:
         df = pd.DataFrame(ws(MS_REMARKS).get_all_records())
         st.dataframe(df if not df.empty else pd.DataFrame(columns=["Value"]), use_container_width=True)
@@ -791,5 +797,5 @@ if page == "Bulk Import Insurance" and ROLE in ("Super Admin", "Admin"):
             st.error(f"Import error: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# END — app.py
+# END — app.py (RiteTech Branded)
 # ─────────────────────────────────────────────────────────────────────────────
