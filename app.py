@@ -256,13 +256,17 @@ def sheet_to_list(title, prefer_cols=("Value","Name","Mode","Portal")):
 def pharmacy_list():
     df = pd.DataFrame(ws(MS_PHARM).get_all_records())
     if df.empty:
+        # fallback to single-column list (Value/Name)
         return sheet_to_list(MS_PHARM)
     df = df.fillna("")
+    # Prefer ID + Name if present
     if {"ID","Name"}.issubset(df.columns):
-        df["Display"] = df["ID"].astype(str).strip() + " - " + df["Name"].astype(str).strip()
+        df["Display"] = df["ID"].astype(str).str.strip() + " - " + df["Name"].astype(str).str.strip()
         return df["Display"].tolist()
+    # Else use Name column if available
     if "Name" in df.columns:
-        return df["Name"].dropna().astype(str).tolist()
+        return df["Name"].dropna().astype(str).str.strip().tolist()
+    # Fallback to first column
     return sheet_to_list(MS_PHARM)
 
 def insurance_list():
