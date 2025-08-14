@@ -1,18 +1,20 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # app.py — RCM Intake (Streamlit) — 2025-08-14
-# Fixes:
-# • Works with gsheets.sheet_url OR gsheets.spreadsheet_id
-# • New streamlit_authenticator login API (location, fields)
-# • Friendly config checks (no redacted KeyError)
-# • Form reset after submit, duplicate warning, cached reads, backoff
-# • Optional WhatsApp send; logging to "Logs" sheet
+# • Your fields: Emirates ID, Insurance, MemberID, Policy No, ERX, etc.
+# • NO patient WhatsApp
+# • Management report sender (CSV) via WhatsApp Cloud API
+# • Duplicate warning (same-day ERX+MemberID+Net)
+# • Cached reads + exponential backoff
+# • Friendly config checks
+# • New streamlit_authenticator API (fields=...)
 # Requirements:
 #   pip install streamlit gspread google-auth streamlit-authenticator pandas requests python-dateutil
 # ─────────────────────────────────────────────────────────────────────────────
 
+import io
 import json
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from dateutil import tz
 
 import pandas as pd
@@ -34,7 +36,7 @@ TZ = tz.gettz("Asia/Dubai")
 
 DATA_SHEET_NAME = "Data"
 LOG_SHEET_NAME = "Logs"
-REFERENCE_SHEET = "Reference"  # optional
+REFERENCE_SHEET = "Reference"  # optional: dropdown sources
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -45,14 +47,12 @@ SCOPES = [
 # Friendly config loader
 # ─────────────────────────────────────────────────────────────────────────────
 def get_cfg():
-    """Validate required secrets; support sheet_url or spreadsheet_id."""
     gs = st.secrets.get("gsheets", {})
     need = ["client_email", "token_uri", "private_key"]
     missing = [k for k in need if not gs.get(k)]
     if missing:
         st.error("Missing Google Sheets secrets: " + ", ".join(missing))
         st.stop()
-
     if not gs.get("sheet_url") and not gs.get("spreadsheet_id"):
         st.error("Provide either [gsheets].sheet_url OR [gsheets].spreadsheet_id in secrets.toml.")
         st.stop()
@@ -63,7 +63,6 @@ def get_cfg():
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def get_gspread_client():
-    """Authorize once per session."""
     gs = get_cfg()
     info = {
         "type": "service_account",
@@ -78,7 +77,6 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 def retry(fn, attempts=5):
-    """Exponential backoff for rate limits or transient errors."""
     for i in range(attempts):
         try:
             return fn()
@@ -101,12 +99,11 @@ def get_ws(gc, ws_title):
     try:
         return retry(lambda: sh.worksheet(ws_title))
     except gspread.exceptions.WorksheetNotFound:
-        ws = retry(lambda: sh.add_worksheet(title=ws_title, rows=1000, cols=50))
+        ws = retry(lambda: sh.add_worksheet(title=ws_title, rows=2000, cols=80))
         return ws
 
 @st.cache_data(ttl=60, show_spinner=False)
 def read_df_cached(ws_title: str) -> pd.DataFrame:
-    """Cached read of a worksheet → DataFrame of records."""
     gc = get_gspread_client()
     sh = open_sheet(gc)
     ws = retry(lambda: sh.worksheet(ws_title))
@@ -124,39 +121,63 @@ def write_header_if_empty(ws, header_list):
         retry(lambda: ws.append_row(header_list, value_input_option="USER_ENTERED"))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WhatsApp (optional)
+# WhatsApp — MANAGEMENT report sender
 # ─────────────────────────────────────────────────────────────────────────────
-def whatsapp_enabled():
-    return "whatsapp" in st.secrets and st.secrets["whatsapp"].get("phone_number_id")
+def whatsapp_cfg_ok():
+    w = st.secrets.get("whatsapp", {})
+    m = st.secrets.get("whatsapp_management", {})
+    return bool(w.get("phone_number_id") and w.get("access_token") and m.get("recipients"))
 
-def send_whatsapp_message(phone_e164: str, params: list[str]):
+def upload_media_to_whatsapp(file_bytes: bytes, filename: str, mime: str = "text/csv") -> str:
     wa = st.secrets["whatsapp"]
-    url = f"https://graph.facebook.com/v20.0/{wa['phone_number_id']}/messages"
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone_e164,  # e.g., "9715XXXXXXXX"
-        "type": "template",
-        "template": {
-            "name": wa["template_name"],
-            "language": {"code": wa.get("lang_code", "en_US")},
-            "components": [
-                {
-                    "type": "body",
-                    "parameters": [{"type": "text", "text": str(p)} for p in params],
-                }
-            ],
-        },
+    url = f"https://graph.facebook.com/v20.0/{wa['phone_number_id']}/media"
+    headers = {"Authorization": f"Bearer {wa['access_token']}"}
+    files = {
+        "file": (filename, file_bytes, mime),
+        "type": (None, mime),
+        # For business accounts, no need to pass messaging_product here; /media is correct endpoint
     }
+    r = requests.post(url, headers=headers, files=files, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    return data.get("id")
+
+def send_document_to_numbers(media_id: str, filename: str, note_text: str):
+    wa = st.secrets["whatsapp"]
+    mgmt = st.secrets["whatsapp_management"]
+    recipients = [x.strip() for x in mgmt["recipients"].split(",") if x.strip()]
+    url = f"https://graph.facebook.com/v20.0/{wa['phone_number_id']}/messages"
     headers = {
         "Authorization": f"Bearer {wa['access_token']}",
         "Content-Type": "application/json",
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=20)
-    r.raise_for_status()
-    return r.json()
+    # Send a text note first (optional)
+    for num in recipients:
+        # Text
+        payload_text = {
+            "messaging_product": "whatsapp",
+            "to": num,
+            "type": "text",
+            "text": {"preview_url": False, "body": note_text},
+        }
+        r1 = requests.post(url, headers=headers, json=payload_text, timeout=30)
+        try:
+            r1.raise_for_status()
+        except Exception:
+            pass  # continue anyway
+
+        # Document
+        payload_doc = {
+            "messaging_product": "whatsapp",
+            "to": num,
+            "type": "document",
+            "document": {"id": media_id, "filename": filename},
+        }
+        r2 = requests.post(url, headers=headers, json=payload_doc, timeout=60)
+        r2.raise_for_status()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Auth (updated login flow)
+# Auth (new API)
 # ─────────────────────────────────────────────────────────────────────────────
 def init_auth():
     auth_conf = st.secrets.get("auth", {})
@@ -164,20 +185,17 @@ def init_auth():
     cookie_key = auth_conf.get("cookie_key", "CHANGE_ME")
     cookie_expiry_days = auth_conf.get("cookie_expiry_days", 30)
 
-    # Demo users JSON: {"email":{"name":"Full Name","password":"plain_or_hashed"}}
     raw_demo = auth_conf.get("demo_users", "{}")
     try:
         demo_users = json.loads(raw_demo)
     except Exception:
         demo_users = {}
 
-    # Build credentials dict for streamlit_authenticator
     names, usernames, passwords = [], [], []
     for email, info in demo_users.items():
         names.append(info.get("name", email.split("@")[0].title()))
         usernames.append(email)
         pwd = info.get("password", "pass123")
-        # Hash if not already pbkdf2:
         if not str(pwd).startswith("pbkdf2:"):
             pwd = stauth.Hasher([pwd]).generate()[0]
         passwords.append(pwd)
@@ -186,13 +204,12 @@ def init_auth():
     for i, u in enumerate(usernames):
         credentials["usernames"][u] = {"name": names[i], "password": passwords[i]}
 
-    authenticator = stauth.Authenticate(
+    return stauth.Authenticate(
         credentials,
         cookie_name=cookie_name,
         key=cookie_key,
         cookie_expiry_days=cookie_expiry_days,
     )
-    return authenticator
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Duplicate check & logging
@@ -227,20 +244,13 @@ def log_action(ws_log, user, action, details: dict):
 def main():
     # ─── Auth ────────────────────────────────────────────────────────────────
     authenticator = init_auth()
-    # New API: location + fields; results in st.session_state
     authenticator.login(
         "sidebar",
-        fields={
-            "Form name": "Login",
-            "Username": "Email",
-            "Password": "Password",
-            "Login": "Sign in",
-        },
+        fields={"Form name": "Login", "Username": "Email", "Password": "Password", "Login": "Sign in"},
     )
     auth_status = st.session_state.get("authentication_status")
     name = st.session_state.get("name")
     username = st.session_state.get("username")
-
     if not auth_status:
         st.stop()
 
@@ -255,124 +265,140 @@ def main():
     ws_data = get_ws(gc, DATA_SHEET_NAME)
     ws_logs = get_ws(gc, LOG_SHEET_NAME)
 
-    # ─── Sidebar: Refresh & Export ──────────────────────────────────────────
+    # ─── Sidebar: Data controls & Management report ─────────────────────────
     st.sidebar.markdown("### Data Controls")
     if st.sidebar.button("🔄 Refresh from Google Sheet"):
         read_df_cached.clear()
         st.experimental_rerun()
 
-    with st.sidebar.expander("⬇️ Export"):
+    with st.sidebar.expander("⬇️ Export & Management Report", expanded=False):
+        period_days = st.number_input(
+            "Days to include (1 = today)", min_value=1, max_value=90,
+            value=st.secrets.get("whatsapp_management", {}).get("default_period_days", 1),
+        )
+        note = st.text_area("Note to include (WhatsApp text)", value="RCM Intake report attached.", height=70)
+        if st.button("Send report to management via WhatsApp", use_container_width=True, disabled=not whatsapp_cfg_ok()):
+            try:
+                df_all = read_df_cached(DATA_SHEET_NAME)
+                if df_all.empty:
+                    st.warning("No data to send.")
+                else:
+                    # Filter by ServiceDate in last N days
+                    df_all["ServiceDate_dt"] = pd.to_datetime(df_all.get("ServiceDate", None), errors="coerce").dt.date
+                    start_date = (date.today() - timedelta(days=int(period_days) - 1))
+                    mask = df_all["ServiceDate_dt"].between(start_date, date.today())
+                    df_send = df_all.loc[mask].drop(columns=["ServiceDate_dt"], errors="ignore")
+                    if df_send.empty:
+                        st.warning("No rows in the selected period.")
+                    else:
+                        csv_bytes = df_send.to_csv(index=False).encode("utf-8")
+                        fname = st.secrets["whatsapp_management"].get("document_filename", "RCM_Intake_Report.csv")
+                        media_id = upload_media_to_whatsapp(csv_bytes, fname, "text/csv")
+                        send_document_to_numbers(media_id, fname, note)
+                        st.success("Report sent to management on WhatsApp.")
+                        log_action(ws_logs, username or name, "send_whatsapp_report", {"rows": int(df_send.shape[0]), "days": int(period_days)})
+            except Exception as e:
+                st.error(f"WhatsApp send failed: {e}")
+
         try:
             df_all = read_df_cached(DATA_SHEET_NAME)
-            csv = df_all.to_csv(index=False).encode("utf-8")
-            st.download_button("Export Data CSV", csv, "intake_data.csv", "text/csv")
+            if not df_all.empty:
+                csv = df_all.to_csv(index=False).encode("utf-8")
+                st.download_button("Export ALL data as CSV", csv, "intake_data_all.csv", "text/csv", use_container_width=True)
         except Exception as e:
-            st.sidebar.warning(f"Cannot export now: {e}")
+            st.warning(f"Cannot export now: {e}")
 
     # ─── Title ──────────────────────────────────────────────────────────────
     st.title("🧾 RCM Intake")
-    st.caption("Fast data entry to Google Sheets with duplicate warning, caching, and WhatsApp confirmation.")
+    st.caption("UAE RCM intake form with Emirates ID & Insurance. Duplicate warning, caching, logs, and WhatsApp report to management.")
 
     # ─── Reference lists (optional) ─────────────────────────────────────────
     def get_reference_options():
         try:
             df_ref = read_df_cached(REFERENCE_SHEET)
             payers = sorted([x for x in df_ref.get("Payer", []).dropna().unique().tolist() if x])
+            insurers = sorted([x for x in df_ref.get("Insurance", []).dropna().unique().tolist() if x])
             clinicians = sorted([x for x in df_ref.get("Clinician", []).dropna().unique().tolist() if x])
-            return payers or ["Daman", "NAS", "Neuron", "Nextcare"], clinicians or ["Dr A", "Dr B"]
+            return (
+                payers or ["Daman", "NAS", "Neuron", "Nextcare"],
+                insurers or ["Daman", "NAS", "Neuron", "Nextcare"],
+                clinicians or ["—"],
+            )
         except Exception:
-            return ["Daman", "NAS", "Neuron", "Nextcare"], ["Dr A", "Dr B"]
+            return (["Daman", "NAS", "Neuron", "Nextcare"], ["Daman", "NAS", "Neuron", "Nextcare"], ["—"])
 
-    payers, clinicians = get_reference_options()
+    payers, insurers, clinicians = get_reference_options()
 
-    # ─── Form ───────────────────────────────────────────────────────────────
+    # ─── Form (YOUR FIELDS) ────────────────────────────────────────────────
+    # Headers in the Google Sheet (fixed order for clean Excel):
+    HEADER = [
+        "Timestamp", "ServiceDate", "PatientName",
+        "EmiratesID", "Insurance", "MemberID", "PolicyNumber",
+        "ERXNumber", "Payer", "Clinician",
+        "Net", "Remarks", "EnteredBy",
+    ]
+    write_header_if_empty(ws_data, HEADER)
+
     form_key = st.session_state.get("form_key", "intake_form")
     with st.form(key=form_key):
-        cols1 = st.columns([1, 1, 1, 1])
-        with cols1[0]:
+        c1 = st.columns([1,1,1,1])
+        with c1[0]:
             service_date = st.date_input("Service Date", value=date.today())
-        with cols1[1]:
+        with c1[1]:
             patient_name = st.text_input("Patient Name")
-        with cols1[2]:
-            member_id = st.text_input("MemberID")
-        with cols1[3]:
-            erx_number = st.text_input("ERXNumber")
+        with c1[2]:
+            emirates_id  = st.text_input("Emirates ID")
+        with c1[3]:
+            insurance    = st.selectbox("Insurance", options=insurers, index=0)
 
-        cols2 = st.columns([1, 1, 1, 1])
-        with cols2[0]:
-            payer = st.selectbox("Payer", options=payers, index=0)
-        with cols2[1]:
-            clinician = st.selectbox("Clinician", options=clinicians, index=0)
-        with cols2[2]:
-            net_amount = st.number_input("Net", min_value=0.0, step=0.01, format="%.2f")
-        with cols2[3]:
-            remarks = st.text_area("Remarks (optional)", height=48)
+        c2 = st.columns([1,1,1,1])
+        with c2[0]:
+            member_id    = st.text_input("Member ID")
+        with c2[1]:
+            policy_no    = st.text_input("Policy Number")
+        with c2[2]:
+            erx_number   = st.text_input("ERX Number")
+        with c2[3]:
+            payer        = st.selectbox("Payer", options=payers, index=0)
 
-        cols3 = st.columns([1, 1, 1, 1])
-        with cols3[0]:
-            patient_phone = st.text_input("Patient WhatsApp (E.164, e.g., 9715XXXXXXXX)", value="")
-        with cols3[1]:
-            send_whatsapp = st.checkbox("Send WhatsApp confirmation", value=False, disabled=not whatsapp_enabled())
-        with cols3[2]:
+        c3 = st.columns([1,1,1,1])
+        with c3[0]:
+            clinician    = st.selectbox("Clinician (optional)", options=clinicians, index=0)
+        with c3[1]:
+            net_amount   = st.number_input("Net Amount", min_value=0.0, step=0.01, format="%.2f")
+        with c3[2]:
+            remarks      = st.text_area("Remarks (optional)", height=48)
+        with c3[3]:
             allow_override = st.checkbox("Allow duplicate override", value=False)
-        with cols3[3]:
-            pass
 
         submitted = st.form_submit_button("💾 Submit", use_container_width=True)
 
     # ─── On Submit ──────────────────────────────────────────────────────────
     if submitted:
         try:
-            # Basic required fields (remarks optional)
+            # Required: ERX, MemberID, Net. (Remarks optional; others recommended)
             if not (erx_number and member_id and net_amount is not None):
-                st.error("ERXNumber, MemberID, and Net are required.")
+                st.error("ERX Number, Member ID, and Net Amount are required.")
                 st.stop()
 
-            # Load current data (cached)
             df_existing = read_df_cached(DATA_SHEET_NAME)
-
-            # Duplicate check for same day (ERX + MemberID + Net)
             dup = is_duplicate(df_existing, erx_number, member_id, net_amount, service_date)
             if dup and not allow_override:
-                st.warning(
-                    "Possible duplicate detected for **today** (ERX + MemberID + Net). "
-                    "Tick **Allow duplicate override** to proceed anyway."
-                )
+                st.warning("Possible duplicate for today (ERX + Member ID + Net). Tick 'Allow duplicate override' to proceed.")
                 st.stop()
 
-            # Prepare values in a consistent header order
-            header = [
-                "Timestamp", "ServiceDate", "PatientName", "MemberID", "ERXNumber",
-                "Payer", "Clinician", "Net", "Remarks", "EnteredBy"
-            ]
-            write_header_if_empty(ws_data, header)
-
             now_ts = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-            values = [
-                now_ts,
-                service_date.strftime("%Y-%m-%d"),
-                patient_name,
-                member_id,
-                erx_number,
-                payer,
-                clinician,
+            row = [
+                now_ts, service_date.strftime("%Y-%m-%d"), patient_name,
+                emirates_id, insurance, member_id, policy_no,
+                erx_number, payer, clinician,
                 float(net_amount) if net_amount is not None else "",
-                remarks,
-                username or name,
+                remarks, username or name,
             ]
-            append_row(ws_data, values)
+            append_row(ws_data, row)
 
-            # Optional: WhatsApp confirmation
-            if send_whatsapp and patient_phone:
-                try:
-                    send_whatsapp_message(patient_phone, [patient_name or "-", erx_number, f"{net_amount:.2f}"])
-                    st.info("WhatsApp confirmation sent.")
-                except Exception as e:
-                    st.warning(f"WhatsApp send failed: {e}")
-
-            # Log the action
             log_action(
-                ws_logs,
+                get_ws(gc, LOG_SHEET_NAME),
                 user=username or name,
                 action="submit",
                 details={
@@ -384,7 +410,6 @@ def main():
                 },
             )
 
-            # Invalidate caches & reset form
             read_df_cached.clear()
             st.success("✅ Saved! Ready for the next entry.")
             st.session_state["form_key"] = str(datetime.now().timestamp())
@@ -393,7 +418,7 @@ def main():
         except Exception as e:
             st.error(f"Failed to save: {e}")
 
-    # ─── Data Preview (read-only, cached) ────────────────────────────────────
+    # ─── Data Preview ───────────────────────────────────────────────────────
     with st.expander("📋 Latest Entries (read-only)", expanded=False):
         try:
             df = read_df_cached(DATA_SHEET_NAME)
@@ -404,14 +429,8 @@ def main():
         except Exception as e:
             st.warning(f"Cannot load data: {e}")
 
-    # ─── Footer note ────────────────────────────────────────────────────────
-    st.caption(
-        "Reads are cached (~60s) to avoid Google API rate limits. "
-        "Use the sidebar **Refresh** if you just added data."
-    )
+    st.caption("Reads are cached (~60s) to avoid Google API rate limits. Use the sidebar **Refresh** if you just added data.")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Entrypoint
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
