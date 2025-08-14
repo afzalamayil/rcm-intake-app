@@ -1,15 +1,14 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# File: app.py — Streamlit (Option B) — RITE TECH BRANDED
+# File: app.py  — Streamlit (Option B) — RITE TECH BRANDED (quota-friendly)
 # ─────────────────────────────────────────────────────────────────────────────
-# Folders expected in your repo:
+# Folders expected:
 #   assets/logo.png
 #   .streamlit/config.toml  (theme)
-# Secrets expected in Streamlit Cloud → App → Settings → Secrets
+# Secrets expected in Streamlit Cloud → App → Settings → Secrets (TOML you pasted)
 # ─────────────────────────────────────────────────────────────────────────────
 
 import io
 import os
-import re
 import json
 import pandas as pd
 import streamlit as st
@@ -20,6 +19,7 @@ import streamlit_authenticator as stauth
 
 # Google Sheets
 import gspread
+from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
 
 # Email
@@ -45,7 +45,6 @@ st.set_page_config(
 try:
     col_logo, col_title = st.columns([1, 8], vertical_alignment="center")
 except TypeError:
-    # Streamlit <1.33 compatibility
     col_logo, col_title = st.columns([1, 8])
 if os.path.exists(LOGO_PATH):
     col_logo.image(LOGO_PATH, use_container_width=True)
@@ -55,17 +54,21 @@ st.caption("Free stack: Streamlit Cloud + Google Sheets. Email via SMTP. WhatsAp
 # ─────────────────────────────────────────────────────────────────────────────
 # Secrets & Google Auth
 # ─────────────────────────────────────────────────────────────────────────────
-AUTH_SECRETS  = st.secrets.get("auth", {})
-SMTP_SECRETS  = st.secrets.get("smtp", {})
-GS_SECRETS    = st.secrets.get("gsheets", {})
+AUTH_SECRETS = st.secrets.get("auth", {})
+SMTP_SECRETS = st.secrets.get("smtp", {})
+GS_SECRETS   = st.secrets.get("gsheets", {})
 ROLE_MAP_JSON = st.secrets.get("roles", {}).get("mapping", "{}")
-UI_BRAND      = st.secrets.get("ui", {}).get("brand", "")
+UI_BRAND = st.secrets.get("ui", {}).get("brand", "")
 
 with st.sidebar:
     if os.path.exists(LOGO_PATH):
         st.image(LOGO_PATH, use_container_width=True)
     if UI_BRAND:
         st.success(f"👋 {UI_BRAND}")
+    # Manual cache refresh
+    if st.button("↻ Refresh from Google Sheets"):
+        st.cache_data.clear()
+        st.experimental_rerun()
 
 REQUIRED_GS_KEYS = [
     "type","project_id","private_key_id","private_key","client_email","client_id",
@@ -80,55 +83,51 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-def extract_sheet_id(maybe_url: str) -> str:
-    """Accept a bare ID or a full URL and return the spreadsheet ID only."""
-    if not maybe_url:
-        return ""
-    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", maybe_url)
-    return m.group(1) if m else maybe_url.strip()
-
 sh = None
 if not missing_gs:
-    creds = Credentials.from_service_account_info(dict(GS_SECRETS), scopes=SCOPES)
-    gc = gspread.authorize(creds)
+    try:
+        creds = Credentials.from_service_account_info(dict(GS_SECRETS), scopes=SCOPES)
+        gc = gspread.authorize(creds)
+    except Exception as e:
+        st.error(f"Could not connect to Google Sheets: {e}")
+        st.stop()
 
-    SPREADSHEET_ID_RAW = GS_SECRETS.get("spreadsheet_id", "").strip()
-    SPREADSHEET_ID     = extract_sheet_id(SPREADSHEET_ID_RAW)
-    SPREADSHEET_NAME   = GS_SECRETS.get("spreadsheet_name", "RCM_Intake_DB").strip()
+    SPREADSHEET_ID = GS_SECRETS.get("spreadsheet_id", "").strip()
+    SPREADSHEET_NAME = GS_SECRETS.get("spreadsheet_name", "RCM_Intake_DB").strip()
 
     try:
         if SPREADSHEET_ID:
             sh = gc.open_by_key(SPREADSHEET_ID)
         else:
-            # open by name (must exist or we create it)
-            try:
-                sh = gc.open(SPREADSHEET_NAME)
-            except gspread.SpreadsheetNotFound:
-                sh = gc.create(SPREADSHEET_NAME)
-                st.info(f"Created new spreadsheet under the service account: {sh.url}")
+            sh = gc.open(SPREADSHEET_NAME)
     except gspread.SpreadsheetNotFound:
-        st.error("Spreadsheet ID not found or no access. Share the sheet with the service account in [gsheets].client_email.")
-        st.stop()
-    except Exception as e:
+        if not SPREADSHEET_ID:
+            sh = gc.create(SPREADSHEET_NAME)
+            st.info(f"Created new spreadsheet under the service account: {sh.url}")
+        else:
+            st.error("Spreadsheet ID not found or no access. Share the sheet with the service account in [gsheets].client_email.")
+            st.stop()
+    except APIError as e:
         st.error(f"Could not connect to Google Sheets: {e}")
         st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sheet Tabs
+# Sheet tabs / names
 # ─────────────────────────────────────────────────────────────────────────────
-DATA_TAB   = "Data"
-USERS_TAB  = "Users"
-MS_PHARM   = "Pharmacies"
+DATA_TAB = "Data"
+USERS_TAB = "Users"
+MASTERS_TAB = "Masters"
+MS_PHARM = "Pharmacies"
 MS_INSURANCE = "Insurance"
 MS_SUBMISSION_MODE = "SubmissionMode"
-MS_PORTAL  = "Portal"
-MS_STATUS  = "Status"
+MS_PORTAL = "Portal"
+MS_STATUS = "Status"
 MS_REMARKS = "Remarks"
 CLIENTS_TAB = "Clients"
 CLIENT_CONTACTS_TAB = "ClientContacts"
 
 DEFAULT_TABS = [
-    DATA_TAB, USERS_TAB, MS_PHARM, MS_INSURANCE,
+    DATA_TAB, USERS_TAB, MASTERS_TAB, MS_PHARM, MS_INSURANCE,
     MS_SUBMISSION_MODE, MS_PORTAL, MS_STATUS, MS_REMARKS,
     CLIENTS_TAB, CLIENT_CONTACTS_TAB
 ]
@@ -136,66 +135,94 @@ DEFAULT_TABS = [
 def ws(title):
     return sh.worksheet(title)
 
-if not missing_gs:
-    existing_titles = [wst.title for wst in sh.worksheets()]
-    for t in DEFAULT_TABS:
-        if t not in existing_titles:
-            sh.add_worksheet(title=t, rows=200, cols=26)
-
-# Ensure headers for Data (robust)
-DATA_HEADERS = [
-    "Timestamp","SubmittedBy","Role","ClientID",
-    "EmployeeName","SubmissionDate","PharmacyName","SubmissionMode",
-    "Portal","ERXNumber","InsuranceCode","InsuranceName",
-    "MemberID","EID","ClaimID","ApprovalCode",
-    "NetAmount","PatientShare","Remark","Status"
-]
-
-if not missing_gs:
-    wsd = ws(DATA_TAB)
+# One-time bootstrap per session (avoid quota burn on reruns)
+if not missing_gs and "sheets_bootstrapped" not in st.session_state:
     try:
-        # read only the header row
-        existing = wsd.get('A1:T1')
-    except Exception:
-        st.error("Could not read the Data sheet. Check service account access & APIs enabled.")
+        existing_titles = [wst.title for wst in sh.worksheets()]
+        for t in DEFAULT_TABS:
+            if t not in existing_titles:
+                sh.add_worksheet(title=t, rows=200, cols=26)
+    except APIError as e:
+        st.error(f"Google Sheets error while preparing tabs: {e}")
         st.stop()
 
-    if not existing or not any(existing[0]):
-        try:
+    # Ensure headers for Data (write only if missing)
+    DATA_HEADERS = [
+        "Timestamp","SubmittedBy","Role","ClientID",
+        "EmployeeName","SubmissionDate","PharmacyName","SubmissionMode",
+        "Portal","ERXNumber","InsuranceCode","InsuranceName",
+        "MemberID","EID","ClaimID","ApprovalCode",
+        "NetAmount","PatientShare","Remark","Status"
+    ]
+    try:
+        wsd = ws(DATA_TAB)
+        existing = wsd.get('A1:T1')
+        if not existing or not any(existing[0]):
             wsd.update('A1', [DATA_HEADERS])
-        except Exception:
-            st.error("Could not write headers to Data sheet. Verify Editor access for the service account.")
-            st.stop()
+    except APIError as e:
+        st.error(f"Could not read/write the Data sheet header: {e}")
+        st.stop()
 
-# Preload minimal masters if empty
-DEFAULT_MASTER_VALUES = {
-    MS_SUBMISSION_MODE: ["Walk-in", "Phone", "Email", "Portal"],
-    MS_PORTAL: ["DHPO", "Riayati", "Insurance Portal"],
-    MS_STATUS: ["Submitted", "Approved", "Rejected", "Pending", "RA Pending"],
-}
-if not missing_gs:
-    for tab, values in DEFAULT_MASTER_VALUES.items():
-        wsx = ws(tab)
-        vals = wsx.get_all_values()
-        if not vals:
-            wsx.update("A1", [["Value"]] + [[v] for v in values])
+    # Seed basic masters when empty
+    DEFAULT_MASTER_VALUES = {
+        MS_SUBMISSION_MODE: ["Walk-in", "Phone", "Email", "Portal"],
+        MS_PORTAL: ["DHPO", "Riayati", "Insurance Portal"],
+        MS_STATUS: ["Submitted", "Approved", "Rejected", "Pending", "RA Pending"],
+    }
+    try:
+        for tab, values in DEFAULT_MASTER_VALUES.items():
+            wsx = ws(tab)
+            vals = wsx.get_all_values()
+            if not vals:
+                wsx.update("A1", [["Value"]] + [[v] for v in values])
+    except APIError as e:
+        st.warning(f"Could not seed default masters: {e}")
+
+    st.session_state["sheets_bootstrapped"] = True
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Role + Client mapping
+# Cached READ helpers (reduce API hits; 60s TTL)
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_get_all_records(sheet_title: str) -> pd.DataFrame:
+    try:
+        return pd.DataFrame(ws(sheet_title).get_all_records())
+    except APIError as e:
+        st.error(f"Google Sheets read error (records) on '{sheet_title}': {e}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_get_all_values(sheet_title: str):
+    try:
+        return ws(sheet_title).get_all_values()
+    except APIError as e:
+        st.error(f"Google Sheets read error (values) on '{sheet_title}': {e}")
+        return []
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_range_first_row(sheet_title: str, end_col: str = "T"):
+    try:
+        return ws(sheet_title).get(f"A1:{end_col}1")
+    except APIError as e:
+        st.error(f"Google Sheets read error (header) on '{sheet_title}': {e}")
+        return []
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Role + Client mapping and Authentication
 # ─────────────────────────────────────────────────────────────────────────────
 def load_users_rolemap_from_sheet():
     try:
-        df = pd.DataFrame(ws(USERS_TAB).get_all_records())
-        return None if df.empty else df
+        df = cached_get_all_records(USERS_TAB)
+        if df.empty:
+            return None
+        return df
     except Exception:
         return None
 
 USERS_DF = load_users_rolemap_from_sheet()
-ROLE_MAP  = json.loads(ROLE_MAP_JSON or "{}")
+ROLE_MAP = json.loads(ROLE_MAP_JSON or "{}")
 if USERS_DF is None and not ROLE_MAP:
-    ROLE_MAP = {
-        "admin@example.com": {"role": "Super Admin", "clients": ["ALL"]}
-    }
+    ROLE_MAP = {"admin@example.com": {"role": "Super Admin", "clients": ["ALL"]}}
 
 def build_authenticator():
     if USERS_DF is not None and not USERS_DF.empty:
@@ -251,10 +278,10 @@ with st.sidebar:
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Utilities for masters
+# Utilities for masters (use cached reads)
 # ─────────────────────────────────────────────────────────────────────────────
 def sheet_to_list(title, prefer_cols=("Value","Name","Mode","Portal")):
-    rows = ws(title).get_all_values()
+    rows = cached_get_all_values(title)
     if not rows:
         return []
     header = rows[0] if rows else []
@@ -265,19 +292,18 @@ def sheet_to_list(title, prefer_cols=("Value","Name","Mode","Portal")):
     return [r[0] for r in rows[1:] if r and r[0]]
 
 def pharmacy_list():
-    df = pd.DataFrame(ws(MS_PHARM).get_all_records())
+    df = cached_get_all_records(MS_PHARM)
     if df.empty:
         return sheet_to_list(MS_PHARM)
     df = df.fillna("")
     if {"ID","Name"}.issubset(df.columns):
-        disp = df["ID"].astype(str).str.strip() + " - " + df["Name"].astype(str).str.strip()
-        return disp.tolist()
+        return (df["ID"].astype(str).str.strip() + " - " + df["Name"].astype(str).str.strip()).tolist()
     if "Name" in df.columns:
         return df["Name"].dropna().astype(str).tolist()
     return sheet_to_list(MS_PHARM)
 
 def insurance_list():
-    df = pd.DataFrame(ws(MS_INSURANCE).get_all_records())
+    df = cached_get_all_records(MS_INSURANCE)
     if df.empty:
         return [], pd.DataFrame()
     df = df.fillna("")
@@ -285,7 +311,7 @@ def insurance_list():
     return df['Display'].tolist(), df
 
 def clients_list():
-    df = pd.DataFrame(ws(CLIENTS_TAB).get_all_records())
+    df = cached_get_all_records(CLIENTS_TAB)
     if df.empty:
         return []
     if "ClientID" in df.columns:
@@ -293,9 +319,10 @@ def clients_list():
     return []
 
 def client_contacts_map():
-    df = pd.DataFrame(ws(CLIENT_CONTACTS_TAB).get_all_records())
+    df = cached_get_all_records(CLIENT_CONTACTS_TAB)
     mapping = {}
     if not df.empty:
+        df = df.fillna("")
         for _, row in df.iterrows():
             cid = str(row.get("ClientID","")).strip()
             to = [e.strip() for e in str(row.get("To","")).split(",") if e.strip()]
@@ -316,64 +343,66 @@ def filter_allowed_clients(candidates):
 ALLOWED_CLIENT_CHOICES = filter_allowed_clients(ALL_CLIENT_IDS)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Page: Intake Form
+# Page: Intake Form  (wrapped in st.form to avoid per-keystroke reruns)
 # ─────────────────────────────────────────────────────────────────────────────
 if page == "Intake Form":
     st.subheader("New Submission")
 
-    sel_client = st.selectbox("Client ID*", ALLOWED_CLIENT_CHOICES)
+    with st.form("intake_form", clear_on_submit=False):
+        sel_client = st.selectbox("Client ID*", ALLOWED_CLIENT_CHOICES)
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        employee_name = st.text_input("Employee Name*")
-        submission_date = st.date_input("Submission Date*", value=date.today())
-        submission_mode = st.selectbox("Submission Mode*", sheet_to_list(MS_SUBMISSION_MODE))
-    with col2:
-        pharmacy_name = st.selectbox("Pharmacy Name*", pharmacy_list())
-        portal = st.selectbox("Portal* (DHPO / Riayati / Insurance Portal)", sheet_to_list(MS_PORTAL))
-        erx_number = st.text_input("ERX Number*")
-    with col3:
-        ins_display_list, ins_df = insurance_list()
-        insurance_display = st.selectbox("Insurance (Code + Name)*", ins_display_list)
-        member_id = st.text_input("Member ID*")
-        eid = st.text_input("EID*")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            employee_name = st.text_input("Employee Name*")
+            submission_date = st.date_input("Submission Date*", value=date.today())
+            submission_mode = st.selectbox("Submission Mode*", sheet_to_list(MS_SUBMISSION_MODE))
+        with col2:
+            pharmacy_name = st.selectbox("Pharmacy Name*", pharmacy_list())
+            portal = st.selectbox("Portal* (DHPO / Riayati / Insurance Portal)", sheet_to_list(MS_PORTAL))
+            erx_number = st.text_input("ERX Number*")
+        with col3:
+            ins_display_list, ins_df = insurance_list()
+            insurance_display = st.selectbox("Insurance (Code + Name)*", ins_display_list)
+            member_id = st.text_input("Member ID*")
+            eid = st.text_input("EID*")
 
-    claim_id = st.text_input("Claim ID*")
-    approval_code = st.text_input("Approval Code*")
+        claim_id = st.text_input("Claim ID*")
+        approval_code = st.text_input("Approval Code*")
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        net_amount = st.number_input("Net Amount*", min_value=0.0, step=0.01, format="%.2f")
-    with c2:
-        patient_share = st.number_input("Patient Share*", min_value=0.0, step=0.01, format="%.2f")
-    with c3:
-        status = st.selectbox("Status*", sheet_to_list(MS_STATUS))
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            net_amount = st.number_input("Net Amount*", min_value=0.0, step=0.01, format="%.2f")
+        with c2:
+            patient_share = st.number_input("Patient Share*", min_value=0.0, step=0.01, format="%.2f")
+        with c3:
+            status = st.selectbox("Status*", sheet_to_list(MS_STATUS))
 
-    remark = st.text_area("Remark* (short note)")
+        remark = st.text_area("Remark* (short note)")
 
-    # Validation
-    missing = []
-    for label, val in [
-        ("Employee Name", employee_name),
-        ("Submission Date", submission_date),
-        ("Pharmacy Name", pharmacy_name),
-        ("Submission Mode", submission_mode),
-        ("Portal", portal),
-        ("ERX Number", erx_number),
-        ("Insurance", insurance_display),
-        ("Member ID", member_id),
-        ("EID", eid),
-        ("Claim ID", claim_id),
-        ("Approval Code", approval_code),
-        ("Net Amount", net_amount),
-        ("Patient Share", patient_share),
-        ("Remark", remark),
-        ("Status", status),
-    ]:
-        if (isinstance(val, str) and not val.strip()) or val is None:
-            missing.append(label)
+        submitted = st.form_submit_button("Submit", type="primary")
 
-    if st.button("Submit", type="primary"):
+    if submitted:
+        missing = []
+        for label, val in [
+            ("Employee Name", employee_name),
+            ("Submission Date", submission_date),
+            ("Pharmacy Name", pharmacy_name),
+            ("Submission Mode", submission_mode),
+            ("Portal", portal),
+            ("ERX Number", erx_number),
+            ("Insurance", insurance_display),
+            ("Member ID", member_id),
+            ("EID", eid),
+            ("Claim ID", claim_id),
+            ("Approval Code", approval_code),
+            ("Net Amount", net_amount),
+            ("Patient Share", patient_share),
+            ("Remark", remark),
+            ("Status", status),
+        ]:
+            if (isinstance(val, str) and not val.strip()) or val is None:
+                missing.append(label)
+
         if missing:
             st.error("Missing required fields: " + ", ".join(missing))
         else:
@@ -406,8 +435,12 @@ if page == "Intake Form":
                 remark.strip(),
                 status
             ]
-            ws(DATA_TAB).append_row(record)
-            st.success("Saved ✔️")
+            try:
+                ws(DATA_TAB).append_row(record)
+                st.success("Saved ✔️")
+                st.cache_data.clear()  # ensure fresh reads on next view
+            except APIError as e:
+                st.error(f"Google Sheets write error: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page: View / Export
@@ -415,7 +448,12 @@ if page == "Intake Form":
 if page == "View / Export":
     st.subheader("Search, Filter & Export")
 
-    df = pd.DataFrame(ws(DATA_TAB).get_all_records())
+    try:
+        df = cached_get_all_records(DATA_TAB)
+    except Exception as e:
+        st.error(f"Could not load data: {e}")
+        st.stop()
+
     if df.empty:
         st.info("No records yet.")
         st.stop()
@@ -458,7 +496,12 @@ if page == "View / Export":
 
     xbytes = to_excel_bytes(df)
     from datetime import datetime as _dt
-    st.download_button("⬇️ Download Excel", data=xbytes, file_name=f"RCM_Intake_Export_{_dt.now():%Y%m%d_%H%M%S}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button(
+        "⬇️ Download Excel",
+        data=xbytes,
+        file_name=f"RCM_Intake_Export_{_dt.now():%Y%m%d_%H%M%S}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page: Email / WhatsApp
@@ -466,7 +509,7 @@ if page == "View / Export":
 if page == "Email / WhatsApp":
     st.subheader("Send Report")
 
-    df = pd.DataFrame(ws(DATA_TAB).get_all_records())
+    df = cached_get_all_records(DATA_TAB)
     if df.empty:
         st.info("No records to send.")
         st.stop()
@@ -531,7 +574,6 @@ if page == "Email / WhatsApp":
         if cc_list:
             msg['Cc'] = ", ".join(cc_list)
         msg['Subject'] = subject
-
         msg.attach(MIMEText(body, 'plain'))
 
         part = MIMEBase('application', 'octet-stream')
@@ -589,9 +631,8 @@ if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
 
     # Pharmacies
     with tabs[0]:
-        df = pd.DataFrame(ws(MS_PHARM).get_all_records())
-        has_id_name = {"ID", "Name"}.issubset(df.columns)
-
+        df = cached_get_all_records(MS_PHARM)
+        has_id_name = {"ID","Name"}.issubset(df.columns)
         if has_id_name:
             st.dataframe(df if not df.empty else pd.DataFrame(columns=["ID","Name"]), use_container_width=True)
             c1, c2 = st.columns(2)
@@ -604,12 +645,12 @@ if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
                     st.error("Both ID and Name required")
                 else:
                     ws_p = ws(MS_PHARM)
-                    all_vals = ws_p.get_all_values()
-                    if not all_vals:
+                    rows = cached_get_all_values(MS_PHARM)
+                    if not rows:
                         ws_p.update("A1", [["ID","Name"]])
-                        all_vals = [["ID","Name"]]
+                        rows = [["ID","Name"]]
                     found_row = None
-                    for idx, r in enumerate(all_vals[1:], start=2):
+                    for idx, r in enumerate(rows[1:], start=2):
                         if len(r) >= 1 and r[0].strip().lower() == new_pid.strip().lower():
                             found_row = idx
                             break
@@ -619,18 +660,17 @@ if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
                     else:
                         ws_p.append_row([new_pid.strip(), new_pname.strip()])
                         st.success("Added")
-                    st.rerun()
+                    st.cache_data.clear(); st.rerun()
         else:
             st.dataframe(df if not df.empty else pd.DataFrame(columns=["Value"]), use_container_width=True)
             new_val = st.text_input("Add Pharmacy (single column)")
             if st.button("Add Pharmacy") and new_val.strip():
                 ws(MS_PHARM).append_row([new_val.strip()])
-                st.success("Added")
-                st.rerun()
+                st.success("Added"); st.cache_data.clear(); st.rerun()
 
     # Insurance
     with tabs[1]:
-        df = pd.DataFrame(ws(MS_INSURANCE).get_all_records())
+        df = cached_get_all_records(MS_INSURANCE)
         if df.empty:
             df = pd.DataFrame(columns=["Code","Name"])
         st.dataframe(df, use_container_width=True)
@@ -644,7 +684,7 @@ if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
                 st.error("Both Code and Name required")
             else:
                 ws_ins = ws(MS_INSURANCE)
-                rows = ws_ins.get_all_values()
+                rows = cached_get_all_values(MS_INSURANCE)
                 if not rows:
                     ws_ins.update("A1", [["Code","Name"]])
                     rows = [["Code","Name"]]
@@ -659,51 +699,47 @@ if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
                 else:
                     ws_ins.append_row([code.strip(), name_ins.strip()])
                     st.success("Added")
-                st.rerun()
+                st.cache_data.clear(); st.rerun()
 
     # Submission Mode
     with tabs[2]:
-        df = pd.DataFrame(ws(MS_SUBMISSION_MODE).get_all_records())
+        df = cached_get_all_records(MS_SUBMISSION_MODE)
         st.dataframe(df if not df.empty else pd.DataFrame(columns=["Value"]), use_container_width=True)
         new_val = st.text_input("Add Submission Mode")
         if st.button("Add Mode") and new_val.strip():
             ws(MS_SUBMISSION_MODE).append_row([new_val.strip()])
-            st.success("Added")
-            st.rerun()
+            st.success("Added"); st.cache_data.clear(); st.rerun()
 
     # Portal
     with tabs[3]:
-        df = pd.DataFrame(ws(MS_PORTAL).get_all_records())
+        df = cached_get_all_records(MS_PORTAL)
         st.dataframe(df if not df.empty else pd.DataFrame(columns=["Value"]), use_container_width=True)
         new_val = st.text_input("Add Portal (DHPO/Riayati/Insurance Portal etc.)")
         if st.button("Add Portal") and new_val.strip():
             ws(MS_PORTAL).append_row([new_val.strip()])
-            st.success("Added")
-            st.rerun()
+            st.success("Added"); st.cache_data.clear(); st.rerun()
 
     # Status
     with tabs[4]:
-        df = pd.DataFrame(ws(MS_STATUS).get_all_records())
+        df = cached_get_all_records(MS_STATUS)
         st.dataframe(df if not df.empty else pd.DataFrame(columns=["Value"]), use_container_width=True)
         new_val = st.text_input("Add Status")
         if st.button("Add Status") and new_val.strip():
             ws(MS_STATUS).append_row([new_val.strip()])
-            st.success("Added")
-            st.rerun()
+            st.success("Added"); st.cache_data.clear(); st.rerun()
 
-    # Remarks (optional)
+    # Remarks
     with tabs[5]:
-        df = pd.DataFrame(ws(MS_REMARKS).get_all_records())
+        df = cached_get_all_records(MS_REMARKS)
         st.dataframe(df if not df.empty else pd.DataFrame(columns=["Value"]), use_container_width=True)
         new_val = st.text_input("Add Remark Template")
         if st.button("Add Remark") and new_val.strip():
             ws(MS_REMARKS).append_row([new_val.strip()])
-            st.success("Added")
-            st.rerun()
+            st.success("Added"); st.cache_data.clear(); st.rerun()
 
     # Clients
     with tabs[6]:
-        df = pd.DataFrame(ws(CLIENTS_TAB).get_all_records())
+        df = cached_get_all_records(CLIENTS_TAB)
         if df.empty:
             df = pd.DataFrame(columns=["ClientID","ClientName"])
         st.dataframe(df, use_container_width=True)
@@ -717,7 +753,7 @@ if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
                 st.error("Both ClientID and ClientName required")
             else:
                 ws_c = ws(CLIENTS_TAB)
-                rows = ws_c.get_all_values()
+                rows = cached_get_all_values(CLIENTS_TAB)
                 if not rows:
                     ws_c.update("A1", [["ClientID","ClientName"]])
                     rows = [["ClientID","ClientName"]]
@@ -732,11 +768,11 @@ if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
                 else:
                     ws_c.append_row([cid.strip(), cname.strip()])
                     st.success("Added")
-                st.rerun()
+                st.cache_data.clear(); st.rerun()
 
     # Client Contacts
     with tabs[7]:
-        df = pd.DataFrame(ws(CLIENT_CONTACTS_TAB).get_all_records())
+        df = cached_get_all_records(CLIENT_CONTACTS_TAB)
         if df.empty:
             df = pd.DataFrame(columns=["ClientID","To","CC"])
         st.dataframe(df, use_container_width=True)
@@ -752,7 +788,7 @@ if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
                 st.error("ClientID and To are required")
             else:
                 ws_ct = ws(CLIENT_CONTACTS_TAB)
-                rows = ws_ct.get_all_values()
+                rows = cached_get_all_values(CLIENT_CONTACTS_TAB)
                 if not rows:
                     ws_ct.update("A1", [["ClientID","To","CC"]])
                     rows = [["ClientID","To","CC"]]
@@ -767,12 +803,12 @@ if page == "Masters Admin" and ROLE in ("Super Admin", "Admin"):
                 else:
                     ws_ct.append_row([ccid.strip(), cto.strip(), ccc.strip()])
                     st.success("Added")
-                st.rerun()
+                st.cache_data.clear(); st.rerun()
 
     # Users (view)
     with tabs[8]:
         st.info("Manage users in the 'Users' sheet with columns: username, name, password (hashed), role, clients (comma-separated).")
-        df = pd.DataFrame(ws(USERS_TAB).get_all_records())
+        df = cached_get_all_records(USERS_TAB)
         st.dataframe(df if not df.empty else pd.DataFrame(columns=["username","name","password","role","clients"]), use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -792,10 +828,11 @@ if page == "Bulk Import Insurance" and ROLE in ("Super Admin", "Admin"):
                 ws_ins.clear()
                 rows = [["Code","Name"]] + df[['Code','Name']].fillna("").astype(str).values.tolist()
                 ws_ins.update("A1", rows)
+                st.cache_data.clear()
                 st.success("Insurance master replaced ✔️")
         except Exception as e:
             st.error(f"Import error: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# END — app.py (RiteTech Branded)
+# END — app.py
 # ─────────────────────────────────────────────────────────────────────────────
