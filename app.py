@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# File: app.py — Streamlit (Option B) — RITE TECH BRANDED (full)
+# File: app.py — Streamlit (Option B) — RITE TECH BRANDED (full + duplicate check)
 # ─────────────────────────────────────────────────────────────────────────────
 import io
 import os
@@ -215,8 +215,10 @@ def insurance_list():
         df["Display"] = df["Code"].astype(str).str.strip() + " - " + df["Name"].astype(str).str.strip()
         return df["Display"].tolist(), df
     # fallback
-    df["Display"] = df.apply(lambda r: " - ".join([str(r.get("Code","")).strip(), str(r.get("Name","")).strip()]).strip(" -"),
-                            axis=1)
+    df["Display"] = df.apply(
+        lambda r: " - ".join([str(r.get("Code","")).strip(), str(r.get("Name","")).strip()]).strip(" -"),
+        axis=1
+    )
     return df["Display"].tolist(), df
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -239,6 +241,36 @@ def client_contacts_map():
                 mapping[cid] = {"to": to, "cc": cc}
     return mapping
 
+# --- Duplicate check helper ---
+def is_potential_duplicate(erx_number: str, member_id: str, net_amount: float, subm_date: date):
+    """
+    Returns (True, df_matches) if any row on the same SubmissionDate has
+    the same ERXNumber + MemberID + NetAmount (two-decimal string).
+    """
+    try:
+        df = pd.DataFrame(ws(DATA_TAB).get_all_records())
+        if df.empty:
+            return False, pd.DataFrame()
+
+        # normalize types
+        df["SubmissionDate"] = pd.to_datetime(df["SubmissionDate"], errors="coerce").dt.date
+        net_str = f"{float(net_amount):.2f}"
+
+        same_day = df[df["SubmissionDate"] == subm_date]
+        if same_day.empty:
+            return False, pd.DataFrame()
+
+        mask = (
+            same_day["ERXNumber"].astype(str).str.strip().eq(erx_number.strip()) &
+            same_day["MemberID"].astype(str).str.strip().eq(member_id.strip()) &
+            same_day["NetAmount"].astype(str).str.strip().eq(net_str)
+        )
+        dup = same_day[mask]
+        return (not dup.empty), dup
+    except Exception:
+        # On any read/parse issue, don't block; just say "no duplicate"
+        return False, pd.DataFrame()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Authentication
 # ─────────────────────────────────────────────────────────────────────────────
@@ -246,7 +278,7 @@ def load_users_rolemap_from_sheet():
     try:
         df = pd.DataFrame(ws(USERS_TAB).get_all_records())
         if not df.empty:
-            # normalize headers
+            # normalize headers to lowercase
             df.columns = df.columns.str.strip().str.lower()
         return None if df.empty else df
     except Exception:
@@ -258,12 +290,14 @@ if USERS_DF is None and not ROLE_MAP:
     ROLE_MAP = {"admin@example.com": {"role": "Super Admin", "clients": ["ALL"]}}
 
 def build_authenticator():
+    """
+    NOTE: streamlit_authenticator expects bcrypt hashes (start with $2b$).
+    Use the 'Password Hash Helper' in Masters Admin to generate these and paste into the Users sheet.
+    """
     if USERS_DF is not None and not USERS_DF.empty:
-        # NOTE: streamlit_authenticator expects its own hashed format.
-        # If your 'password' values are already in that format, this works directly.
         names = USERS_DF['name'].tolist()
         usernames = USERS_DF['username'].tolist()
-        passwords = USERS_DF['password'].tolist()  # hashed (see note above)
+        passwords = USERS_DF['password'].tolist()  # bcrypt hashes expected
         creds = {"usernames": {u: {"name": n, "password": p} for n, u, p in zip(names, usernames, passwords)}}
     else:
         demo_users = json.loads(AUTH.get("demo_users", "{}")) or {
@@ -390,12 +424,12 @@ if page == "Intake Form":
         with d3:
             st.selectbox("Status*", sheet_to_list(MS_STATUS), key="status")
 
-        st.text_area("Remark* (short note)", key="remark")
+        st.text_area("Remark (optional)", key="remark")  # optional now
 
         submitted = st.form_submit_button("Submit", type="primary")
 
     if submitted:
-        # Validate
+        # Validate (Remark is OPTIONAL now)
         required = {
             "Employee Name": st.session_state.employee_name,
             "Submission Date": st.session_state.submission_date,
@@ -410,7 +444,6 @@ if page == "Intake Form":
             "Approval Code": st.session_state.approval_code,
             "Net Amount": st.session_state.net_amount,
             "Patient Share": st.session_state.patient_share,
-            "Remark": st.session_state.remark,
             "Status": st.session_state.status,
         }
         missing = [k for k, v in required.items()
@@ -424,6 +457,20 @@ if page == "Intake Form":
                 ins_code, ins_name = parts[0].strip(), parts[1].strip()
             else:
                 ins_name = st.session_state.insurance_display
+
+            # Duplicate-prevention (optional warning)
+            is_dup, dup_df = is_potential_duplicate(
+                st.session_state.erx_number,
+                st.session_state.member_id,
+                st.session_state.net_amount,
+                st.session_state.submission_date
+            )
+            if is_dup:
+                st.warning(
+                    f"Possible duplicate found for today with the same ERXNumber + MemberID + NetAmount. "
+                    f"(ERX: {st.session_state.erx_number}, Member: {st.session_state.member_id}, "
+                    f"Net: {float(st.session_state.net_amount):.2f})"
+                )
 
             record = [
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -444,7 +491,7 @@ if page == "Intake Form":
                 st.session_state.approval_code.strip(),
                 f"{float(st.session_state.net_amount):.2f}",
                 f"{float(st.session_state.patient_share):.2f}",
-                st.session_state.remark.strip(),
+                st.session_state.remark.strip(),  # optional
                 st.session_state.status
             ]
 
@@ -631,8 +678,8 @@ if page == "Email / WhatsApp":
 if page == "Masters Admin":
     st.subheader("Masters Admin")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["Submission Modes", "Portals", "Status", "Pharmacies", "Clients / Contacts"]
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["Submission Modes", "Portals", "Status", "Pharmacies", "Clients / Contacts", "Utilities"]
     )
 
     # Simple list editors
@@ -640,12 +687,13 @@ if page == "Masters Admin":
         st.markdown(f"**{title}**")
         vals = sheet_to_list(title)
         st.write(f"Current values: {', '.join(vals) if vals else '(empty)'}")
-        new_val = st.text_input(f"Add new to {title}")
-        if st.button(f"Add to {title}"):
-            wsx = ws(title)
-            wsx.append_row([new_val])
-            sheet_to_list.clear()
-            st.success("Added")
+        new_val = st.text_input(f"Add new to {title}", key=f"add_{title}")
+        if st.button(f"Add to {title}", key=f"btn_{title}"):
+            if new_val.strip():
+                wsx = ws(title)
+                wsx.append_row([new_val.strip()])
+                sheet_to_list.clear()
+                st.success("Added")
 
     with tab1:
         simple_list_editor(MS_SUBMISSION_MODE)
@@ -660,11 +708,11 @@ if page == "Masters Admin":
         st.dataframe(ph_df, use_container_width=True, hide_index=True)
         c1, c2 = st.columns(2)
         with c1:
-            pid = st.text_input("ID")
-            pname = st.text_input("Name")
-        if st.button("Add Pharmacy"):
-            if pid and pname:
-                ws(MS_PHARM).append_row([pid, pname], value_input_option="USER_ENTERED")
+            pid = st.text_input("ID", key="ph_id")
+            pname = st.text_input("Name", key="ph_name")
+        if st.button("Add Pharmacy", key="ph_add"):
+            if pid.strip() and pname.strip():
+                ws(MS_PHARM).append_row([pid.strip(), pname.strip()], value_input_option="USER_ENTERED")
                 pharmacies_list.clear()
                 st.success("Pharmacy added")
 
@@ -674,12 +722,12 @@ if page == "Masters Admin":
         st.dataframe(cl_df, use_container_width=True, hide_index=True)
         c1, c2 = st.columns(2)
         with c1:
-            cid = st.text_input("ClientID")
+            cid = st.text_input("ClientID", key="cl_id")
         with c2:
-            cname = st.text_input("Client Name")
-        if st.button("Add Client"):
-            if cid and cname:
-                ws(CLIENTS_TAB).append_row([cid, cname], value_input_option="USER_ENTERED")
+            cname = st.text_input("Client Name", key="cl_name")
+        if st.button("Add Client", key="cl_add"):
+            if cid.strip() and cname.strip():
+                ws(CLIENTS_TAB).append_row([cid.strip(), cname.strip()], value_input_option="USER_ENTERED")
                 clients_list.clear()
                 st.success("Client added")
 
@@ -689,12 +737,12 @@ if page == "Masters Admin":
         st.dataframe(cc_df, use_container_width=True, hide_index=True)
         c1, c2, c3 = st.columns(3)
         with c1:
-            cc_cid = st.text_input("ClientID (for contacts)")
+            cc_cid = st.text_input("ClientID (for contacts)", key="cc_id")
         with c2:
-            cc_to = st.text_input("To (comma-separated)")
+            cc_to = st.text_input("To (comma-separated)", key="cc_to")
         with c3:
-            cc_cc = st.text_input("CC (comma-separated)")
-        if st.button("Add / Update Contacts"):
+            cc_cc = st.text_input("CC (comma-separated)", key="cc_cc")
+        if st.button("Add / Update Contacts", key="cc_save"):
             # upsert by ClientID
             wsx = ws(CLIENT_CONTACTS_TAB)
             all_vals = wsx.get_all_values()
@@ -703,13 +751,22 @@ if page == "Masters Admin":
             updated = False
             for i, r in enumerate(rows, start=2):
                 if len(r) > 0 and r[0].strip() == cc_cid.strip():
-                    wsx.update(f"A{i}:C{i}", [[cc_cid, cc_to, cc_cc]])
+                    wsx.update(f"A{i}:C{i}", [[cc_cid.strip(), cc_to.strip(), cc_cc.strip()]])
                     updated = True
                     break
             if not updated:
-                wsx.append_row([cc_cid, cc_to, cc_cc], value_input_option="USER_ENTERED")
+                wsx.append_row([cc_cid.strip(), cc_to.strip(), cc_cc.strip()], value_input_option="USER_ENTERED")
             client_contacts_map.clear()
             st.success("Contacts saved")
+
+    with tab6:
+        st.markdown("**Utilities**")
+        st.caption("Password Hash Helper — generates bcrypt hash for streamlit_authenticator. Paste into Users sheet 'password' column.")
+        plain = st.text_input("Plain password", type="password", key="util_pwd")
+        if plain:
+            hashed = stauth.Hasher([plain]).generate()[0]
+            st.code(hashed, language="text")
+            st.info("Copy the above value into the Users sheet. (bcrypt, starts with $2b$...)")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Bulk Import Insurance
