@@ -3,7 +3,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # ✅ Fixes stale-cookie KeyError by rotating cookie & rerunning
 # ✅ Fixes "Missing submit button" (single st.form + st.form_submit_button)
-# ✅ Avoids rate-limit crashes on masters (safe loaders + fallbacks + caching)
+# ✅ Avoids rate-limit/metadata crashes on masters (retry + safe loaders)
 # ✅ New streamlit_authenticator API (fields=..., reads session_state)
 # ✅ Duplicate check (ERX + MemberID + Net same day) + Allow duplicate override
 # ✅ Masters from Google Sheets (Pharmacies, Insurance, Portals, Status, Clients)
@@ -128,6 +128,19 @@ def get_spreadsheet(_gc):
 gc = get_gspread_client()
 sh = get_spreadsheet(gc)
 
+# ---------- NEW: robust worksheet helpers ----------
+def get_or_create_ws(sh, title: str, rows=200, cols=26):
+    """Retryable 'get or add' for a worksheet."""
+    try:
+        return retry(lambda: sh.worksheet(title))
+    except gspread.exceptions.WorksheetNotFound:
+        return retry(lambda: sh.add_worksheet(title=title, rows=rows, cols=cols))
+
+def list_titles(sh):
+    """Retryable list of worksheet titles."""
+    return {w.title for w in retry(lambda: sh.worksheets())}
+# ---------------------------------------------------
+
 # Tab names
 DATA_TAB = "Data"
 USERS_TAB = "Users"
@@ -168,30 +181,48 @@ SEED_SIMPLE = {
     MS_STATUS: ["Submitted","Approved","Rejected","Pending","RA Pending"],
 }
 
+# ---------- UPDATED: resilient, retried tab/header creation ----------
 def ensure_tabs_and_headers():
-    existing = {w.title for w in sh.worksheets()}
-    for t in DEFAULT_TABS:
-        if t not in existing:
-            retry(lambda: sh.add_worksheet(t, rows=200, cols=26))
-    for tab, headers in REQUIRED_HEADERS.items():
-        wsx = sh.worksheet(tab)
-        vals = retry(lambda: wsx.get_all_values())
-        if not vals:
-            retry(lambda: wsx.update("A1", [headers]))
-        else:
-            current = [c.strip() for c in vals[0]]
-            if [c.lower() for c in current] != [h.lower() for h in headers]:
+    try:
+        existing = list_titles(sh)
+        # Create missing tabs
+        for t in DEFAULT_TABS:
+            if t not in existing:
+                retry(lambda: sh.add_worksheet(t, rows=200, cols=26))
+
+        # Ensure headers
+        for tab, headers in REQUIRED_HEADERS.items():
+            wsx = get_or_create_ws(sh, tab)
+            vals = retry(lambda: wsx.get_all_values())
+            if not vals:
                 retry(lambda: wsx.update("A1", [headers]))
-    for tab, values in SEED_SIMPLE.items():
-        wsx = sh.worksheet(tab)
-        vals = retry(lambda: wsx.get_all_values())
-        if len(vals) <= 1:
-            retry(lambda: wsx.update("A1", [["Value"], *[[v] for v in values]]))
+            else:
+                current = [c.strip() for c in vals[0]]
+                if [c.lower() for c in current] != [h.lower() for h in headers]:
+                    retry(lambda: wsx.update("A1", [headers]))
+
+        # Seed simple masters
+        for tab, values in SEED_SIMPLE.items():
+            wsx = get_or_create_ws(sh, tab)
+            vals = retry(lambda: wsx.get_all_values())
+            if len(vals) <= 1:
+                retry(lambda: wsx.update("A1", [["Value"], *[[v] for v in values]]))
+
+    except gspread.exceptions.APIError:
+        st.error(
+            "Couldn’t read/create worksheets.\n\n"
+            "• Make sure the spreadsheet exists and is shared with **Editor** access to:\n"
+            f"  **{GS.get('client_email','(service account)')}**\n"
+            "• If you just granted access, click **Rerun**.\n"
+            "• If it’s a quota hiccup, rerun in a few seconds."
+        )
+        st.stop()
+# --------------------------------------------------------------------
 
 ensure_tabs_and_headers()
 
 def ws(name: str):
-    return sh.worksheet(name)
+    return get_or_create_ws(sh, name)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Safe cached reads (with graceful fallbacks to avoid UI crashes)
@@ -644,8 +675,8 @@ if page == "View / Export":
 
     def to_excel_bytes(dataframe: pd.DataFrame) -> bytes:
         buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as w:
-            dataframe.to_excel(w, index=False, sheet_name="Data")
+        with pd.ExcelWriter(buf, engine="openpyxl") as pdw:
+            dataframe.to_excel(pdw, index=False, sheet_name="Data")
         return buf.getvalue()
 
     xbytes = to_excel_bytes(df)
@@ -719,8 +750,8 @@ if page == "Email / WhatsApp":
 
     # Prepare Excel bytes
     xbytes = io.BytesIO()
-    with pd.ExcelWriter(xbytes, engine="openpyxl") as w:
-        df.to_excel(w, index=False, sheet_name="Data")
+    with pd.ExcelWriter(xbytes, engine="openpyxl") as pdw:
+        df.to_excel(pdw, index=False, sheet_name="Data")
     xbytes.seek(0)
 
     st.divider()
