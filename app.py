@@ -1,41 +1,32 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# File: app.py — Streamlit (Option B) — RITE TECH BRANDED (full + all patches)
+# File: app.py — Streamlit (Option B) — RITE TECH BRANDED (full + resilient init)
 # ─────────────────────────────────────────────────────────────────────────────
-# ✅ Fixes stale-cookie KeyError by rotating cookie & rerunning
-# ✅ Fixes "Missing submit button" (single st.form + st.form_submit_button)
-# ✅ Avoids rate-limit/metadata crashes on masters (retry + safe loaders)
-# ✅ New streamlit_authenticator API (fields=..., reads session_state)
-# ✅ Duplicate check (ERX + MemberID + Net same day) + Allow duplicate override
-# ✅ Masters from Google Sheets (Pharmacies, Insurance, Portals, Status, Clients)
-# ✅ Email with Excel attachment (SMTP)
-# ✅ WhatsApp Cloud API: send CSV report to MANAGEMENT (not patients)
-# ✅ Exponential backoff + caching; form reset after save; refresh button
-# Requirements:
-#   pip install streamlit gspread google-auth streamlit-authenticator pandas requests python-dateutil openpyxl
+# ✅ Stale-cookie fix for streamlit_authenticator
+# ✅ Single st.form + st.form_submit_button (no submit error)
+# ✅ Google Sheets init now ultra-light: row_values(1)/acell() instead of get_all_values()
+# ✅ Jittered exponential backoff; init runs once per server (cache_resource)
+# ✅ Duplicate check + override
+# ✅ Masters from Google Sheets; Email export; WhatsApp (management)
 # ─────────────────────────────────────────────────────────────────────────────
 
 import io
 import os
 import json
 import time
+import random
 from datetime import datetime, date, timedelta
-from dateutil import tz
 
 import pandas as pd
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
 import requests
-
-# Auth
-import streamlit_authenticator as stauth
-
-# Email
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from email import encoders
+import streamlit_authenticator as stauth
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Branding
@@ -71,7 +62,7 @@ with st.sidebar:
         st.success(f"👋 {UI_BRAND}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Google Sheets connect (with retries + caching)
+# Google Sheets connect (with jittered retries + caching)
 # ─────────────────────────────────────────────────────────────────────────────
 REQUIRED_GS_KEYS = [
     "type","project_id","private_key_id","private_key","client_email","client_id",
@@ -91,21 +82,24 @@ if not SPREADSHEET_ID and not SPREADSHEET_NAME:
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
           "https://www.googleapis.com/auth/drive"]
 
-def retry(fn, attempts=5):
+def retry(fn, attempts=8, base=0.7):
     for i in range(attempts):
         try:
             return fn()
         except Exception as e:
             msg = str(e).lower()
-            if "429" in msg or "rate" in msg or "quota" in msg or "deadline" in msg or "temporar" in msg:
-                time.sleep(min(2**i, 10))
+            transient = any(x in msg for x in [
+                "429","rate","quota","deadline","temporar","internal","backend error","backendError"
+            ])
+            if transient:
+                # jittered exponential backoff
+                time.sleep(min(base * (2**i), 6) + random.random()*0.5)
                 continue
             raise
     raise RuntimeError("Exceeded retries due to rate limiting.")
 
 @st.cache_resource(show_spinner=False)
 def get_gspread_client():
-    # convert literal "\n" to real line breaks if needed
     gs_info = dict(GS)
     if isinstance(gs_info.get("private_key", ""), str):
         gs_info["private_key"] = gs_info["private_key"].replace("\\n", "\n")
@@ -128,20 +122,18 @@ def get_spreadsheet(_gc):
 gc = get_gspread_client()
 sh = get_spreadsheet(gc)
 
-# ---------- NEW: robust worksheet helpers ----------
 def get_or_create_ws(sh, title: str, rows=200, cols=26):
-    """Retryable 'get or add' for a worksheet."""
     try:
         return retry(lambda: sh.worksheet(title))
     except gspread.exceptions.WorksheetNotFound:
         return retry(lambda: sh.add_worksheet(title=title, rows=rows, cols=cols))
 
 def list_titles(sh):
-    """Retryable list of worksheet titles."""
     return {w.title for w in retry(lambda: sh.worksheets())}
-# ---------------------------------------------------
 
-# Tab names
+# ─────────────────────────────────────────────────────────────────────────────
+# Tabs, headers, seeds (ultra-light)
+# ─────────────────────────────────────────────────────────────────────────────
 DATA_TAB = "Data"
 USERS_TAB = "Users"
 MS_PHARM = "Pharmacies"
@@ -181,54 +173,57 @@ SEED_SIMPLE = {
     MS_STATUS: ["Submitted","Approved","Rejected","Pending","RA Pending"],
 }
 
-# ---------- UPDATED: resilient, retried tab/header creation ----------
-def ensure_tabs_and_headers():
+def ensure_tabs_and_headers_light():
     try:
         existing = list_titles(sh)
-        # Create missing tabs
+        # create only missing tabs
         for t in DEFAULT_TABS:
             if t not in existing:
                 retry(lambda: sh.add_worksheet(t, rows=200, cols=26))
 
-        # Ensure headers
+        # ensure headers using only row 1
         for tab, headers in REQUIRED_HEADERS.items():
             wsx = get_or_create_ws(sh, tab)
-            vals = retry(lambda: wsx.get_all_values())
-            if not vals:
+            head = retry(lambda: wsx.row_values(1))  # LIGHT: only first row
+            head_norm = [c.strip().lower() for c in head] if head else []
+            need_update = (not head) or (head_norm != [h.lower() for h in headers])
+            if need_update:
                 retry(lambda: wsx.update("A1", [headers]))
-            else:
-                current = [c.strip() for c in vals[0]]
-                if [c.lower() for c in current] != [h.lower() for h in headers]:
-                    retry(lambda: wsx.update("A1", [headers]))
 
-        # Seed simple masters
+        # seed masters (LIGHT: check A2 only)
         for tab, values in SEED_SIMPLE.items():
             wsx = get_or_create_ws(sh, tab)
-            vals = retry(lambda: wsx.get_all_values())
-            if len(vals) <= 1:
+            a2 = retry(lambda: wsx.acell("A2").value)  # LIGHT: single cell
+            if not a2:
                 retry(lambda: wsx.update("A1", [["Value"], *[[v] for v in values]]))
 
     except gspread.exceptions.APIError:
         st.error(
             "Couldn’t read/create worksheets.\n\n"
-            "• Make sure the spreadsheet exists and is shared with **Editor** access to:\n"
+            "• Ensure the sheet is shared with **Editor** access to:\n"
             f"  **{GS.get('client_email','(service account)')}**\n"
             "• If you just granted access, click **Rerun**.\n"
             "• If it’s a quota hiccup, rerun in a few seconds."
         )
         st.stop()
-# --------------------------------------------------------------------
 
-ensure_tabs_and_headers()
+# Run once per server (not every rerun)
+@st.cache_resource(show_spinner=False)
+def _init_sheets_once():
+    ensure_tabs_and_headers_light()
+    return True
+
+_init_sheets_once()
 
 def ws(name: str):
     return get_or_create_ws(sh, name)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Safe cached reads (with graceful fallbacks to avoid UI crashes)
+# Safe cached reads (fallbacks)
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=45, show_spinner=False)
 def _sheet_to_list_raw(title, prefer_cols=("Value","Name","Mode","Portal","Status","Display")):
+    # Read only what we need
     rows = retry(lambda: ws(title).get_all_values())
     if not rows:
         return []
@@ -338,7 +333,7 @@ def safe_contacts():
             st.session_state["_warn_contacts"] = True
         return {}
 
-# --- Duplicate check helper ---
+# Duplicate check
 def is_potential_duplicate(erx_number: str, member_id: str, net_amount: float, subm_date: date):
     try:
         df = pd.DataFrame(retry(lambda: ws(DATA_TAB).get_all_records()))
@@ -377,11 +372,6 @@ if USERS_DF is None and not ROLE_MAP:
     ROLE_MAP = {"admin@example.com": {"role": "Super Admin", "clients": ["ALL"]}}
 
 def build_authenticator(cookie_suffix: str = ""):
-    """
-    Users sheet expects bcrypt hashes (start with $2b$). Generate via Masters Admin → Utilities.
-    If no Users sheet, falls back to [auth].demo_users (auto-hashed at runtime).
-    cookie_suffix lets us rotate the cookie name to invalidate stale cookies.
-    """
     if USERS_DF is not None and not USERS_DF.empty:
         names = USERS_DF['name'].tolist()
         usernames = USERS_DF['username'].tolist()
@@ -403,7 +393,6 @@ def build_authenticator(cookie_suffix: str = ""):
         int(AUTH.get("cookie_expiry_days", 30)),
     )
 
-# Rotate cookie automatically if a stale cookie causes KeyError inside login()
 cookie_suffix = st.session_state.get("_cookie_suffix", "")
 authenticator = build_authenticator(cookie_suffix)
 
@@ -460,7 +449,7 @@ ALL_CLIENT_IDS = safe_clients()
 ALLOWED_CHOICES = ALL_CLIENT_IDS if "ALL" in ALLOWED_CLIENTS else [c for c in ALL_CLIENT_IDS if c in ALLOWED_CLIENTS]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Intake Form (single form + submit button + DUPLICATE OVERRIDE)
+# Intake Form
 # ─────────────────────────────────────────────────────────────────────────────
 def reset_form():
     defaults = {
@@ -488,14 +477,12 @@ def reset_form():
 if page == "Intake Form":
     st.subheader("New Submission")
 
-    # Preload masters safely (with fallbacks) once per render
     submission_modes = safe_list(MS_SUBMISSION_MODE, ["Walk-in","Phone","Email","Portal"])
     portals          = safe_list(MS_PORTAL, ["DHPO","Riayati","Insurance Portal"])
     statuses         = safe_list(MS_STATUS, ["Submitted","Approved","Rejected","Pending","RA Pending"])
     pharm_list       = safe_pharmacies()
     ins_display_list, _ins_df = safe_insurance()
 
-    # Clear request from last save before building the form
     if st.session_state.get("_clear_form", False):
         for k in list(st.session_state.keys()):
             if k in {
@@ -507,10 +494,8 @@ if page == "Intake Form":
         reset_form()
         st.session_state["_clear_form"] = False
 
-    # First-time defaults
     reset_form()
 
-    # ——— THE form (all inputs are inside, with one submit button) ———
     with st.form("intake_form", clear_on_submit=False):
         st.selectbox("Client ID*", ALLOWED_CHOICES, key="sel_client")
         c1, c2, c3 = st.columns(3, gap="large")
@@ -538,14 +523,12 @@ if page == "Intake Form":
         with d3:
             st.selectbox("Status*", statuses, key="status")
 
-        st.text_area("Remark (optional)", key="remark")  # optional
+        st.text_area("Remark (optional)", key="remark")
         st.checkbox("Allow duplicate override", key="allow_dup_override")
 
         submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
 
-    # ——— Submit handler ———
     if submitted:
-        # Validate (Remark optional)
         required = {
             "Employee Name": st.session_state.employee_name,
             "Submission Date": st.session_state.submission_date,
@@ -567,7 +550,6 @@ if page == "Intake Form":
         if missing_req:
             st.error("Missing required fields: " + ", ".join(missing_req))
         else:
-            # Parse Insurance "Code - Name"
             ins_code, ins_name = "", ""
             if " - " in st.session_state.insurance_display:
                 parts = st.session_state.insurance_display.split(" - ", 1)
@@ -575,18 +557,14 @@ if page == "Intake Form":
             else:
                 ins_name = st.session_state.insurance_display
 
-            # Duplicate-prevention with OVERRIDE
-            is_dup, _dup_df = is_potential_duplicate(
+            is_dup, _ = is_potential_duplicate(
                 st.session_state.erx_number,
                 st.session_state.member_id,
                 st.session_state.net_amount,
                 st.session_state.submission_date
             )
             if is_dup and not st.session_state.allow_dup_override:
-                st.warning(
-                    "Possible duplicate for today (ERX + Member ID + Net). "
-                    "Tick **Allow duplicate override** to proceed."
-                )
+                st.warning("Possible duplicate for today (ERX + Member ID + Net). Tick override to proceed.")
                 st.stop()
 
             record = [
@@ -608,17 +586,15 @@ if page == "Intake Form":
                 st.session_state.approval_code.strip(),
                 f"{float(st.session_state.net_amount):.2f}",
                 f"{float(st.session_state.patient_share):.2f}",
-                st.session_state.remark.strip(),  # optional
+                st.session_state.remark.strip(),
                 st.session_state.status
             ]
 
             try:
                 retry(lambda: ws(DATA_TAB).append_row(record, value_input_option="USER_ENTERED"))
                 st.toast("Saved ✔️")
-                # Clear any caches so views see the new row
                 _sheet_to_list_raw.clear(); _pharmacies_list_raw.clear(); _insurance_list_raw.clear()
                 _clients_list_raw.clear(); _client_contacts_raw.clear()
-                # schedule a clear on next run
                 st.session_state["_clear_form"] = True
                 st.rerun()
             except gspread.exceptions.APIError as e:
@@ -675,8 +651,8 @@ if page == "View / Export":
 
     def to_excel_bytes(dataframe: pd.DataFrame) -> bytes:
         buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as pdw:
-            dataframe.to_excel(pdw, index=False, sheet_name="Data")
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            dataframe.to_excel(w, index=False, sheet_name="Data")
         return buf.getvalue()
 
     xbytes = to_excel_bytes(df)
@@ -688,7 +664,7 @@ if page == "View / Export":
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Email / WhatsApp (Management report)
+# Email / WhatsApp (Management)
 # ─────────────────────────────────────────────────────────────────────────────
 def whatsapp_cfg_ok():
     w = st.secrets.get("whatsapp", {})
@@ -748,10 +724,9 @@ if page == "Email / WhatsApp":
     else:
         st.success(f"Filtered rows: {len(df)}")
 
-    # Prepare Excel bytes
     xbytes = io.BytesIO()
-    with pd.ExcelWriter(xbytes, engine="openpyxl") as pdw:
-        df.to_excel(pdw, index=False, sheet_name="Data")
+    with pd.ExcelWriter(xbytes, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="Data")
     xbytes.seek(0)
 
     st.divider()
@@ -820,7 +795,6 @@ if page == "Email / WhatsApp":
         if not wa_ready:
             st.error("WhatsApp Cloud not configured in secrets.")
         else:
-            # Build CSV for last N days from df_all (covers all clients unless filtered above)
             df_all["SubmissionDate_dt"] = pd.to_datetime(df_all.get("SubmissionDate"), errors="coerce").dt.date
             start_date = (date.today() - timedelta(days=int(days) - 1))
             mask = df_all["SubmissionDate_dt"].between(start_date, date.today())
@@ -837,7 +811,7 @@ if page == "Email / WhatsApp":
                 except Exception as e:
                     st.error(f"WhatsApp send failed: {e}")
 
-    st.caption("Tip: If Cloud API isn’t set, you can use a free open link below (no attachment).")
+    st.caption("Tip: If Cloud API isn’t set, use the free link (no attachment).")
     def wa_link(text):
         from urllib.parse import quote_plus
         return f"https://wa.me/?text={quote_plus(text)}"
@@ -853,7 +827,6 @@ if page == "Masters Admin":
         ["Submission Modes", "Portals", "Status", "Pharmacies", "Clients / Contacts", "Utilities"]
     )
 
-    # Simple list editors
     def simple_list_editor(title):
         st.markdown(f"**{title}**")
         vals = safe_list(title, [])
