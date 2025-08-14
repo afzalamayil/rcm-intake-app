@@ -444,9 +444,15 @@ with st.sidebar:
     st.write(f"**User:** {name or username}")
     st.write(f"**Role:** {ROLE}")
     st.write(f"**Clients:** {', '.join(ALLOWED_CLIENTS)}")
-    if st.button("Logout"):
+
+    # Render the authenticator's logout button (no extra st.button)
+    # Use a unique key to avoid collisions across versions.
+    try:
+        # If your version accepts location ('sidebar') as 2nd arg:
         authenticator.logout("Logout", "sidebar")
-        st.rerun()
+    except TypeError:
+        # Older/newer API where 2nd arg is the key:
+        authenticator.logout("Logout", "logout_sidebar_btn")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Navigation (restrict non-admins to Intake Form only)
