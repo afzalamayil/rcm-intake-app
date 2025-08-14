@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# File: app.py — Streamlit (Option B) — RITE TECH BRANDED (fixed submit/reset)
+# File: app.py — Streamlit (Option B) — RITE TECH BRANDED (full)
 # ─────────────────────────────────────────────────────────────────────────────
 import io
 import os
@@ -78,7 +78,11 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
 
 @st.cache_resource(show_spinner=False)
 def get_gspread_client():
-    creds = Credentials.from_service_account_info(dict(GS), scopes=SCOPES)
+    # IMPORTANT: convert literal "\n" to real line breaks
+    gs_info = dict(GS)
+    if isinstance(gs_info.get("private_key", ""), str):
+        gs_info["private_key"] = gs_info["private_key"].replace("\\n", "\n")
+    creds = Credentials.from_service_account_info(gs_info, scopes=SCOPES)
     return gspread.authorize(creds)
 
 @st.cache_resource(show_spinner=False)
@@ -89,7 +93,7 @@ def get_spreadsheet(_gc):
         return _gc.open(SPREADSHEET_NAME)
     except gspread.SpreadsheetNotFound:
         if not SPREADSHEET_ID:
-            # Create if name-only provided
+            # Create if only name provided (requires Drive scope)
             sh = _gc.create(SPREADSHEET_NAME)
             return sh
         st.error("Spreadsheet ID not found or no access. Share it with the service account in [gsheets].client_email.")
@@ -97,6 +101,14 @@ def get_spreadsheet(_gc):
 
 gc = get_gspread_client()
 sh = get_spreadsheet(gc)
+
+# --- Smoke test (optional) ---
+try:
+    _titles = [ws.title for ws in sh.worksheets()]
+    st.info(f"Connected to '{SPREADSHEET_NAME}'. Tabs: {_titles}")
+except Exception as e:
+    st.error(f"Sheets connection failed: {e}")
+    st.stop()
 
 # Tab names
 DATA_TAB = "Data"
@@ -116,35 +128,49 @@ DEFAULT_TABS = [
     CLIENTS_TAB, CLIENT_CONTACTS_TAB
 ]
 
-def ensure_tabs_and_headers():
-    existing = [w.title for w in sh.worksheets()]
-    for t in DEFAULT_TABS:
-        if t not in existing:
-            sh.add_worksheet(t, rows=200, cols=26)
-
-    # Ensure Data headers
-    headers = [
+REQUIRED_HEADERS = {
+    DATA_TAB: [
         "Timestamp","SubmittedBy","Role","ClientID",
         "EmployeeName","SubmissionDate","PharmacyName","SubmissionMode",
         "Portal","ERXNumber","InsuranceCode","InsuranceName",
         "MemberID","EID","ClaimID","ApprovalCode",
         "NetAmount","PatientShare","Remark","Status"
-    ]
-    wsd = sh.worksheet(DATA_TAB)
-    cur = wsd.get('A1:T1')
-    if not cur or not any(cur[0]):
-        wsd.update('A1', [headers])
+    ],
+    USERS_TAB: ["username","name","password","role","clients"],
+    MS_SUBMISSION_MODE: ["Value"],
+    MS_PORTAL: ["Value"],
+    MS_STATUS: ["Value"],
+    CLIENTS_TAB: ["ClientID","Name"],
+    CLIENT_CONTACTS_TAB: ["ClientID","To","CC"],
+}
 
-    # Seed a few masters if empty
-    seed = {
-        MS_SUBMISSION_MODE: ["Walk-in","Phone","Email","Portal"],
-        MS_PORTAL: ["DHPO","Riayati","Insurance Portal"],
-        MS_STATUS: ["Submitted","Approved","Rejected","Pending","RA Pending"],
-    }
-    for tab, values in seed.items():
+SEED_SIMPLE = {
+    MS_SUBMISSION_MODE: ["Walk-in","Phone","Email","Portal"],
+    MS_PORTAL: ["DHPO","Riayati","Insurance Portal"],
+    MS_STATUS: ["Submitted","Approved","Rejected","Pending","RA Pending"],
+}
+
+def ensure_tabs_and_headers():
+    existing = {w.title for w in sh.worksheets()}
+    # create missing tabs
+    for t in DEFAULT_TABS:
+        if t not in existing:
+            sh.add_worksheet(t, rows=200, cols=26)
+    # ensure headers
+    for tab, headers in REQUIRED_HEADERS.items():
         wsx = sh.worksheet(tab)
         vals = wsx.get_all_values()
         if not vals:
+            wsx.update("A1", [headers])
+        else:
+            current = [c.strip() for c in vals[0]]
+            if [c.lower() for c in current] != [h.lower() for h in headers]:
+                wsx.update("A1", [headers])
+    # seed simple masters if empty (below header)
+    for tab, values in SEED_SIMPLE.items():
+        wsx = sh.worksheet(tab)
+        vals = wsx.get_all_values()
+        if len(vals) <= 1:  # only header or empty
             wsx.update("A1", [["Value"], *[[v] for v in values]])
 
 ensure_tabs_and_headers()
@@ -185,7 +211,12 @@ def insurance_list():
     if df.empty:
         return [], pd.DataFrame()
     df = df.fillna("")
-    df["Display"] = df["Code"].astype(str).str.strip() + " - " + df["Name"].astype(str).str.strip()
+    if {"Code","Name"}.issubset(df.columns):
+        df["Display"] = df["Code"].astype(str).str.strip() + " - " + df["Name"].astype(str).str.strip()
+        return df["Display"].tolist(), df
+    # fallback
+    df["Display"] = df.apply(lambda r: " - ".join([str(r.get("Code","")).strip(), str(r.get("Name","")).strip()]).strip(" -"),
+                            axis=1)
     return df["Display"].tolist(), df
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -214,6 +245,9 @@ def client_contacts_map():
 def load_users_rolemap_from_sheet():
     try:
         df = pd.DataFrame(ws(USERS_TAB).get_all_records())
+        if not df.empty:
+            # normalize headers
+            df.columns = df.columns.str.strip().str.lower()
         return None if df.empty else df
     except Exception:
         return None
@@ -225,9 +259,11 @@ if USERS_DF is None and not ROLE_MAP:
 
 def build_authenticator():
     if USERS_DF is not None and not USERS_DF.empty:
+        # NOTE: streamlit_authenticator expects its own hashed format.
+        # If your 'password' values are already in that format, this works directly.
         names = USERS_DF['name'].tolist()
         usernames = USERS_DF['username'].tolist()
-        passwords = USERS_DF['password'].tolist()  # hashed
+        passwords = USERS_DF['password'].tolist()  # hashed (see note above)
         creds = {"usernames": {u: {"name": n, "password": p} for n, u, p in zip(names, usernames, passwords)}}
     else:
         demo_users = json.loads(AUTH.get("demo_users", "{}")) or {
@@ -256,7 +292,7 @@ def get_user_role_and_clients(u):
     if USERS_DF is not None and not USERS_DF.empty:
         row = USERS_DF[USERS_DF['username'] == u]
         if not row.empty:
-            role = row.iloc[0]['role']
+            role = row.iloc[0].get('role', 'User')
             clients = [c.strip() for c in str(row.iloc[0].get('clients', 'ALL')).split(',') if c.strip()]
             return role, clients or ["ALL"]
     if u in ROLE_MAP:
@@ -286,9 +322,6 @@ ALLOWED_CHOICES = ALL_CLIENT_IDS if "ALL" in ALLOWED_CLIENTS else [c for c in AL
 # ─────────────────────────────────────────────────────────────────────────────
 # Intake Form (with true form + reset on submit)
 # ─────────────────────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────────────────────
-# Page: Intake Form  (FIXED: clear-after-submit without touching live widgets)
-# ─────────────────────────────────────────────────────────────────────────────
 def reset_form():
     defaults = {
         "employee_name": "",
@@ -316,7 +349,6 @@ if page == "Intake Form":
 
     # If the previous run asked to clear the form, do it BEFORE rendering widgets
     if st.session_state.get("_clear_form", False):
-        # reinitialize defaults
         for k in list(st.session_state.keys()):
             if k in {
                 "employee_name","submission_date","submission_mode","pharmacy_name","portal",
@@ -418,7 +450,7 @@ if page == "Intake Form":
 
             try:
                 ws(DATA_TAB).append_row(record, value_input_option="USER_ENTERED")
-                st.toast("Saved ✔️")          # quick feedback
+                st.toast("Saved ✔️")
                 # Clear caches so views see the new row
                 sheet_to_list.clear(); pharmacies_list.clear(); insurance_list.clear()
                 clients_list.clear(); client_contacts_map.clear()
@@ -430,14 +462,12 @@ if page == "Intake Form":
             except Exception as e:
                 st.error(f"Unexpected error while saving: {e}")
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # View / Export
 # ─────────────────────────────────────────────────────────────────────────────
 if page == "View / Export":
     st.subheader("Search, Filter & Export")
     if st.button("🔄 Refresh data"):
-        # clear caches and rerun
         sheet_to_list.clear(); pharmacies_list.clear(); insurance_list.clear()
         clients_list.clear(); client_contacts_map.clear()
         st.rerun()
@@ -494,7 +524,7 @@ if page == "View / Export":
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Email / WhatsApp (unchanged logic; minor polish)
+# Email / WhatsApp
 # ─────────────────────────────────────────────────────────────────────────────
 if page == "Email / WhatsApp":
     st.subheader("Send Report")
@@ -588,16 +618,124 @@ if page == "Email / WhatsApp":
 
     st.divider()
     st.markdown("**WhatsApp share** (free link with prefilled text)")
-    wa_msg = st.text_area("Prefilled message",
-                          value=f"RCM Intake report — rows: {len(df)}. Please see attached in email.")
-
     def wa_link(text):
         from urllib.parse import quote_plus
         return f"https://wa.me/?text={quote_plus(text)}"
-
+    wa_msg = st.text_area("Prefilled message",
+                          value=f"RCM Intake report — rows: {len(df)}. Please see attached in email.")
     st.link_button("Open WhatsApp with message", wa_link(wa_msg))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Masters Admin & Bulk Import remain same as before; omitted to keep this focused
-# If you still need those sections in this file, tell me and I’ll drop them in, too.
+# Masters Admin
 # ─────────────────────────────────────────────────────────────────────────────
+if page == "Masters Admin":
+    st.subheader("Masters Admin")
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["Submission Modes", "Portals", "Status", "Pharmacies", "Clients / Contacts"]
+    )
+
+    # Simple list editors
+    def simple_list_editor(title):
+        st.markdown(f"**{title}**")
+        vals = sheet_to_list(title)
+        st.write(f"Current values: {', '.join(vals) if vals else '(empty)'}")
+        new_val = st.text_input(f"Add new to {title}")
+        if st.button(f"Add to {title}"):
+            wsx = ws(title)
+            wsx.append_row([new_val])
+            sheet_to_list.clear()
+            st.success("Added")
+
+    with tab1:
+        simple_list_editor(MS_SUBMISSION_MODE)
+    with tab2:
+        simple_list_editor(MS_PORTAL)
+    with tab3:
+        simple_list_editor(MS_STATUS)
+
+    with tab4:
+        st.markdown("**Pharmacies**")
+        ph_df = pd.DataFrame(ws(MS_PHARM).get_all_records())
+        st.dataframe(ph_df, use_container_width=True, hide_index=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            pid = st.text_input("ID")
+            pname = st.text_input("Name")
+        if st.button("Add Pharmacy"):
+            if pid and pname:
+                ws(MS_PHARM).append_row([pid, pname], value_input_option="USER_ENTERED")
+                pharmacies_list.clear()
+                st.success("Pharmacy added")
+
+    with tab5:
+        st.markdown("**Clients**")
+        cl_df = pd.DataFrame(ws(CLIENTS_TAB).get_all_records())
+        st.dataframe(cl_df, use_container_width=True, hide_index=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            cid = st.text_input("ClientID")
+        with c2:
+            cname = st.text_input("Client Name")
+        if st.button("Add Client"):
+            if cid and cname:
+                ws(CLIENTS_TAB).append_row([cid, cname], value_input_option="USER_ENTERED")
+                clients_list.clear()
+                st.success("Client added")
+
+        st.divider()
+        st.markdown("**Client Contacts**")
+        cc_df = pd.DataFrame(ws(CLIENT_CONTACTS_TAB).get_all_records())
+        st.dataframe(cc_df, use_container_width=True, hide_index=True)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            cc_cid = st.text_input("ClientID (for contacts)")
+        with c2:
+            cc_to = st.text_input("To (comma-separated)")
+        with c3:
+            cc_cc = st.text_input("CC (comma-separated)")
+        if st.button("Add / Update Contacts"):
+            # upsert by ClientID
+            wsx = ws(CLIENT_CONTACTS_TAB)
+            all_vals = wsx.get_all_values()
+            header = all_vals[0] if all_vals else ["ClientID","To","CC"]
+            rows = all_vals[1:]
+            updated = False
+            for i, r in enumerate(rows, start=2):
+                if len(r) > 0 and r[0].strip() == cc_cid.strip():
+                    wsx.update(f"A{i}:C{i}", [[cc_cid, cc_to, cc_cc]])
+                    updated = True
+                    break
+            if not updated:
+                wsx.append_row([cc_cid, cc_to, cc_cc], value_input_option="USER_ENTERED")
+            client_contacts_map.clear()
+            st.success("Contacts saved")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bulk Import Insurance
+# ─────────────────────────────────────────────────────────────────────────────
+if page == "Bulk Import Insurance":
+    st.subheader("Bulk Import Insurance (CSV/XLSX with columns: Code, Name)")
+    uploaded = st.file_uploader("Upload file", type=["csv","xlsx"])
+    if uploaded is not None:
+        try:
+            if uploaded.name.lower().endswith(".csv"):
+                idf = pd.read_csv(uploaded)
+            else:
+                idf = pd.read_excel(uploaded)
+            idf.columns = idf.columns.str.strip()
+            if not {"Code","Name"}.issubset(idf.columns):
+                st.error("File must contain columns: Code, Name")
+            else:
+                st.dataframe(idf, use_container_width=True, hide_index=True)
+                if st.button("Replace Insurance master with this file", type="primary"):
+                    wsx = ws(MS_INSURANCE)
+                    # clear existing (except header)
+                    wsx.clear()
+                    wsx.update("A1", [["Code","Name"]])
+                    if not idf.empty:
+                        wsx.update("A2", idf[["Code","Name"]].astype(str).values.tolist())
+                    insurance_list.clear()
+                    st.success("Insurance master updated")
+        except Exception as e:
+            st.error(f"Import error: {e}")
