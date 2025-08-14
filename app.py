@@ -1,25 +1,31 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# app.py — RCM Intake (Streamlit) — with form reset, duplicate warning,
-# cached reads, exponential backoff, optional WhatsApp send, and logging.
+# app.py — RCM Intake (Streamlit)
+# • Form reset after submit
+# • Duplicate warning (same-day ERX+MemberID+Net)
+# • Cached reads to avoid 429s + exponential backoff
+# • Optional WhatsApp Business Cloud API send
+# • Logging to a "Logs" sheet
+# • UPDATED for streamlit_authenticator (new .login API with fields=…)
 # ─────────────────────────────────────────────────────────────────────────────
-# Requirements (Streamlit Cloud or local):
+# Requirements:
 #   pip install streamlit gspread google-auth streamlit-authenticator pandas requests python-dateutil
-# Secrets (in .streamlit/secrets.toml):
+#
+# .streamlit/secrets.toml (example)
 # [gsheets]
-# sheet_url = "https://docs.google.com/spreadsheets/d/XXXX/edit"
+# sheet_url    = "https://docs.google.com/spreadsheets/d/XXXX/edit"
 # client_email = "service-account@project.iam.gserviceaccount.com"
-# token_uri = "https://oauth2.googleapis.com/token"
-# private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+# token_uri    = "https://oauth2.googleapis.com/token"
+# private_key  = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
 # private_key_id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 #
 # [auth]
 # cookie_name = "rcm_intake_app"
-# cookie_key = "CHANGE_ME_TO_A_RANDOM_LONG_VALUE"
+# cookie_key  = "CHANGE_ME_TO_A_RANDOM_LONG_VALUE"
 # cookie_expiry_days = 30
-# # Examples:
-# demo_users = "{\"admin@example.com\":{\"name\":\"Admin\",\"password\":\"admin123\"}}"
+# # Example demo users (use hashed in production):
+# demo_users  = "{\"admin@example.com\":{\"name\":\"Admin\",\"password\":\"admin123\"}}"
 #
-# [whatsapp]  # Optional—remove if you don't use WA
+# [whatsapp]  # Optional—remove if not used
 # phone_number_id = "YOUR_PHONE_NUMBER_ID"
 # access_token     = "YOUR_PERMANENT_ACCESS_TOKEN"
 # template_name    = "intake_confirmation"
@@ -98,7 +104,6 @@ def get_ws(gc, ws_title):
     try:
         return retry(lambda: sh.worksheet(ws_title))
     except gspread.exceptions.WorksheetNotFound:
-        # Create if missing
         ws = retry(lambda: sh.add_worksheet(title=ws_title, rows=1000, cols=50))
         return ws
 
@@ -155,13 +160,14 @@ def send_whatsapp_message(phone_e164: str, params: list[str]):
     return r.json()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers: Auth
+# Helpers: Auth (updated login flow)
 # ─────────────────────────────────────────────────────────────────────────────
 def init_auth():
     auth_conf = st.secrets.get("auth", {})
     cookie_name = auth_conf.get("cookie_name", "rcm_intake_app")
     cookie_key = auth_conf.get("cookie_key", "CHANGE_ME")
     cookie_expiry_days = auth_conf.get("cookie_expiry_days", 30)
+
     # Demo users JSON: {"email":{"name":"Full Name","password":"plain_or_hashed"}}
     raw_demo = auth_conf.get("demo_users", "{}")
     try:
@@ -174,11 +180,9 @@ def init_auth():
     for email, info in demo_users.items():
         names.append(info.get("name", email.split("@")[0].title()))
         usernames.append(email)
-        # NOTE: streamlit_authenticator expects hashed. For demo plain is OK with
-        # hasher if prefixed with "plain:".
         pwd = info.get("password", "pass123")
-        if not pwd.startswith("pbkdf2:"):
-            # Hash on the fly so we don't store plain secrets in session
+        # Hash if not already pbkdf2
+        if not str(pwd).startswith("pbkdf2:"):
             pwd = stauth.Hasher([pwd]).generate()[0]
         passwords.append(pwd)
 
@@ -201,7 +205,6 @@ def is_duplicate(df: pd.DataFrame, erx: str, member_id: str, net_amount, svc_dat
     if df.empty:
         return False
     try:
-        # Normalize columns
         d = df.copy()
         if "ServiceDate" in d.columns:
             d["ServiceDate"] = pd.to_datetime(d["ServiceDate"], errors="coerce").dt.date
@@ -228,11 +231,25 @@ def log_action(ws_log, user, action, details: dict):
 def main():
     # ─── Auth ────────────────────────────────────────────────────────────────
     authenticator = init_auth()
-    name, auth_status, username = authenticator.login("Login", "sidebar")
+
+    # NEW API: location first, plus 'fields' labels. No tuple return.
+    authenticator.login(
+        "sidebar",
+        fields={
+            "Form name": "Login",
+            "Username": "Email",
+            "Password": "Password",
+            "Login": "Sign in",
+        },
+    )
+    auth_status = st.session_state.get("authentication_status")
+    name = st.session_state.get("name")
+    username = st.session_state.get("username")
+
     if not auth_status:
         st.stop()
 
-    st.sidebar.success(f"Signed in as {name}")
+    st.sidebar.success(f"Signed in as {name or username}")
     if st.sidebar.button("Sign out"):
         authenticator.logout("Sign out", "sidebar")
         st.rerun()
@@ -249,7 +266,6 @@ def main():
         read_df_cached.clear()
         st.experimental_rerun()
 
-    # Download/export
     with st.sidebar.expander("⬇️ Export"):
         try:
             df_all = read_df_cached(st.secrets["gsheets"]["sheet_url"], DATA_SHEET_NAME)
@@ -264,8 +280,6 @@ def main():
 
     # ─── Reference lists (optional) ─────────────────────────────────────────
     def get_reference_options():
-        # If you maintain a 'Reference' sheet with named columns, load them here.
-        # Fallback to static lists if sheet missing.
         try:
             df_ref = read_df_cached(st.secrets["gsheets"]["sheet_url"], REFERENCE_SHEET)
             payers = sorted([x for x in df_ref.get("Payer", []).dropna().unique().tolist() if x])
@@ -277,7 +291,6 @@ def main():
     payers, clinicians = get_reference_options()
 
     # ─── Form ───────────────────────────────────────────────────────────────
-    # Trick to reset form after successful submission
     form_key = st.session_state.get("form_key", "intake_form")
 
     with st.form(key=form_key, border=True):
@@ -309,7 +322,7 @@ def main():
         with cols3[2]:
             allow_override = st.checkbox("Allow duplicate override", value=False)
         with cols3[3]:
-            pass  # spacer
+            pass
 
         submitted = st.form_submit_button("💾 Submit", use_container_width=True)
 
