@@ -286,22 +286,49 @@ ALLOWED_CHOICES = ALL_CLIENT_IDS if "ALL" in ALLOWED_CLIENTS else [c for c in AL
 # ─────────────────────────────────────────────────────────────────────────────
 # Intake Form (with true form + reset on submit)
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Page: Intake Form  (FIXED: clear-after-submit without touching live widgets)
+# ─────────────────────────────────────────────────────────────────────────────
 def reset_form():
     defaults = {
-        "employee_name": "", "submission_date": date.today(), "submission_mode": "",
-        "pharmacy_name": "", "portal": "", "erx_number": "",
-        "insurance_display": "", "member_id": "", "eid": "",
-        "claim_id": "", "approval_code": "", "net_amount": 0.0,
-        "patient_share": 0.0, "status": "", "remark": "", "sel_client": (ALLOWED_CHOICES[0] if ALLOWED_CHOICES else "")
+        "employee_name": "",
+        "submission_date": date.today(),
+        "submission_mode": "",
+        "pharmacy_name": "",
+        "portal": "",
+        "erx_number": "",
+        "insurance_display": "",
+        "member_id": "",
+        "eid": "",
+        "claim_id": "",
+        "approval_code": "",
+        "net_amount": 0.0,
+        "patient_share": 0.0,
+        "status": "",
+        "remark": "",
+        "sel_client": (ALLOWED_CHOICES[0] if ALLOWED_CHOICES else "")
     }
     for k, v in defaults.items():
-        st.session_state[k] = v
+        st.session_state.setdefault(k, v)
 
 if page == "Intake Form":
     st.subheader("New Submission")
 
-    if "sel_client" not in st.session_state:
+    # If the previous run asked to clear the form, do it BEFORE rendering widgets
+    if st.session_state.get("_clear_form", False):
+        # reinitialize defaults
+        for k in list(st.session_state.keys()):
+            if k in {
+                "employee_name","submission_date","submission_mode","pharmacy_name","portal",
+                "erx_number","insurance_display","member_id","eid","claim_id","approval_code",
+                "net_amount","patient_share","status","remark","sel_client"
+            }:
+                del st.session_state[k]
         reset_form()
+        st.session_state["_clear_form"] = False
+
+    # First-time defaults
+    reset_form()
 
     with st.form("intake_form", clear_on_submit=False):
         st.selectbox("Client ID*", ALLOWED_CHOICES, key="sel_client")
@@ -391,19 +418,18 @@ if page == "Intake Form":
 
             try:
                 ws(DATA_TAB).append_row(record, value_input_option="USER_ENTERED")
-                st.success("Saved ✔️")
-                # Clear cached reads so new row appears elsewhere instantly
-                sheet_to_list.clear()
-                pharmacies_list.clear()
-                insurance_list.clear()
-                clients_list.clear()
-                client_contacts_map.clear()
-                # Reset inputs for next entry
-                reset_form()
+                st.toast("Saved ✔️")          # quick feedback
+                # Clear caches so views see the new row
+                sheet_to_list.clear(); pharmacies_list.clear(); insurance_list.clear()
+                clients_list.clear(); client_contacts_map.clear()
+                # schedule a clear on next run
+                st.session_state["_clear_form"] = True
+                st.rerun()
             except gspread.exceptions.APIError as e:
                 st.error(f"Google Sheets error while saving: {e}")
             except Exception as e:
                 st.error(f"Unexpected error while saving: {e}")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # View / Export
