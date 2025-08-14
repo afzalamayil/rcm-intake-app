@@ -1,8 +1,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # File: app.py — Streamlit (Option B) — RITE TECH BRANDED (full + all patches)
 # ─────────────────────────────────────────────────────────────────────────────
-# ✅ Fixes "Missing submit button" (single form with st.form_submit_button inside)
-# ✅ Avoids rate-limit crashes when loading masters (safe loaders + fallbacks)
+# ✅ Fixes stale-cookie KeyError by rotating cookie & rerunning
+# ✅ Fixes "Missing submit button" (single st.form + st.form_submit_button)
+# ✅ Avoids rate-limit crashes on masters (safe loaders + fallbacks + caching)
 # ✅ New streamlit_authenticator API (fields=..., reads session_state)
 # ✅ Duplicate check (ERX + MemberID + Net same day) + Allow duplicate override
 # ✅ Masters from Google Sheets (Pharmacies, Insurance, Portals, Status, Clients)
@@ -328,7 +329,7 @@ def is_potential_duplicate(erx_number: str, member_id: str, net_amount: float, s
         return False, pd.DataFrame()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Authentication (new API)
+# Authentication (new API) + stale-cookie auto-reset
 # ─────────────────────────────────────────────────────────────────────────────
 def load_users_rolemap_from_sheet():
     try:
@@ -344,7 +345,12 @@ ROLE_MAP = json.loads(ROLE_MAP_JSON or "{}")
 if USERS_DF is None and not ROLE_MAP:
     ROLE_MAP = {"admin@example.com": {"role": "Super Admin", "clients": ["ALL"]}}
 
-def build_authenticator():
+def build_authenticator(cookie_suffix: str = ""):
+    """
+    Users sheet expects bcrypt hashes (start with $2b$). Generate via Masters Admin → Utilities.
+    If no Users sheet, falls back to [auth].demo_users (auto-hashed at runtime).
+    cookie_suffix lets us rotate the cookie name to invalidate stale cookies.
+    """
     if USERS_DF is not None and not USERS_DF.empty:
         names = USERS_DF['name'].tolist()
         usernames = USERS_DF['username'].tolist()
@@ -357,18 +363,32 @@ def build_authenticator():
         creds = {"usernames": {}}
         for u, info in demo_users.items():
             creds["usernames"][u] = {"name": info["name"], "password": stauth.Hasher([info["password"]]).generate()[0]}
+    base_cookie = AUTH.get("cookie_name", "rcm_intake_app")
+    cookie_name = f"{base_cookie}-{cookie_suffix}" if cookie_suffix else base_cookie
     return stauth.Authenticate(
         creds,
-        AUTH.get("cookie_name", "rcm_intake_app"),
+        cookie_name,
         AUTH.get("cookie_key", "super-secret-key-change-me"),
         int(AUTH.get("cookie_expiry_days", 30)),
     )
 
-authenticator = build_authenticator()
-authenticator.login(
-    location="sidebar",
-    fields={"Form name":"Login","Username":"Username","Password":"Password","Login":"Login"}
-)
+# Rotate cookie automatically if a stale cookie causes KeyError inside login()
+cookie_suffix = st.session_state.get("_cookie_suffix", "")
+authenticator = build_authenticator(cookie_suffix)
+
+try:
+    authenticator.login(
+        location="sidebar",
+        fields={"Form name":"Login","Username":"Username","Password":"Password","Login":"Login"}
+    )
+except KeyError:
+    st.warning("Your previous sign-in cookie is outdated. Resetting it now…")
+    st.session_state["_cookie_suffix"] = str(int(time.time()))
+    st.rerun()
+except Exception as e:
+    st.error(f"Sign-in error: {e}")
+    st.stop()
+
 authentication_status = st.session_state.get("authentication_status")
 name = st.session_state.get("name")
 username = st.session_state.get("username")
