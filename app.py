@@ -1,47 +1,16 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # File: app.py — Streamlit (Option B) — RITE TECH BRANDED (full + all patches)
 # ─────────────────────────────────────────────────────────────────────────────
-# ✅ Pulls masters from Google Sheets (Pharmacies, Insurance, Portals, Status…)
-# ✅ Works with Spreadsheet ID or Name (from secrets)
-# ✅ Handles service-account private_key \n
-# ✅ New streamlit_authenticator API (fields=..., reads from session_state)
-# ✅ Duplicate check (ERX + MemberID + Net on same SubmissionDate) + OVERRIDE
-# ✅ Management report via WhatsApp Cloud API (send CSV to management)
-# ✅ Email send with Excel attachment (SMTP)
+# ✅ Fixes "Missing submit button" (single form with st.form_submit_button inside)
+# ✅ Avoids rate-limit crashes when loading masters (safe loaders + fallbacks)
+# ✅ New streamlit_authenticator API (fields=..., reads session_state)
+# ✅ Duplicate check (ERX + MemberID + Net same day) + Allow duplicate override
+# ✅ Masters from Google Sheets (Pharmacies, Insurance, Portals, Status, Clients)
+# ✅ Email with Excel attachment (SMTP)
+# ✅ WhatsApp Cloud API: send CSV report to MANAGEMENT (not patients)
 # ✅ Exponential backoff + caching; form reset after save; refresh button
-# ✅ Masters Admin + Bulk Import Insurance
-# ─────────────────────────────────────────────────────────────────────────────
 # Requirements:
 #   pip install streamlit gspread google-auth streamlit-authenticator pandas requests python-dateutil openpyxl
-# Secrets (.streamlit/secrets.toml):
-#   [auth]
-#   cookie_name = "rcm_intake_app"
-#   cookie_key  = "CHANGE_ME"
-#   cookie_expiry_days = 30
-#   demo_users  = "{\"admin@example.com\":{\"name\":\"Admin\",\"password\":\"admin123\"}}"
-#
-#   [smtp]
-#   host="smtp.gmail.com"; port=587; user="..."; password="..."; from_email="..."
-#
-#   [gsheets]
-#   spreadsheet_id = "YOUR_SHEET_ID"   # or spreadsheet_name = "RCM_Intake_DB"
-#   type="service_account"; project_id="..."; private_key_id="..."; private_key="-----BEGIN..."
-#   client_email="..."; client_id="..."; auth_uri="..."; token_uri="..."
-#   auth_provider_x509_cert_url="..."; client_x509_cert_url="..."
-#
-#   [ui]
-#   brand="RiteTech Solutions"
-#
-#   # Optional: WhatsApp Cloud API for MANAGEMENT reports
-#   [whatsapp]
-#   phone_number_id = "YOUR_PHONE_NUMBER_ID"
-#   access_token     = "YOUR_PERMANENT_ACCESS_TOKEN"
-#   lang_code        = "en_US"
-#
-#   [whatsapp_management]
-#   recipients = "9715XXXXXXXXX,9715YYYYYYYY"
-#   default_period_days = 1
-#   document_filename = "RCM_Intake_Report.csv"
 # ─────────────────────────────────────────────────────────────────────────────
 
 import io
@@ -150,7 +119,6 @@ def get_spreadsheet(_gc):
         return retry(lambda: _gc.open(SPREADSHEET_NAME))
     except gspread.SpreadsheetNotFound:
         if not SPREADSHEET_ID:
-            # Create if only name provided (requires Drive scope)
             sh = retry(lambda: _gc.create(SPREADSHEET_NAME))
             return sh
         st.error("Spreadsheet ID not found or no access. Share it with the service account in [gsheets].client_email.")
@@ -158,14 +126,6 @@ def get_spreadsheet(_gc):
 
 gc = get_gspread_client()
 sh = get_spreadsheet(gc)
-
-# --- Smoke test (optional) ---
-try:
-    _titles = [ws.title for ws in sh.worksheets()]
-    st.info(f"Connected to '{SPREADSHEET_NAME or SPREADSHEET_ID}'. Tabs: {_titles}")
-except Exception as e:
-    st.error(f"Sheets connection failed: {e}")
-    st.stop()
 
 # Tab names
 DATA_TAB = "Data"
@@ -209,11 +169,9 @@ SEED_SIMPLE = {
 
 def ensure_tabs_and_headers():
     existing = {w.title for w in sh.worksheets()}
-    # create missing tabs
     for t in DEFAULT_TABS:
         if t not in existing:
             retry(lambda: sh.add_worksheet(t, rows=200, cols=26))
-    # ensure headers
     for tab, headers in REQUIRED_HEADERS.items():
         wsx = sh.worksheet(tab)
         vals = retry(lambda: wsx.get_all_values())
@@ -223,11 +181,10 @@ def ensure_tabs_and_headers():
             current = [c.strip() for c in vals[0]]
             if [c.lower() for c in current] != [h.lower() for h in headers]:
                 retry(lambda: wsx.update("A1", [headers]))
-    # seed simple masters if empty (below header)
     for tab, values in SEED_SIMPLE.items():
         wsx = sh.worksheet(tab)
         vals = retry(lambda: wsx.get_all_values())
-        if len(vals) <= 1:  # only header or empty
+        if len(vals) <= 1:
             retry(lambda: wsx.update("A1", [["Value"], *[[v] for v in values]]))
 
 ensure_tabs_and_headers()
@@ -236,38 +193,56 @@ def ws(name: str):
     return sh.worksheet(name)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers (cached reads) — robust header discovery for masters
+# Safe cached reads (with graceful fallbacks to avoid UI crashes)
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=45, show_spinner=False)
-def sheet_to_list(title, prefer_cols=("Value","Name","Mode","Portal","Status","Display")):
+def _sheet_to_list_raw(title, prefer_cols=("Value","Name","Mode","Portal","Status","Display")):
     rows = retry(lambda: ws(title).get_all_values())
     if not rows:
         return []
     header = [h.strip() for h in (rows[0] if rows else [])]
-    # Try preferred columns in order
     for col in prefer_cols:
         if col in header:
             i = header.index(col)
             return [r[i] for r in rows[1:] if len(r) > i and r[i]]
-    # Fallback first column
     return [r[0] for r in rows[1:] if r and r[0]]
 
+def safe_list(title, default_list):
+    try:
+        lst = _sheet_to_list_raw(title)
+        return lst if lst else list(default_list)
+    except Exception:
+        key = f"_warn_{title}"
+        if not st.session_state.get(key):
+            st.sidebar.warning(f"Using fallback for '{title}' due to rate limiting.")
+            st.session_state[key] = True
+        return list(default_list)
+
 @st.cache_data(ttl=45, show_spinner=False)
-def pharmacies_list():
+def _pharmacies_list_raw():
     df = pd.DataFrame(retry(lambda: ws(MS_PHARM).get_all_records()))
     if df.empty:
-        return sheet_to_list(MS_PHARM)
+        return _sheet_to_list_raw(MS_PHARM)
     df = df.fillna("")
-    # Prefer ID + Name if present
     if {"ID","Name"}.issubset(df.columns):
         disp = (df["ID"].astype(str).str.strip() + " - " + df["Name"].astype(str).str.strip()).tolist()
         return [x for x in disp if x and x != " - "]
     if "Name" in df.columns:
         return df["Name"].dropna().astype(str).tolist()
-    return sheet_to_list(MS_PHARM)
+    return _sheet_to_list_raw(MS_PHARM)
+
+def safe_pharmacies():
+    try:
+        lst = _pharmacies_list_raw()
+        return lst if lst else ["—"]
+    except Exception:
+        if not st.session_state.get("_warn_pharm"):
+            st.sidebar.warning("Using fallback for 'Pharmacies' due to rate limiting.")
+            st.session_state["_warn_pharm"] = True
+        return ["—"]
 
 @st.cache_data(ttl=45, show_spinner=False)
-def insurance_list():
+def _insurance_list_raw():
     df = pd.DataFrame(retry(lambda: ws(MS_INSURANCE).get_all_records()))
     if df.empty:
         return [], pd.DataFrame()
@@ -275,7 +250,6 @@ def insurance_list():
     if {"Code","Name"}.issubset(df.columns):
         df["Display"] = df["Code"].astype(str).str.strip() + " - " + df["Name"].astype(str).str.strip()
         return df["Display"].tolist(), df
-    # Try to construct display if headers vary
     if "Display" not in df.columns:
         df["Display"] = df.apply(
             lambda r: " - ".join([str(r.get("Code","")).strip(), str(r.get("Name","")).strip()]).strip(" -"),
@@ -283,15 +257,35 @@ def insurance_list():
         )
     return df["Display"].tolist(), df
 
+def safe_insurance():
+    try:
+        lst, df = _insurance_list_raw()
+        return (lst if lst else ["—"]), df
+    except Exception:
+        if not st.session_state.get("_warn_ins"):
+            st.sidebar.warning("Using fallback for 'Insurance' due to rate limiting.")
+            st.session_state["_warn_ins"] = True
+        return ["—"], pd.DataFrame(columns=["Code","Name","Display"])
+
 @st.cache_data(ttl=45, show_spinner=False)
-def clients_list():
+def _clients_list_raw():
     df = pd.DataFrame(retry(lambda: ws(CLIENTS_TAB).get_all_records()))
     if df.empty or "ClientID" not in df.columns:
         return []
     return df["ClientID"].dropna().astype(str).tolist()
 
+def safe_clients():
+    try:
+        lst = _clients_list_raw()
+        return lst if lst else ["DEFAULT"]
+    except Exception:
+        if not st.session_state.get("_warn_clients"):
+            st.sidebar.warning("Using fallback for 'Clients' due to rate limiting.")
+            st.session_state["_warn_clients"] = True
+        return ["DEFAULT"]
+
 @st.cache_data(ttl=45, show_spinner=False)
-def client_contacts_map():
+def _client_contacts_raw():
     df = pd.DataFrame(retry(lambda: ws(CLIENT_CONTACTS_TAB).get_all_records()))
     mapping = {}
     if not df.empty:
@@ -303,12 +297,17 @@ def client_contacts_map():
                 mapping[cid] = {"to": to, "cc": cc}
     return mapping
 
+def safe_contacts():
+    try:
+        return _client_contacts_raw()
+    except Exception:
+        if not st.session_state.get("_warn_contacts"):
+            st.sidebar.warning("ClientContacts fallback due to rate limiting.")
+            st.session_state["_warn_contacts"] = True
+        return {}
+
 # --- Duplicate check helper ---
 def is_potential_duplicate(erx_number: str, member_id: str, net_amount: float, subm_date: date):
-    """
-    Returns (True, df_matches) if any row on the same SubmissionDate has
-    the same ERXNumber + MemberID + NetAmount (two-decimal string).
-    """
     try:
         df = pd.DataFrame(retry(lambda: ws(DATA_TAB).get_all_records()))
         if df.empty:
@@ -346,10 +345,6 @@ if USERS_DF is None and not ROLE_MAP:
     ROLE_MAP = {"admin@example.com": {"role": "Super Admin", "clients": ["ALL"]}}
 
 def build_authenticator():
-    """
-    Users sheet expects bcrypt hashes (start with $2b$). Generate via Masters Admin → Utilities.
-    If no Users sheet, falls back to [auth].demo_users (auto-hashed at runtime).
-    """
     if USERS_DF is not None and not USERS_DF.empty:
         names = USERS_DF['name'].tolist()
         usernames = USERS_DF['username'].tolist()
@@ -370,7 +365,6 @@ def build_authenticator():
     )
 
 authenticator = build_authenticator()
-# NEW signature: pass location + fields, then read results from session_state
 authenticator.login(
     location="sidebar",
     fields={"Form name":"Login","Username":"Username","Password":"Password","Login":"Login"}
@@ -411,11 +405,11 @@ with st.sidebar:
 PAGES = ["Intake Form", "View / Export", "Email / WhatsApp", "Masters Admin", "Bulk Import Insurance"]
 page = st.sidebar.radio("Navigation", PAGES if ROLE in ("Super Admin", "Admin") else PAGES[:-2])
 
-ALL_CLIENT_IDS = clients_list() or ["DEFAULT"]
+ALL_CLIENT_IDS = safe_clients()
 ALLOWED_CHOICES = ALL_CLIENT_IDS if "ALL" in ALLOWED_CLIENTS else [c for c in ALL_CLIENT_IDS if c in ALLOWED_CLIENTS]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Intake Form (with reset + DUPLICATE OVERRIDE)
+# Intake Form (single form + submit button + DUPLICATE OVERRIDE)
 # ─────────────────────────────────────────────────────────────────────────────
 def reset_form():
     defaults = {
@@ -443,7 +437,14 @@ def reset_form():
 if page == "Intake Form":
     st.subheader("New Submission")
 
-    # If previous run asked to clear the form, do it BEFORE rendering widgets
+    # Preload masters safely (with fallbacks) once per render
+    submission_modes = safe_list(MS_SUBMISSION_MODE, ["Walk-in","Phone","Email","Portal"])
+    portals          = safe_list(MS_PORTAL, ["DHPO","Riayati","Insurance Portal"])
+    statuses         = safe_list(MS_STATUS, ["Submitted","Approved","Rejected","Pending","RA Pending"])
+    pharm_list       = safe_pharmacies()
+    ins_display_list, _ins_df = safe_insurance()
+
+    # Clear request from last save before building the form
     if st.session_state.get("_clear_form", False):
         for k in list(st.session_state.keys()):
             if k in {
@@ -458,19 +459,19 @@ if page == "Intake Form":
     # First-time defaults
     reset_form()
 
+    # ——— THE form (all inputs are inside, with one submit button) ———
     with st.form("intake_form", clear_on_submit=False):
         st.selectbox("Client ID*", ALLOWED_CHOICES, key="sel_client")
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3 = st.columns(3, gap="large")
         with c1:
             st.text_input("Employee Name*", key="employee_name")
             st.date_input("Submission Date*", value=st.session_state["submission_date"], key="submission_date")
-            st.selectbox("Submission Mode*", sheet_to_list(MS_SUBMISSION_MODE), key="submission_mode")
+            st.selectbox("Submission Mode*", submission_modes, key="submission_mode")
         with c2:
-            st.selectbox("Pharmacy Name*", pharmacies_list(), key="pharmacy_name")
-            st.selectbox("Portal* (DHPO / Riayati / Insurance Portal)", sheet_to_list(MS_PORTAL), key="portal")
+            st.selectbox("Pharmacy Name*", pharm_list, key="pharmacy_name")
+            st.selectbox("Portal* (DHPO / Riayati / Insurance Portal)", portals, key="portal")
             st.text_input("ERX Number*", key="erx_number")
         with c3:
-            ins_display_list, _ = insurance_list()
             st.selectbox("Insurance (Code + Name)*", ins_display_list, key="insurance_display")
             st.text_input("Member ID*", key="member_id")
             st.text_input("EID*", key="eid")
@@ -478,21 +479,22 @@ if page == "Intake Form":
         st.text_input("Claim ID*", key="claim_id")
         st.text_input("Approval Code*", key="approval_code")
 
-        d1, d2, d3 = st.columns(3)
+        d1, d2, d3 = st.columns(3, gap="large")
         with d1:
             st.number_input("Net Amount*", min_value=0.0, step=0.01, format="%.2f", key="net_amount")
         with d2:
             st.number_input("Patient Share*", min_value=0.0, step=0.01, format="%.2f", key="patient_share")
         with d3:
-            st.selectbox("Status*", sheet_to_list(MS_STATUS), key="status")
+            st.selectbox("Status*", statuses, key="status")
 
         st.text_area("Remark (optional)", key="remark")  # optional
         st.checkbox("Allow duplicate override", key="allow_dup_override")
 
-        submitted = st.form_submit_button("Submit", type="primary")
+        submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
 
+    # ——— Submit handler ———
     if submitted:
-        # Validate (Remark is OPTIONAL)
+        # Validate (Remark optional)
         required = {
             "Employee Name": st.session_state.employee_name,
             "Submission Date": st.session_state.submission_date,
@@ -514,6 +516,7 @@ if page == "Intake Form":
         if missing_req:
             st.error("Missing required fields: " + ", ".join(missing_req))
         else:
+            # Parse Insurance "Code - Name"
             ins_code, ins_name = "", ""
             if " - " in st.session_state.insurance_display:
                 parts = st.session_state.insurance_display.split(" - ", 1)
@@ -522,7 +525,7 @@ if page == "Intake Form":
                 ins_name = st.session_state.insurance_display
 
             # Duplicate-prevention with OVERRIDE
-            is_dup, dup_df = is_potential_duplicate(
+            is_dup, _dup_df = is_potential_duplicate(
                 st.session_state.erx_number,
                 st.session_state.member_id,
                 st.session_state.net_amount,
@@ -530,8 +533,8 @@ if page == "Intake Form":
             )
             if is_dup and not st.session_state.allow_dup_override:
                 st.warning(
-                    f"Possible duplicate for today (ERX + Member ID + Net). "
-                    f"Tick **Allow duplicate override** to proceed."
+                    "Possible duplicate for today (ERX + Member ID + Net). "
+                    "Tick **Allow duplicate override** to proceed."
                 )
                 st.stop()
 
@@ -561,9 +564,9 @@ if page == "Intake Form":
             try:
                 retry(lambda: ws(DATA_TAB).append_row(record, value_input_option="USER_ENTERED"))
                 st.toast("Saved ✔️")
-                # Clear caches so views see the new row
-                sheet_to_list.clear(); pharmacies_list.clear(); insurance_list.clear()
-                clients_list.clear(); client_contacts_map.clear()
+                # Clear any caches so views see the new row
+                _sheet_to_list_raw.clear(); _pharmacies_list_raw.clear(); _insurance_list_raw.clear()
+                _clients_list_raw.clear(); _client_contacts_raw.clear()
                 # schedule a clear on next run
                 st.session_state["_clear_form"] = True
                 st.rerun()
@@ -578,8 +581,8 @@ if page == "Intake Form":
 if page == "View / Export":
     st.subheader("Search, Filter & Export")
     if st.button("🔄 Refresh data"):
-        sheet_to_list.clear(); pharmacies_list.clear(); insurance_list.clear()
-        clients_list.clear(); client_contacts_map.clear()
+        _sheet_to_list_raw.clear(); _pharmacies_list_raw.clear(); _insurance_list_raw.clear()
+        _clients_list_raw.clear(); _client_contacts_raw.clear()
         st.rerun()
 
     @st.cache_data(ttl=30, show_spinner=False)
@@ -645,44 +648,27 @@ def upload_media_to_whatsapp(file_bytes: bytes, filename: str, mime: str = "text
     wa = st.secrets["whatsapp"]
     url = f"https://graph.facebook.com/v20.0/{wa['phone_number_id']}/media"
     headers = {"Authorization": f"Bearer {wa['access_token']}"}
-    files = {
-        "file": (filename, file_bytes, mime),
-        "type": (None, mime),
-    }
+    files = {"file": (filename, file_bytes, mime), "type": (None, mime)}
     r = requests.post(url, headers=headers, files=files, timeout=60)
     r.raise_for_status()
-    data = r.json()
-    return data.get("id")
+    return r.json().get("id")
 
 def send_document_to_numbers(media_id: str, filename: str, note_text: str):
     wa = st.secrets["whatsapp"]
     mgmt = st.secrets["whatsapp_management"]
     recipients = [x.strip() for x in mgmt["recipients"].split(",") if x.strip()]
     url = f"https://graph.facebook.com/v20.0/{wa['phone_number_id']}/messages"
-    headers = {
-        "Authorization": f"Bearer {wa['access_token']}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {wa['access_token']}", "Content-Type": "application/json"}
     for num in recipients:
-        # Text note (optional)
-        payload_text = {
-            "messaging_product": "whatsapp",
-            "to": num,
-            "type": "text",
-            "text": {"preview_url": False, "body": note_text},
-        }
         try:
-            requests.post(url, headers=headers, json=payload_text, timeout=30).raise_for_status()
+            requests.post(url, headers=headers,
+                          json={"messaging_product":"whatsapp","to":num,"type":"text",
+                                "text":{"preview_url":False,"body":note_text}}, timeout=30).raise_for_status()
         except Exception:
             pass
-        # Document
-        payload_doc = {
-            "messaging_product": "whatsapp",
-            "to": num,
-            "type": "document",
-            "document": {"id": media_id, "filename": filename},
-        }
-        r2 = requests.post(url, headers=headers, json=payload_doc, timeout=60)
+        r2 = requests.post(url, headers=headers,
+                           json={"messaging_product":"whatsapp","to":num,"type":"document",
+                                 "document":{"id":media_id,"filename":filename}}, timeout=60)
         r2.raise_for_status()
 
 if page == "Email / WhatsApp":
@@ -722,7 +708,7 @@ if page == "Email / WhatsApp":
     to_key, cc_key = "to_emails", "cc_emails"
     st.session_state.setdefault(to_key, ""); st.session_state.setdefault(cc_key, "")
 
-    contacts = client_contacts_map()
+    contacts = safe_contacts()
     if len(sel_clients) == 1 and sel_clients[0] in contacts:
         if st.button("Load recipients from ClientContacts"):
             st.session_state[to_key] = ", ".join(contacts[sel_clients[0]]["to"])
@@ -777,13 +763,13 @@ if page == "Email / WhatsApp":
     st.markdown("**WhatsApp (Management) — send CSV through Cloud API**")
     period_days_default = st.secrets.get("whatsapp_management", {}).get("default_period_days", 1)
     days = st.number_input("Days to include (1=today)", min_value=1, max_value=90, value=period_days_default)
-    note = st.text_area("Message body", value=f"RCM Intake report — rows: {len(df)}.")
+    note = st.text_area("Message body", value=f"RCM Intake report — total rows (filtered view): {len(df)}.")
     wa_ready = whatsapp_cfg_ok()
     if st.button("Send to Management via WhatsApp", disabled=not wa_ready):
         if not wa_ready:
             st.error("WhatsApp Cloud not configured in secrets.")
         else:
-            # Build CSV for last N days from df_all (not only current filter) to match requirement
+            # Build CSV for last N days from df_all (covers all clients unless filtered above)
             df_all["SubmissionDate_dt"] = pd.to_datetime(df_all.get("SubmissionDate"), errors="coerce").dt.date
             start_date = (date.today() - timedelta(days=int(days) - 1))
             mask = df_all["SubmissionDate_dt"].between(start_date, date.today())
@@ -800,12 +786,11 @@ if page == "Email / WhatsApp":
                 except Exception as e:
                     st.error(f"WhatsApp send failed: {e}")
 
-    st.caption("Tip: You can still use the free 'Share to WhatsApp' link if Cloud API isn't set up.")
-
+    st.caption("Tip: If Cloud API isn’t set, you can use a free open link below (no attachment).")
     def wa_link(text):
         from urllib.parse import quote_plus
         return f"https://wa.me/?text={quote_plus(text)}"
-    st.link_button("Open WhatsApp with prefilled text", wa_link(f"RCM Intake report — rows: {len(df)}. Please see email."))
+    st.link_button("Open WhatsApp with prefilled text", wa_link(f"RCM Intake report — rows: {len(df)}. Check email for attachment."))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Masters Admin
@@ -820,14 +805,14 @@ if page == "Masters Admin":
     # Simple list editors
     def simple_list_editor(title):
         st.markdown(f"**{title}**")
-        vals = sheet_to_list(title)
+        vals = safe_list(title, [])
         st.write(f"Current values: {', '.join(vals) if vals else '(empty)'}")
         new_val = st.text_input(f"Add new to {title}", key=f"add_{title}")
         if st.button(f"Add to {title}", key=f"btn_{title}"):
             if new_val.strip():
                 wsx = ws(title)
                 retry(lambda: wsx.append_row([new_val.strip()]))
-                sheet_to_list.clear()
+                _sheet_to_list_raw.clear()
                 st.success("Added")
 
     with tab1:
@@ -848,7 +833,7 @@ if page == "Masters Admin":
         if st.button("Add Pharmacy", key="ph_add"):
             if pid.strip() and pname.strip():
                 retry(lambda: ws(MS_PHARM).append_row([pid.strip(), pname.strip()], value_input_option="USER_ENTERED"))
-                pharmacies_list.clear()
+                _pharmacies_list_raw.clear()
                 st.success("Pharmacy added")
 
     with tab5:
@@ -863,7 +848,7 @@ if page == "Masters Admin":
         if st.button("Add Client", key="cl_add"):
             if cid.strip() and cname.strip():
                 retry(lambda: ws(CLIENTS_TAB).append_row([cid.strip(), cname.strip()], value_input_option="USER_ENTERED"))
-                clients_list.clear()
+                _clients_list_raw.clear()
                 st.success("Client added")
 
         st.divider()
@@ -880,8 +865,7 @@ if page == "Masters Admin":
         if st.button("Add / Update Contacts", key="cc_save"):
             wsx = ws(CLIENT_CONTACTS_TAB)
             all_vals = retry(lambda: wsx.get_all_values())
-            header = all_vals[0] if all_vals else ["ClientID","To","CC"]
-            rows = all_vals[1:]
+            rows = all_vals[1:] if all_vals else []
             updated = False
             for i, r in enumerate(rows, start=2):
                 if len(r) > 0 and r[0].strip() == cc_cid.strip():
@@ -890,7 +874,7 @@ if page == "Masters Admin":
                     break
             if not updated:
                 retry(lambda: wsx.append_row([cc_cid.strip(), cc_to.strip(), cc_cc.strip()], value_input_option="USER_ENTERED"))
-            client_contacts_map.clear()
+            _client_contacts_raw.clear()
             st.success("Contacts saved")
 
     with tab6:
@@ -921,12 +905,11 @@ if page == "Bulk Import Insurance":
                 st.dataframe(idf, use_container_width=True, hide_index=True)
                 if st.button("Replace Insurance master with this file", type="primary"):
                     wsx = ws(MS_INSURANCE)
-                    # clear existing (reset headers too)
                     retry(lambda: wsx.clear())
                     retry(lambda: wsx.update("A1", [["Code","Name"]]))
                     if not idf.empty:
                         retry(lambda: wsx.update("A2", idf[["Code","Name"]].astype(str).values.tolist()))
-                    insurance_list.clear()
+                    _insurance_list_raw.clear()
                     st.success("Insurance master updated")
         except Exception as e:
             st.error(f"Import error: {e}")
