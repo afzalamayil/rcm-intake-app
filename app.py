@@ -3,10 +3,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # ✅ Stale-cookie fix for streamlit_authenticator
 # ✅ Single st.form + st.form_submit_button (no submit error)
-# ✅ Google Sheets init now ultra-light: row_values(1)/acell() instead of get_all_values()
-# ✅ Jittered exponential backoff; init runs once per server (cache_resource)
-# ✅ Duplicate check + override
-# ✅ Masters from Google Sheets; Email export; WhatsApp (management)
+# ✅ Google Sheets init ultra-light; jittered exponential backoff
+# ✅ Duplicate check now uses batch_get(F/J/M/Q)
+# ✅ Masters from Google Sheets; Email export
+# ✅ WhatsApp (Management via Cloud API) + FREE manual share via Drive + wa.me buttons
 # ─────────────────────────────────────────────────────────────────────────────
 
 import io
@@ -44,7 +44,7 @@ except TypeError:
 if os.path.exists(LOGO_PATH):
     col_logo.image(LOGO_PATH, use_container_width=True)
 col_title.markdown("### RCM Intake — Streamlit (Option B)")
-st.caption("Stack: Streamlit + Google Sheets • Email via SMTP • WhatsApp Cloud for management reports")
+st.caption("Stack: Streamlit + Google Sheets • Email via SMTP • WhatsApp Cloud (mgmt) + Free WA links")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Secrets
@@ -89,10 +89,9 @@ def retry(fn, attempts=8, base=0.7):
         except Exception as e:
             msg = str(e).lower()
             transient = any(x in msg for x in [
-                "429","rate","quota","deadline","temporar","internal","backend error","backendError"
+                "429","rate","quota","deadline","temporar","internal","backenderror"
             ])
             if transient:
-                # jittered exponential backoff
                 time.sleep(min(base * (2**i), 6) + random.random()*0.5)
                 continue
             raise
@@ -164,7 +163,7 @@ REQUIRED_HEADERS = {
     MS_PORTAL: ["Value"],
     MS_STATUS: ["Value"],
     CLIENTS_TAB: ["ClientID","Name"],
-    CLIENT_CONTACTS_TAB: ["ClientID","To","CC"],
+    CLIENT_CONTACTS_TAB: ["ClientID","To","CC","WhatsApp"],  # WhatsApp numbers (comma-separated E.164)
 }
 
 SEED_SIMPLE = {
@@ -176,27 +175,21 @@ SEED_SIMPLE = {
 def ensure_tabs_and_headers_light():
     try:
         existing = list_titles(sh)
-        # create only missing tabs
         for t in DEFAULT_TABS:
             if t not in existing:
                 retry(lambda: sh.add_worksheet(t, rows=200, cols=26))
-
-        # ensure headers using only row 1
         for tab, headers in REQUIRED_HEADERS.items():
             wsx = get_or_create_ws(sh, tab)
-            head = retry(lambda: wsx.row_values(1))  # LIGHT: only first row
+            head = retry(lambda: wsx.row_values(1))
             head_norm = [c.strip().lower() for c in head] if head else []
             need_update = (not head) or (head_norm != [h.lower() for h in headers])
             if need_update:
                 retry(lambda: wsx.update("A1", [headers]))
-
-        # seed masters (LIGHT: check A2 only)
         for tab, values in SEED_SIMPLE.items():
             wsx = get_or_create_ws(sh, tab)
-            a2 = retry(lambda: wsx.acell("A2").value)  # LIGHT: single cell
+            a2 = retry(lambda: wsx.acell("A2").value)
             if not a2:
                 retry(lambda: wsx.update("A1", [["Value"], *[[v] for v in values]]))
-
     except gspread.exceptions.APIError:
         st.error(
             "Couldn’t read/create worksheets.\n\n"
@@ -207,7 +200,6 @@ def ensure_tabs_and_headers_light():
         )
         st.stop()
 
-# Run once per server (not every rerun)
 @st.cache_resource(show_spinner=False)
 def _init_sheets_once():
     ensure_tabs_and_headers_light()
@@ -223,7 +215,6 @@ def ws(name: str):
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=45, show_spinner=False)
 def _sheet_to_list_raw(title, prefer_cols=("Value","Name","Mode","Portal","Status","Display")):
-    # Read only what we need
     rows = retry(lambda: ws(title).get_all_values())
     if not rows:
         return []
@@ -320,8 +311,9 @@ def _client_contacts_raw():
             cid = str(row.get("ClientID","")).strip()
             to = [e.strip() for e in str(row.get("To","")).split(",") if e.strip()]
             cc = [e.strip() for e in str(row.get("CC","")).split(",") if e.strip()]
+            wa = [e.strip() for e in str(row.get("WhatsApp","")).split(",") if e.strip()]
             if cid:
-                mapping[cid] = {"to": to, "cc": cc}
+                mapping[cid] = {"to": to, "cc": cc, "wa": wa}
     return mapping
 
 def safe_contacts():
@@ -333,23 +325,39 @@ def safe_contacts():
             st.session_state["_warn_contacts"] = True
         return {}
 
-# Duplicate check
+# ── Light duplicate snapshot using batch_get (F/J/M/Q) ───────────────────────
+@st.cache_data(ttl=30, show_spinner=False)
+def light_duplicate_snapshot():
+    # F:SubmissionDate, J:ERXNumber, M:MemberID, Q:NetAmount
+    ranges = [f"{DATA_TAB}!F:F", f"{DATA_TAB}!J:J", f"{DATA_TAB}!M:M", f"{DATA_TAB}!Q:Q"]
+    values = retry(lambda: sh.batch_get(ranges))
+    def col_or_empty(i):
+        return values[i][1:] if (i < len(values) and values[i]) else []
+    dates, erx, members, nets = (col_or_empty(i) for i in range(4))
+    rows = []
+    N = max(len(dates), len(erx), len(members), len(nets))
+    for i in range(N):
+        rows.append({
+            "SubmissionDate": (dates[i][0] if i < len(dates) and dates[i] else ""),
+            "ERXNumber":      (erx[i][0] if i < len(erx) and erx[i] else ""),
+            "MemberID":       (members[i][0] if i < len(members) and members[i] else ""),
+            "NetAmount":      (nets[i][0] if i < len(nets) and nets[i] else ""),
+        })
+    return pd.DataFrame(rows)
+
 def is_potential_duplicate(erx_number: str, member_id: str, net_amount: float, subm_date: date):
     try:
-        df = pd.DataFrame(retry(lambda: ws(DATA_TAB).get_all_records()))
+        df = light_duplicate_snapshot()
         if df.empty:
             return False, pd.DataFrame()
         df["SubmissionDate"] = pd.to_datetime(df["SubmissionDate"], errors="coerce").dt.date
         net_str = f"{float(net_amount):.2f}"
         same_day = df[df["SubmissionDate"] == subm_date]
-        if same_day.empty:
-            return False, pd.DataFrame()
-        mask = (
+        dup = same_day[
             same_day["ERXNumber"].astype(str).str.strip().eq(erx_number.strip()) &
             same_day["MemberID"].astype(str).str.strip().eq(member_id.strip()) &
             same_day["NetAmount"].astype(str).str.strip().eq(net_str)
-        )
-        dup = same_day[mask]
+        ]
         return (not dup.empty), dup
     except Exception:
         return False, pd.DataFrame()
@@ -375,7 +383,7 @@ def build_authenticator(cookie_suffix: str = ""):
     if USERS_DF is not None and not USERS_DF.empty:
         names = USERS_DF['name'].tolist()
         usernames = USERS_DF['username'].tolist()
-        passwords = USERS_DF['password'].tolist()
+        passwords = USERS_DF['password'].tolist()  # bcrypt hashes expected
         creds = {"usernames": {u: {"name": n, "password": p} for n, u, p in zip(names, usernames, passwords)}}
     else:
         demo_users = json.loads(AUTH.get("demo_users", "{}")) or {
@@ -594,7 +602,7 @@ if page == "Intake Form":
                 retry(lambda: ws(DATA_TAB).append_row(record, value_input_option="USER_ENTERED"))
                 st.toast("Saved ✔️")
                 _sheet_to_list_raw.clear(); _pharmacies_list_raw.clear(); _insurance_list_raw.clear()
-                _clients_list_raw.clear(); _client_contacts_raw.clear()
+                _clients_list_raw.clear(); _client_contacts_raw.clear(); light_duplicate_snapshot.clear()
                 st.session_state["_clear_form"] = True
                 st.rerun()
             except gspread.exceptions.APIError as e:
@@ -609,7 +617,7 @@ if page == "View / Export":
     st.subheader("Search, Filter & Export")
     if st.button("🔄 Refresh data"):
         _sheet_to_list_raw.clear(); _pharmacies_list_raw.clear(); _insurance_list_raw.clear()
-        _clients_list_raw.clear(); _client_contacts_raw.clear()
+        _clients_list_raw.clear(); _client_contacts_raw.clear(); light_duplicate_snapshot.clear()
         st.rerun()
 
     @st.cache_data(ttl=30, show_spinner=False)
@@ -664,7 +672,7 @@ if page == "View / Export":
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Email / WhatsApp (Management)
+# Email / WhatsApp (Management + Free Manual)
 # ─────────────────────────────────────────────────────────────────────────────
 def whatsapp_cfg_ok():
     w = st.secrets.get("whatsapp", {})
@@ -697,6 +705,50 @@ def send_document_to_numbers(media_id: str, filename: str, note_text: str):
                            json={"messaging_product":"whatsapp","to":num,"type":"document",
                                  "document":{"id":media_id,"filename":filename}}, timeout=60)
         r2.raise_for_status()
+
+# ---- FREE WhatsApp manual share via Drive (optional dependency) -------------
+from urllib.parse import quote_plus
+@st.cache_resource(show_spinner=False)
+def get_drive_service():
+    """
+    Requires 'google-api-python-client' in requirements.txt.
+    Uses same service account from [gsheets].
+    """
+    try:
+        from googleapiclient.discovery import build
+        from google.oauth2.service_account import Credentials as GCreds
+    except Exception as e:
+        st.warning("Install 'google-api-python-client' to enable Drive upload for free WhatsApp sharing.")
+        raise
+    gs_info = dict(GS)
+    if isinstance(gs_info.get("private_key",""), str):
+        gs_info["private_key"] = gs_info["private_key"].replace("\\n", "\n")
+    scopes = [
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/drive.file",
+    ]
+    creds = GCreds.from_service_account_info(gs_info, scopes=scopes)
+    return build("drive", "v3", credentials=creds)
+
+def drive_upload_and_share(file_bytes: bytes, filename: str, mime: str) -> dict:
+    """Upload to Drive (optional [drive].reports_folder_id), make public, return links."""
+    from googleapiclient.http import MediaIoBaseUpload
+    import io as _io
+    service = get_drive_service()
+    folder_id = st.secrets.get("drive", {}).get("reports_folder_id", "").strip()
+    meta = {"name": filename}
+    if folder_id:
+        meta["parents"] = [folder_id]
+    media = MediaIoBaseUpload(_io.BytesIO(file_bytes), mimetype=mime, resumable=False)
+    file = service.files().create(body=meta, media_body=media, fields="id, webViewLink, webContentLink").execute()
+    fid = file["id"]
+    service.permissions().create(fileId=fid, body={"type": "anyone", "role": "reader"}).execute()
+    file = service.files().get(fileId=fid, fields="id, webViewLink, webContentLink").execute()
+    return file  # id, webViewLink, webContentLink
+
+def wa_link(phone_e164: str, text: str) -> str:
+    return f"https://wa.me/{phone_e164}?text={quote_plus(text)}"
+# -----------------------------------------------------------------------------
 
 if page == "Email / WhatsApp":
     st.subheader("Send Report")
@@ -785,10 +837,11 @@ if page == "Email / WhatsApp":
             )
             if ok: st.success("Email sent ✔️")
 
+    # ── WhatsApp MANAGEMENT (Cloud API; paid by Meta) ────────────────────────
     st.divider()
-    st.markdown("**WhatsApp (Management) — send CSV through Cloud API**")
+    st.markdown("**WhatsApp (Management, Cloud API) — send CSV to configured recipients**")
     period_days_default = st.secrets.get("whatsapp_management", {}).get("default_period_days", 1)
-    days = st.number_input("Days to include (1=today)", min_value=1, max_value=90, value=period_days_default)
+    days = st.number_input("Days to include (1=today)", min_value=1, max_value=90, value=int(period_days_default))
     note = st.text_area("Message body", value=f"RCM Intake report — total rows (filtered view): {len(df)}.")
     wa_ready = whatsapp_cfg_ok()
     if st.button("Send to Management via WhatsApp", disabled=not wa_ready):
@@ -811,11 +864,67 @@ if page == "Email / WhatsApp":
                 except Exception as e:
                     st.error(f"WhatsApp send failed: {e}")
 
-    st.caption("Tip: If Cloud API isn’t set, use the free link (no attachment).")
-    def wa_link(text):
+    # ── FREE WhatsApp manual sharing via Drive (+ wa.me buttons) ─────────────
+    st.divider()
+    st.markdown("### WhatsApp (free, manual send)")
+    st.caption("Uploads the filtered Excel to Drive (public read-only) and creates WhatsApp buttons per client number. "
+               "You still tap Send in WhatsApp (Click-to-Chat).")
+
+    wa_filename = f"RCM_Intake_Report_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+    uploaded_info = None
+    if st.button("📤 Upload report to Google Drive & generate WhatsApp buttons", type="secondary"):
+        try:
+            uploaded_info = drive_upload_and_share(
+                file_bytes=xbytes.getvalue(),
+                filename=wa_filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            st.success("Report uploaded to Drive and shared (anyone with link).")
+            st.write("Link:", uploaded_info.get("webViewLink") or uploaded_info.get("webContentLink"))
+        except Exception as e:
+            st.error(f"Drive upload/share failed: {e}")
+
+    if uploaded_info:
+        drive_link = uploaded_info.get("webContentLink") or uploaded_info.get("webViewLink")
+        today = datetime.now().strftime("%Y-%m-%d")
+        base_msg = f"RCM Intake report ({today}). Download: {drive_link}"
+
+        contacts_df = pd.DataFrame(retry(lambda: ws(CLIENT_CONTACTS_TAB).get_all_records()))
+        if contacts_df.empty:
+            st.warning("No ClientContacts found.")
+        else:
+            st.write("Select a client to show WhatsApp buttons:")
+            cid_for_wa = st.selectbox("Client", sorted(df['ClientID'].unique().tolist()))
+            wa_numbers = []
+            if "WhatsApp" in contacts_df.columns:
+                wa_numbers = (
+                    contacts_df.loc[contacts_df["ClientID"].astype(str) == str(cid_for_wa), "WhatsApp"]
+                    .astype(str)
+                    .str.split(",")
+                    .explode()
+                    .dropna()
+                    .map(lambda x: x.strip())
+                    .tolist()
+                )
+                wa_numbers = [p for p in wa_numbers if p]
+            manual_numbers = st.text_input("Extra WhatsApp numbers (comma-separated, E.164, optional)")
+            if manual_numbers.strip():
+                wa_numbers.extend([p.strip() for p in manual_numbers.split(",") if p.strip()])
+
+            if not wa_numbers:
+                st.info("No WhatsApp numbers found for this client. Add a 'WhatsApp' column in ClientContacts (comma-separated E.164 numbers), "
+                        "or paste numbers above.")
+            else:
+                st.success(f"Generating WhatsApp buttons for {len(wa_numbers)} number(s).")
+                for phone in wa_numbers:
+                    url = wa_link(phone, base_msg)
+                    st.link_button(f"Open WhatsApp → {phone}", url)
+
+    # Simple fallback text-only (no file)
+    if st.button("Open WhatsApp with simple prefilled text"):
         from urllib.parse import quote_plus
-        return f"https://wa.me/?text={quote_plus(text)}"
-    st.link_button("Open WhatsApp with prefilled text", wa_link(f"RCM Intake report — rows: {len(df)}. Check email for attachment."))
+        st.link_button("Go to WhatsApp",
+                       f"https://wa.me/?text={quote_plus(f'RCM Intake report — rows: {len(df)}. Check email for attachment.')}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Masters Admin
