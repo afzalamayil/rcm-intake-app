@@ -1,12 +1,13 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# File: app.py — Streamlit (Option B) — RITE TECH BRANDED (full + resilient init)
+# File: app.py — Streamlit (Option B) — RITE TECH BRANDED (full + restricted UI)
 # ─────────────────────────────────────────────────────────────────────────────
 # ✅ Stale-cookie fix for streamlit_authenticator
-# ✅ Single st.form + st.form_submit_button (no submit error)
+# ✅ Single st.form + st.form_submit_button
 # ✅ Google Sheets init ultra-light; jittered exponential backoff
-# ✅ Duplicate check now uses batch_get(F/J/M/Q)
+# ✅ Duplicate check uses batch_get(F/J/M/Q)
 # ✅ Masters from Google Sheets; Email export
-# ✅ WhatsApp (Management via Cloud API) + FREE manual share via Drive + wa.me buttons
+# ✅ WhatsApp (Management via Cloud API) + FREE manual share (Drive + wa.me)
+# ✅ Role-based navigation: only Admin/Super Admin see non-Intake pages
 # ─────────────────────────────────────────────────────────────────────────────
 
 import io
@@ -448,13 +449,17 @@ with st.sidebar:
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Navigation
+# Navigation (restrict non-admins to Intake Form only)
 # ─────────────────────────────────────────────────────────────────────────────
-PAGES = ["Intake Form", "View / Export", "Email / WhatsApp", "Masters Admin", "Bulk Import Insurance"]
-page = st.sidebar.radio("Navigation", PAGES if ROLE in ("Super Admin", "Admin") else PAGES[:-2])
+PAGES_ALL = ["Intake Form", "View / Export", "Email / WhatsApp", "Masters Admin", "Bulk Import Insurance"]
 
-ALL_CLIENT_IDS = safe_clients()
-ALLOWED_CHOICES = ALL_CLIENT_IDS if "ALL" in ALLOWED_CLIENTS else [c for c in ALL_CLIENT_IDS if c in ALLOWED_CLIENTS]
+def pages_for(role: str):
+    if role in ("Super Admin", "Admin"):
+        return PAGES_ALL
+    return ["Intake Form"]
+
+NAV_PAGES = pages_for(ROLE)
+page = st.sidebar.radio("Navigation", NAV_PAGES)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Intake Form
@@ -476,11 +481,14 @@ def reset_form():
         "patient_share": 0.0,
         "status": "",
         "remark": "",
-        "sel_client": (ALLOWED_CHOICES[0] if ALLOWED_CHOICES else ""),
+        "sel_client": (safe_clients()[0] if pages_for(ROLE) and safe_clients() else ""),
         "allow_dup_override": False,
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
+
+ALL_CLIENT_IDS = safe_clients()
+ALLOWED_CHOICES = ALL_CLIENT_IDS if "ALL" in ALLOWED_CLIENTS else [c for c in ALL_CLIENT_IDS if c in ALLOWED_CLIENTS]
 
 if page == "Intake Form":
     st.subheader("New Submission")
@@ -611,9 +619,12 @@ if page == "Intake Form":
                 st.error(f"Unexpected error while saving: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# View / Export
+# View / Export (ADMIN ONLY)
 # ─────────────────────────────────────────────────────────────────────────────
 if page == "View / Export":
+    if ROLE not in ("Super Admin", "Admin"):
+        st.stop()
+
     st.subheader("Search, Filter & Export")
     if st.button("🔄 Refresh data"):
         _sheet_to_list_raw.clear(); _pharmacies_list_raw.clear(); _insurance_list_raw.clear()
@@ -672,7 +683,7 @@ if page == "View / Export":
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Email / WhatsApp (Management + Free Manual)
+# Email / WhatsApp (ADMIN ONLY)
 # ─────────────────────────────────────────────────────────────────────────────
 def whatsapp_cfg_ok():
     w = st.secrets.get("whatsapp", {})
@@ -706,7 +717,7 @@ def send_document_to_numbers(media_id: str, filename: str, note_text: str):
                                  "document":{"id":media_id,"filename":filename}}, timeout=60)
         r2.raise_for_status()
 
-# ---- FREE WhatsApp manual share via Drive (optional dependency) -------------
+# ---- FREE WhatsApp manual share via Drive (requires google-api-python-client) ----
 from urllib.parse import quote_plus
 @st.cache_resource(show_spinner=False)
 def get_drive_service():
@@ -748,9 +759,12 @@ def drive_upload_and_share(file_bytes: bytes, filename: str, mime: str) -> dict:
 
 def wa_link(phone_e164: str, text: str) -> str:
     return f"https://wa.me/{phone_e164}?text={quote_plus(text)}"
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
 
 if page == "Email / WhatsApp":
+    if ROLE not in ("Super Admin", "Admin"):
+        st.stop()
+
     st.subheader("Send Report")
 
     df_all = pd.DataFrame(retry(lambda: ws(DATA_TAB).get_all_records()))
@@ -920,16 +934,19 @@ if page == "Email / WhatsApp":
                     url = wa_link(phone, base_msg)
                     st.link_button(f"Open WhatsApp → {phone}", url)
 
-    # Simple fallback text-only (no file)
-    if st.button("Open WhatsApp with simple prefilled text"):
-        from urllib.parse import quote_plus
-        st.link_button("Go to WhatsApp",
-                       f"https://wa.me/?text={quote_plus(f'RCM Intake report — rows: {len(df)}. Check email for attachment.')}")
+    # Simple text-only link (no file)
+    st.link_button(
+        "Open WhatsApp with simple prefilled text",
+        f"https://wa.me/?text={quote_plus(f'RCM Intake report — rows: {len(df)}. Check email for attachment.')}"
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Masters Admin
+# Masters Admin (ADMIN ONLY)
 # ─────────────────────────────────────────────────────────────────────────────
 if page == "Masters Admin":
+    if ROLE not in ("Super Admin", "Admin"):
+        st.stop()
+
     st.subheader("Masters Admin")
 
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
@@ -1020,9 +1037,12 @@ if page == "Masters Admin":
             st.info("Copy the above value into the Users sheet. (bcrypt, starts with $2b$...)")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Bulk Import Insurance
+# Bulk Import Insurance (ADMIN ONLY)
 # ─────────────────────────────────────────────────────────────────────────────
 if page == "Bulk Import Insurance":
+    if ROLE not in ("Super Admin", "Admin"):
+        st.stop()
+
     st.subheader("Bulk Import Insurance (CSV/XLSX with columns: Code, Name)")
     uploaded = st.file_uploader("Upload file", type=["csv","xlsx"])
     if uploaded is not None:
