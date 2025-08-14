@@ -1,37 +1,15 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# app.py — RCM Intake (Streamlit)
-# • Form reset after submit
-# • Duplicate warning (same-day ERX+MemberID+Net)
-# • Cached reads to avoid 429s + exponential backoff
-# • Optional WhatsApp Business Cloud API send
-# • Logging to a "Logs" sheet
-# • UPDATED for streamlit_authenticator (new .login API with fields=…)
-# ─────────────────────────────────────────────────────────────────────────────
+# app.py — RCM Intake (Streamlit) — 2025-08-14
+# Fixes:
+# • Works with gsheets.sheet_url OR gsheets.spreadsheet_id
+# • New streamlit_authenticator login API (location, fields)
+# • Friendly config checks (no redacted KeyError)
+# • Form reset after submit, duplicate warning, cached reads, backoff
+# • Optional WhatsApp send; logging to "Logs" sheet
 # Requirements:
 #   pip install streamlit gspread google-auth streamlit-authenticator pandas requests python-dateutil
-#
-# .streamlit/secrets.toml (example)
-# [gsheets]
-# sheet_url    = "https://docs.google.com/spreadsheets/d/XXXX/edit"
-# client_email = "service-account@project.iam.gserviceaccount.com"
-# token_uri    = "https://oauth2.googleapis.com/token"
-# private_key  = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-# private_key_id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-#
-# [auth]
-# cookie_name = "rcm_intake_app"
-# cookie_key  = "CHANGE_ME_TO_A_RANDOM_LONG_VALUE"
-# cookie_expiry_days = 30
-# # Example demo users (use hashed in production):
-# demo_users  = "{\"admin@example.com\":{\"name\":\"Admin\",\"password\":\"admin123\"}}"
-#
-# [whatsapp]  # Optional—remove if not used
-# phone_number_id = "YOUR_PHONE_NUMBER_ID"
-# access_token     = "YOUR_PERMANENT_ACCESS_TOKEN"
-# template_name    = "intake_confirmation"
-# lang_code        = "en_US"
+# ─────────────────────────────────────────────────────────────────────────────
 
-import os
 import json
 import time
 from datetime import datetime, date
@@ -56,7 +34,7 @@ TZ = tz.gettz("Asia/Dubai")
 
 DATA_SHEET_NAME = "Data"
 LOG_SHEET_NAME = "Logs"
-REFERENCE_SHEET = "Reference"  # optional; dropdowns can be fed from here
+REFERENCE_SHEET = "Reference"  # optional
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -64,12 +42,29 @@ SCOPES = [
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers: Google Sheets
+# Friendly config loader
+# ─────────────────────────────────────────────────────────────────────────────
+def get_cfg():
+    """Validate required secrets; support sheet_url or spreadsheet_id."""
+    gs = st.secrets.get("gsheets", {})
+    need = ["client_email", "token_uri", "private_key"]
+    missing = [k for k in need if not gs.get(k)]
+    if missing:
+        st.error("Missing Google Sheets secrets: " + ", ".join(missing))
+        st.stop()
+
+    if not gs.get("sheet_url") and not gs.get("spreadsheet_id"):
+        st.error("Provide either [gsheets].sheet_url OR [gsheets].spreadsheet_id in secrets.toml.")
+        st.stop()
+    return gs
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Google Sheets helpers
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def get_gspread_client():
     """Authorize once per session."""
-    gs = st.secrets["gsheets"]
+    gs = get_cfg()
     info = {
         "type": "service_account",
         "client_email": gs["client_email"],
@@ -96,8 +91,10 @@ def retry(fn, attempts=5):
     raise RuntimeError("Exceeded retries due to rate limiting.")
 
 def open_sheet(gc):
-    url = st.secrets["gsheets"]["sheet_url"]
-    return retry(lambda: gc.open_by_url(url))
+    gs = get_cfg()
+    if gs.get("spreadsheet_id"):
+        return retry(lambda: gc.open_by_key(gs["spreadsheet_id"]))
+    return retry(lambda: gc.open_by_url(gs["sheet_url"]))
 
 def get_ws(gc, ws_title):
     sh = open_sheet(gc)
@@ -108,14 +105,13 @@ def get_ws(gc, ws_title):
         return ws
 
 @st.cache_data(ttl=60, show_spinner=False)
-def read_df_cached(sheet_url: str, ws_title: str) -> pd.DataFrame:
+def read_df_cached(ws_title: str) -> pd.DataFrame:
     """Cached read of a worksheet → DataFrame of records."""
     gc = get_gspread_client()
-    sh = retry(lambda: gc.open_by_url(sheet_url))
+    sh = open_sheet(gc)
     ws = retry(lambda: sh.worksheet(ws_title))
     records = retry(lambda: ws.get_all_records())
-    df = pd.DataFrame(records)
-    return df
+    return pd.DataFrame(records)
 
 def append_row(ws, values):
     return retry(lambda: ws.append_row(values, value_input_option="USER_ENTERED"))
@@ -128,7 +124,7 @@ def write_header_if_empty(ws, header_list):
         retry(lambda: ws.append_row(header_list, value_input_option="USER_ENTERED"))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers: WhatsApp (optional)
+# WhatsApp (optional)
 # ─────────────────────────────────────────────────────────────────────────────
 def whatsapp_enabled():
     return "whatsapp" in st.secrets and st.secrets["whatsapp"].get("phone_number_id")
@@ -160,7 +156,7 @@ def send_whatsapp_message(phone_e164: str, params: list[str]):
     return r.json()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers: Auth (updated login flow)
+# Auth (updated login flow)
 # ─────────────────────────────────────────────────────────────────────────────
 def init_auth():
     auth_conf = st.secrets.get("auth", {})
@@ -181,7 +177,7 @@ def init_auth():
         names.append(info.get("name", email.split("@")[0].title()))
         usernames.append(email)
         pwd = info.get("password", "pass123")
-        # Hash if not already pbkdf2
+        # Hash if not already pbkdf2:
         if not str(pwd).startswith("pbkdf2:"):
             pwd = stauth.Hasher([pwd]).generate()[0]
         passwords.append(pwd)
@@ -199,7 +195,7 @@ def init_auth():
     return authenticator
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers: Duplicate check & logging
+# Duplicate check & logging
 # ─────────────────────────────────────────────────────────────────────────────
 def is_duplicate(df: pd.DataFrame, erx: str, member_id: str, net_amount, svc_date: date) -> bool:
     if df.empty:
@@ -213,7 +209,7 @@ def is_duplicate(df: pd.DataFrame, erx: str, member_id: str, net_amount, svc_dat
                 (d.get("ERXNumber", "") == erx)
                 & (d.get("MemberID", "") == member_id)
                 & (d.get("Net", "").astype(str) == str(net_amount))
-                & (d.get("ServiceDate", pd.NaT) == svc_date)
+                & (d.get("ServiceDate", None) == svc_date)
             ).any()
         )
     except Exception:
@@ -231,8 +227,7 @@ def log_action(ws_log, user, action, details: dict):
 def main():
     # ─── Auth ────────────────────────────────────────────────────────────────
     authenticator = init_auth()
-
-    # NEW API: location first, plus 'fields' labels. No tuple return.
+    # New API: location + fields; results in st.session_state
     authenticator.login(
         "sidebar",
         fields={
@@ -268,7 +263,7 @@ def main():
 
     with st.sidebar.expander("⬇️ Export"):
         try:
-            df_all = read_df_cached(st.secrets["gsheets"]["sheet_url"], DATA_SHEET_NAME)
+            df_all = read_df_cached(DATA_SHEET_NAME)
             csv = df_all.to_csv(index=False).encode("utf-8")
             st.download_button("Export Data CSV", csv, "intake_data.csv", "text/csv")
         except Exception as e:
@@ -276,12 +271,12 @@ def main():
 
     # ─── Title ──────────────────────────────────────────────────────────────
     st.title("🧾 RCM Intake")
-    st.caption("Fast data entry to Google Sheets with duplicate warning and WhatsApp confirmation.")
+    st.caption("Fast data entry to Google Sheets with duplicate warning, caching, and WhatsApp confirmation.")
 
     # ─── Reference lists (optional) ─────────────────────────────────────────
     def get_reference_options():
         try:
-            df_ref = read_df_cached(st.secrets["gsheets"]["sheet_url"], REFERENCE_SHEET)
+            df_ref = read_df_cached(REFERENCE_SHEET)
             payers = sorted([x for x in df_ref.get("Payer", []).dropna().unique().tolist() if x])
             clinicians = sorted([x for x in df_ref.get("Clinician", []).dropna().unique().tolist() if x])
             return payers or ["Daman", "NAS", "Neuron", "Nextcare"], clinicians or ["Dr A", "Dr B"]
@@ -292,8 +287,7 @@ def main():
 
     # ─── Form ───────────────────────────────────────────────────────────────
     form_key = st.session_state.get("form_key", "intake_form")
-
-    with st.form(key=form_key, border=True):
+    with st.form(key=form_key):
         cols1 = st.columns([1, 1, 1, 1])
         with cols1[0]:
             service_date = st.date_input("Service Date", value=date.today())
@@ -335,7 +329,7 @@ def main():
                 st.stop()
 
             # Load current data (cached)
-            df_existing = read_df_cached(st.secrets["gsheets"]["sheet_url"], DATA_SHEET_NAME)
+            df_existing = read_df_cached(DATA_SHEET_NAME)
 
             # Duplicate check for same day (ERX + MemberID + Net)
             dup = is_duplicate(df_existing, erx_number, member_id, net_amount, service_date)
@@ -402,7 +396,7 @@ def main():
     # ─── Data Preview (read-only, cached) ────────────────────────────────────
     with st.expander("📋 Latest Entries (read-only)", expanded=False):
         try:
-            df = read_df_cached(st.secrets["gsheets"]["sheet_url"], DATA_SHEET_NAME)
+            df = read_df_cached(DATA_SHEET_NAME)
             if not df.empty:
                 st.dataframe(df.tail(50), use_container_width=True, height=320)
             else:
@@ -412,8 +406,8 @@ def main():
 
     # ─── Footer note ────────────────────────────────────────────────────────
     st.caption(
-        "Reads are cached for ~60s to avoid Google API rate limits. "
-        "Use the sidebar **Refresh** if you recently added data."
+        "Reads are cached (~60s) to avoid Google API rate limits. "
+        "Use the sidebar **Refresh** if you just added data."
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
