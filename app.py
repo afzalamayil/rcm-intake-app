@@ -1,798 +1,410 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# File: app.py — Streamlit (Option B) — RITE TECH BRANDED (full + duplicate check)
+# app.py — RCM Intake (Streamlit) — with form reset, duplicate warning,
+# cached reads, exponential backoff, optional WhatsApp send, and logging.
 # ─────────────────────────────────────────────────────────────────────────────
-import io
+# Requirements (Streamlit Cloud or local):
+#   pip install streamlit gspread google-auth streamlit-authenticator pandas requests python-dateutil
+# Secrets (in .streamlit/secrets.toml):
+# [gsheets]
+# sheet_url = "https://docs.google.com/spreadsheets/d/XXXX/edit"
+# client_email = "service-account@project.iam.gserviceaccount.com"
+# token_uri = "https://oauth2.googleapis.com/token"
+# private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+# private_key_id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+#
+# [auth]
+# cookie_name = "rcm_intake_app"
+# cookie_key = "CHANGE_ME_TO_A_RANDOM_LONG_VALUE"
+# cookie_expiry_days = 30
+# # Examples:
+# demo_users = "{\"admin@example.com\":{\"name\":\"Admin\",\"password\":\"admin123\"}}"
+#
+# [whatsapp]  # Optional—remove if you don't use WA
+# phone_number_id = "YOUR_PHONE_NUMBER_ID"
+# access_token     = "YOUR_PERMANENT_ACCESS_TOKEN"
+# template_name    = "intake_confirmation"
+# lang_code        = "en_US"
+
 import os
 import json
+import time
 from datetime import datetime, date
+from dateutil import tz
 
 import pandas as pd
 import streamlit as st
+import requests
+
+# Google Sheets
 import gspread
 from google.oauth2.service_account import Credentials
 
 # Auth
 import streamlit_authenticator as stauth
 
-# Email
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email.mime.text import MIMEText
-from email import encoders
+# ─────────────────────────────────────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="RCM Intake", page_icon="🧾", layout="wide")
+TZ = tz.gettz("Asia/Dubai")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Branding
-# ─────────────────────────────────────────────────────────────────────────────
-LOGO_PATH = "assets/logo.png"
-st.set_page_config(
-    page_title="RCM Intake (Option B)",
-    page_icon=LOGO_PATH if os.path.exists(LOGO_PATH) else "📋",
-    layout="wide"
-)
+DATA_SHEET_NAME = "Data"
+LOG_SHEET_NAME = "Logs"
+REFERENCE_SHEET = "Reference"  # optional; dropdowns can be fed from here
 
-try:
-    col_logo, col_title = st.columns([1, 8], vertical_alignment="center")
-except TypeError:
-    col_logo, col_title = st.columns([1, 8])
-if os.path.exists(LOGO_PATH):
-    col_logo.image(LOGO_PATH, use_container_width=True)
-col_title.markdown("### RCM Intake — Streamlit (Option B)")
-st.caption("Free stack: Streamlit Cloud + Google Sheets. Email via SMTP. WhatsApp via share links.")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Secrets
-# ─────────────────────────────────────────────────────────────────────────────
-AUTH = st.secrets.get("auth", {})
-SMTP = st.secrets.get("smtp", {})
-GS    = st.secrets.get("gsheets", {})
-ROLE_MAP_JSON = st.secrets.get("roles", {}).get("mapping", "{}")
-UI_BRAND = st.secrets.get("ui", {}).get("brand", "")
-
-with st.sidebar:
-    if os.path.exists(LOGO_PATH):
-        st.image(LOGO_PATH, use_container_width=True)
-    if UI_BRAND:
-        st.success(f"👋 {UI_BRAND}")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Google Sheets connect (with caching)
-# ─────────────────────────────────────────────────────────────────────────────
-REQUIRED_GS_KEYS = [
-    "type","project_id","private_key_id","private_key","client_email","client_id",
-    "auth_uri","token_uri","auth_provider_x509_cert_url","client_x509_cert_url"
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
 ]
-missing = [k for k in REQUIRED_GS_KEYS if k not in GS]
-if missing:
-    st.error("Google Sheets credentials missing in secrets: " + ", ".join(missing))
-    st.stop()
 
-SPREADSHEET_ID = GS.get("spreadsheet_id", "").strip()
-SPREADSHEET_NAME = GS.get("spreadsheet_name", "RCM_Intake_DB").strip()
-if not SPREADSHEET_ID and not SPREADSHEET_NAME:
-    st.error("Provide either [gsheets].spreadsheet_id or spreadsheet_name in secrets.")
-    st.stop()
-
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
-          "https://www.googleapis.com/auth/drive"]
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers: Google Sheets
+# ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def get_gspread_client():
-    # IMPORTANT: convert literal "\n" to real line breaks
-    gs_info = dict(GS)
-    if isinstance(gs_info.get("private_key", ""), str):
-        gs_info["private_key"] = gs_info["private_key"].replace("\\n", "\n")
-    creds = Credentials.from_service_account_info(gs_info, scopes=SCOPES)
+    """Authorize once per session."""
+    gs = st.secrets["gsheets"]
+    info = {
+        "type": "service_account",
+        "client_email": gs["client_email"],
+        "token_uri": gs["token_uri"],
+        "private_key": gs["private_key"],
+        "private_key_id": gs.get("private_key_id", ""),
+        "project_id": gs.get("project_id", "rcm-intake"),
+        "client_id": gs.get("client_id", ""),
+    }
+    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.authorize(creds)
 
-@st.cache_resource(show_spinner=False)
-def get_spreadsheet(_gc):
+def retry(fn, attempts=5):
+    """Exponential backoff for rate limits or transient errors."""
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            msg = str(e).lower()
+            if "429" in msg or "rate" in msg or "quota" in msg or "deadline" in msg:
+                time.sleep(min(2**i, 10))
+                continue
+            raise
+    raise RuntimeError("Exceeded retries due to rate limiting.")
+
+def open_sheet(gc):
+    url = st.secrets["gsheets"]["sheet_url"]
+    return retry(lambda: gc.open_by_url(url))
+
+def get_ws(gc, ws_title):
+    sh = open_sheet(gc)
     try:
-        if SPREADSHEET_ID:
-            return _gc.open_by_key(SPREADSHEET_ID)
-        return _gc.open(SPREADSHEET_NAME)
-    except gspread.SpreadsheetNotFound:
-        if not SPREADSHEET_ID:
-            # Create if only name provided (requires Drive scope)
-            sh = _gc.create(SPREADSHEET_NAME)
-            return sh
-        st.error("Spreadsheet ID not found or no access. Share it with the service account in [gsheets].client_email.")
-        st.stop()
+        return retry(lambda: sh.worksheet(ws_title))
+    except gspread.exceptions.WorksheetNotFound:
+        # Create if missing
+        ws = retry(lambda: sh.add_worksheet(title=ws_title, rows=1000, cols=50))
+        return ws
 
-gc = get_gspread_client()
-sh = get_spreadsheet(gc)
+@st.cache_data(ttl=60, show_spinner=False)
+def read_df_cached(sheet_url: str, ws_title: str) -> pd.DataFrame:
+    """Cached read of a worksheet → DataFrame of records."""
+    gc = get_gspread_client()
+    sh = retry(lambda: gc.open_by_url(sheet_url))
+    ws = retry(lambda: sh.worksheet(ws_title))
+    records = retry(lambda: ws.get_all_records())
+    df = pd.DataFrame(records)
+    return df
 
-# --- Smoke test (optional) ---
-try:
-    _titles = [ws.title for ws in sh.worksheets()]
-    st.info(f"Connected to '{SPREADSHEET_NAME}'. Tabs: {_titles}")
-except Exception as e:
-    st.error(f"Sheets connection failed: {e}")
-    st.stop()
+def append_row(ws, values):
+    return retry(lambda: ws.append_row(values, value_input_option="USER_ENTERED"))
 
-# Tab names
-DATA_TAB = "Data"
-USERS_TAB = "Users"
-MS_PHARM = "Pharmacies"
-MS_INSURANCE = "Insurance"
-MS_SUBMISSION_MODE = "SubmissionMode"
-MS_PORTAL = "Portal"
-MS_STATUS = "Status"
-MS_REMARKS = "Remarks"
-CLIENTS_TAB = "Clients"
-CLIENT_CONTACTS_TAB = "ClientContacts"
-
-DEFAULT_TABS = [
-    DATA_TAB, USERS_TAB, MS_PHARM, MS_INSURANCE,
-    MS_SUBMISSION_MODE, MS_PORTAL, MS_STATUS, MS_REMARKS,
-    CLIENTS_TAB, CLIENT_CONTACTS_TAB
-]
-
-REQUIRED_HEADERS = {
-    DATA_TAB: [
-        "Timestamp","SubmittedBy","Role","ClientID",
-        "EmployeeName","SubmissionDate","PharmacyName","SubmissionMode",
-        "Portal","ERXNumber","InsuranceCode","InsuranceName",
-        "MemberID","EID","ClaimID","ApprovalCode",
-        "NetAmount","PatientShare","Remark","Status"
-    ],
-    USERS_TAB: ["username","name","password","role","clients"],
-    MS_SUBMISSION_MODE: ["Value"],
-    MS_PORTAL: ["Value"],
-    MS_STATUS: ["Value"],
-    CLIENTS_TAB: ["ClientID","Name"],
-    CLIENT_CONTACTS_TAB: ["ClientID","To","CC"],
-}
-
-SEED_SIMPLE = {
-    MS_SUBMISSION_MODE: ["Walk-in","Phone","Email","Portal"],
-    MS_PORTAL: ["DHPO","Riayati","Insurance Portal"],
-    MS_STATUS: ["Submitted","Approved","Rejected","Pending","RA Pending"],
-}
-
-def ensure_tabs_and_headers():
-    existing = {w.title for w in sh.worksheets()}
-    # create missing tabs
-    for t in DEFAULT_TABS:
-        if t not in existing:
-            sh.add_worksheet(t, rows=200, cols=26)
-    # ensure headers
-    for tab, headers in REQUIRED_HEADERS.items():
-        wsx = sh.worksheet(tab)
-        vals = wsx.get_all_values()
-        if not vals:
-            wsx.update("A1", [headers])
-        else:
-            current = [c.strip() for c in vals[0]]
-            if [c.lower() for c in current] != [h.lower() for h in headers]:
-                wsx.update("A1", [headers])
-    # seed simple masters if empty (below header)
-    for tab, values in SEED_SIMPLE.items():
-        wsx = sh.worksheet(tab)
-        vals = wsx.get_all_values()
-        if len(vals) <= 1:  # only header or empty
-            wsx.update("A1", [["Value"], *[[v] for v in values]])
-
-ensure_tabs_and_headers()
-
-def ws(name: str):
-    return sh.worksheet(name)
+def write_header_if_empty(ws, header_list):
+    vals = retry(lambda: ws.get_all_values())
+    if not vals:
+        retry(lambda: ws.append_row(header_list, value_input_option="USER_ENTERED"))
+    elif len(vals) == 1 and not any(vals[0]):
+        retry(lambda: ws.append_row(header_list, value_input_option="USER_ENTERED"))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers (cached reads)
+# Helpers: WhatsApp (optional)
 # ─────────────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=30, show_spinner=False)
-def sheet_to_list(title, prefer_cols=("Value","Name","Mode","Portal")):
-    rows = ws(title).get_all_values()
-    if not rows:
-        return []
-    header = rows[0]
-    for col in prefer_cols:
-        if col in header:
-            i = header.index(col)
-            return [r[i] for r in rows[1:] if len(r) > i and r[i]]
-    return [r[0] for r in rows[1:] if r and r[0]]
+def whatsapp_enabled():
+    return "whatsapp" in st.secrets and st.secrets["whatsapp"].get("phone_number_id")
 
-@st.cache_data(ttl=30, show_spinner=False)
-def pharmacies_list():
-    df = pd.DataFrame(ws(MS_PHARM).get_all_records())
-    if df.empty:
-        return sheet_to_list(MS_PHARM)
-    df = df.fillna("")
-    if {"ID","Name"}.issubset(df.columns):
-        return (df["ID"].astype(str).str.strip() + " - " + df["Name"].astype(str).str.strip()).tolist()
-    if "Name" in df.columns:
-        return df["Name"].dropna().astype(str).tolist()
-    return sheet_to_list(MS_PHARM)
-
-@st.cache_data(ttl=30, show_spinner=False)
-def insurance_list():
-    df = pd.DataFrame(ws(MS_INSURANCE).get_all_records())
-    if df.empty:
-        return [], pd.DataFrame()
-    df = df.fillna("")
-    if {"Code","Name"}.issubset(df.columns):
-        df["Display"] = df["Code"].astype(str).str.strip() + " - " + df["Name"].astype(str).str.strip()
-        return df["Display"].tolist(), df
-    # fallback
-    df["Display"] = df.apply(
-        lambda r: " - ".join([str(r.get("Code","")).strip(), str(r.get("Name","")).strip()]).strip(" -"),
-        axis=1
-    )
-    return df["Display"].tolist(), df
-
-@st.cache_data(ttl=30, show_spinner=False)
-def clients_list():
-    df = pd.DataFrame(ws(CLIENTS_TAB).get_all_records())
-    if df.empty or "ClientID" not in df.columns:
-        return []
-    return df["ClientID"].dropna().astype(str).tolist()
-
-@st.cache_data(ttl=30, show_spinner=False)
-def client_contacts_map():
-    df = pd.DataFrame(ws(CLIENT_CONTACTS_TAB).get_all_records())
-    mapping = {}
-    if not df.empty:
-        for _, row in df.fillna("").iterrows():
-            cid = str(row.get("ClientID","")).strip()
-            to = [e.strip() for e in str(row.get("To","")).split(",") if e.strip()]
-            cc = [e.strip() for e in str(row.get("CC","")).split(",") if e.strip()]
-            if cid:
-                mapping[cid] = {"to": to, "cc": cc}
-    return mapping
-
-# --- Duplicate check helper ---
-def is_potential_duplicate(erx_number: str, member_id: str, net_amount: float, subm_date: date):
-    """
-    Returns (True, df_matches) if any row on the same SubmissionDate has
-    the same ERXNumber + MemberID + NetAmount (two-decimal string).
-    """
-    try:
-        df = pd.DataFrame(ws(DATA_TAB).get_all_records())
-        if df.empty:
-            return False, pd.DataFrame()
-
-        # normalize types
-        df["SubmissionDate"] = pd.to_datetime(df["SubmissionDate"], errors="coerce").dt.date
-        net_str = f"{float(net_amount):.2f}"
-
-        same_day = df[df["SubmissionDate"] == subm_date]
-        if same_day.empty:
-            return False, pd.DataFrame()
-
-        mask = (
-            same_day["ERXNumber"].astype(str).str.strip().eq(erx_number.strip()) &
-            same_day["MemberID"].astype(str).str.strip().eq(member_id.strip()) &
-            same_day["NetAmount"].astype(str).str.strip().eq(net_str)
-        )
-        dup = same_day[mask]
-        return (not dup.empty), dup
-    except Exception:
-        # On any read/parse issue, don't block; just say "no duplicate"
-        return False, pd.DataFrame()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Authentication
-# ─────────────────────────────────────────────────────────────────────────────
-def load_users_rolemap_from_sheet():
-    try:
-        df = pd.DataFrame(ws(USERS_TAB).get_all_records())
-        if not df.empty:
-            # normalize headers to lowercase
-            df.columns = df.columns.str.strip().str.lower()
-        return None if df.empty else df
-    except Exception:
-        return None
-
-USERS_DF = load_users_rolemap_from_sheet()
-ROLE_MAP = json.loads(ROLE_MAP_JSON or "{}")
-if USERS_DF is None and not ROLE_MAP:
-    ROLE_MAP = {"admin@example.com": {"role": "Super Admin", "clients": ["ALL"]}}
-
-def build_authenticator():
-    """
-    NOTE: streamlit_authenticator expects bcrypt hashes (start with $2b$).
-    Use the 'Password Hash Helper' in Masters Admin to generate these and paste into the Users sheet.
-    """
-    if USERS_DF is not None and not USERS_DF.empty:
-        names = USERS_DF['name'].tolist()
-        usernames = USERS_DF['username'].tolist()
-        passwords = USERS_DF['password'].tolist()  # bcrypt hashes expected
-        creds = {"usernames": {u: {"name": n, "password": p} for n, u, p in zip(names, usernames, passwords)}}
-    else:
-        demo_users = json.loads(AUTH.get("demo_users", "{}")) or {
-            "admin@example.com": {"name": "Admin", "password": "admin123"}
-        }
-        creds = {"usernames": {}}
-        for u, info in demo_users.items():
-            creds["usernames"][u] = {"name": info["name"], "password": stauth.Hasher([info["password"]]).generate()[0]}
-    return stauth.Authenticate(
-        creds,
-        AUTH.get("cookie_name", "rcm_intake_app"),
-        AUTH.get("cookie_key", "super-secret-key-change-me"),
-        int(AUTH.get("cookie_expiry_days", 30)),
-    )
-
-authenticator = build_authenticator()
-name, authentication_status, username = authenticator.login(
-    location="sidebar", fields={"Form name":"Login","Username":"Username","Password":"Password","Login":"Login"}
-)
-if not authentication_status:
-    if authentication_status is False:
-        st.error("Invalid credentials")
-    st.stop()
-
-def get_user_role_and_clients(u):
-    if USERS_DF is not None and not USERS_DF.empty:
-        row = USERS_DF[USERS_DF['username'] == u]
-        if not row.empty:
-            role = row.iloc[0].get('role', 'User')
-            clients = [c.strip() for c in str(row.iloc[0].get('clients', 'ALL')).split(',') if c.strip()]
-            return role, clients or ["ALL"]
-    if u in ROLE_MAP:
-        m = ROLE_MAP[u]
-        return m.get("role", "User"), m.get("clients", ["ALL"])
-    return "User", ["ALL"]
-
-ROLE, ALLOWED_CLIENTS = get_user_role_and_clients(username)
-
-with st.sidebar:
-    st.write(f"**User:** {name}")
-    st.write(f"**Role:** {ROLE}")
-    st.write(f"**Clients:** {', '.join(ALLOWED_CLIENTS)}")
-    if st.button("Logout"):
-        authenticator.logout("Logout", "sidebar")
-        st.rerun()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Navigation
-# ─────────────────────────────────────────────────────────────────────────────
-PAGES = ["Intake Form", "View / Export", "Email / WhatsApp", "Masters Admin", "Bulk Import Insurance"]
-page = st.sidebar.radio("Navigation", PAGES if ROLE in ("Super Admin", "Admin") else PAGES[:-2])
-
-ALL_CLIENT_IDS = clients_list() or ["DEFAULT"]
-ALLOWED_CHOICES = ALL_CLIENT_IDS if "ALL" in ALLOWED_CLIENTS else [c for c in ALL_CLIENT_IDS if c in ALLOWED_CLIENTS]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Intake Form (with true form + reset on submit)
-# ─────────────────────────────────────────────────────────────────────────────
-def reset_form():
-    defaults = {
-        "employee_name": "",
-        "submission_date": date.today(),
-        "submission_mode": "",
-        "pharmacy_name": "",
-        "portal": "",
-        "erx_number": "",
-        "insurance_display": "",
-        "member_id": "",
-        "eid": "",
-        "claim_id": "",
-        "approval_code": "",
-        "net_amount": 0.0,
-        "patient_share": 0.0,
-        "status": "",
-        "remark": "",
-        "sel_client": (ALLOWED_CHOICES[0] if ALLOWED_CHOICES else "")
+def send_whatsapp_message(phone_e164: str, params: list[str]):
+    wa = st.secrets["whatsapp"]
+    url = f"https://graph.facebook.com/v20.0/{wa['phone_number_id']}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone_e164,  # e.g., "9715XXXXXXXX"
+        "type": "template",
+        "template": {
+            "name": wa["template_name"],
+            "language": {"code": wa.get("lang_code", "en_US")},
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [{"type": "text", "text": str(p)} for p in params],
+                }
+            ],
+        },
     }
-    for k, v in defaults.items():
-        st.session_state.setdefault(k, v)
-
-if page == "Intake Form":
-    st.subheader("New Submission")
-
-    # If the previous run asked to clear the form, do it BEFORE rendering widgets
-    if st.session_state.get("_clear_form", False):
-        for k in list(st.session_state.keys()):
-            if k in {
-                "employee_name","submission_date","submission_mode","pharmacy_name","portal",
-                "erx_number","insurance_display","member_id","eid","claim_id","approval_code",
-                "net_amount","patient_share","status","remark","sel_client"
-            }:
-                del st.session_state[k]
-        reset_form()
-        st.session_state["_clear_form"] = False
-
-    # First-time defaults
-    reset_form()
-
-    with st.form("intake_form", clear_on_submit=False):
-        st.selectbox("Client ID*", ALLOWED_CHOICES, key="sel_client")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.text_input("Employee Name*", key="employee_name")
-            st.date_input("Submission Date*", value=st.session_state["submission_date"], key="submission_date")
-            st.selectbox("Submission Mode*", sheet_to_list(MS_SUBMISSION_MODE), key="submission_mode")
-        with c2:
-            st.selectbox("Pharmacy Name*", pharmacies_list(), key="pharmacy_name")
-            st.selectbox("Portal* (DHPO / Riayati / Insurance Portal)", sheet_to_list(MS_PORTAL), key="portal")
-            st.text_input("ERX Number*", key="erx_number")
-        with c3:
-            ins_display_list, _ = insurance_list()
-            st.selectbox("Insurance (Code + Name)*", ins_display_list, key="insurance_display")
-            st.text_input("Member ID*", key="member_id")
-            st.text_input("EID*", key="eid")
-
-        st.text_input("Claim ID*", key="claim_id")
-        st.text_input("Approval Code*", key="approval_code")
-
-        d1, d2, d3 = st.columns(3)
-        with d1:
-            st.number_input("Net Amount*", min_value=0.0, step=0.01, format="%.2f", key="net_amount")
-        with d2:
-            st.number_input("Patient Share*", min_value=0.0, step=0.01, format="%.2f", key="patient_share")
-        with d3:
-            st.selectbox("Status*", sheet_to_list(MS_STATUS), key="status")
-
-        st.text_area("Remark (optional)", key="remark")  # optional now
-
-        submitted = st.form_submit_button("Submit", type="primary")
-
-    if submitted:
-        # Validate (Remark is OPTIONAL now)
-        required = {
-            "Employee Name": st.session_state.employee_name,
-            "Submission Date": st.session_state.submission_date,
-            "Pharmacy Name": st.session_state.pharmacy_name,
-            "Submission Mode": st.session_state.submission_mode,
-            "Portal": st.session_state.portal,
-            "ERX Number": st.session_state.erx_number,
-            "Insurance": st.session_state.insurance_display,
-            "Member ID": st.session_state.member_id,
-            "EID": st.session_state.eid,
-            "Claim ID": st.session_state.claim_id,
-            "Approval Code": st.session_state.approval_code,
-            "Net Amount": st.session_state.net_amount,
-            "Patient Share": st.session_state.patient_share,
-            "Status": st.session_state.status,
-        }
-        missing = [k for k, v in required.items()
-                   if (isinstance(v, str) and not v.strip()) or v is None]
-        if missing:
-            st.error("Missing required fields: " + ", ".join(missing))
-        else:
-            ins_code, ins_name = "", ""
-            if " - " in st.session_state.insurance_display:
-                parts = st.session_state.insurance_display.split(" - ", 1)
-                ins_code, ins_name = parts[0].strip(), parts[1].strip()
-            else:
-                ins_name = st.session_state.insurance_display
-
-            # Duplicate-prevention (optional warning)
-            is_dup, dup_df = is_potential_duplicate(
-                st.session_state.erx_number,
-                st.session_state.member_id,
-                st.session_state.net_amount,
-                st.session_state.submission_date
-            )
-            if is_dup:
-                st.warning(
-                    f"Possible duplicate found for today with the same ERXNumber + MemberID + NetAmount. "
-                    f"(ERX: {st.session_state.erx_number}, Member: {st.session_state.member_id}, "
-                    f"Net: {float(st.session_state.net_amount):.2f})"
-                )
-
-            record = [
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                username,
-                ROLE,
-                st.session_state.sel_client,
-                st.session_state.employee_name.strip(),
-                st.session_state.submission_date.strftime("%Y-%m-%d"),
-                st.session_state.pharmacy_name,
-                st.session_state.submission_mode,
-                st.session_state.portal,
-                st.session_state.erx_number.strip(),
-                ins_code,
-                ins_name,
-                st.session_state.member_id.strip(),
-                st.session_state.eid.strip(),
-                st.session_state.claim_id.strip(),
-                st.session_state.approval_code.strip(),
-                f"{float(st.session_state.net_amount):.2f}",
-                f"{float(st.session_state.patient_share):.2f}",
-                st.session_state.remark.strip(),  # optional
-                st.session_state.status
-            ]
-
-            try:
-                ws(DATA_TAB).append_row(record, value_input_option="USER_ENTERED")
-                st.toast("Saved ✔️")
-                # Clear caches so views see the new row
-                sheet_to_list.clear(); pharmacies_list.clear(); insurance_list.clear()
-                clients_list.clear(); client_contacts_map.clear()
-                # schedule a clear on next run
-                st.session_state["_clear_form"] = True
-                st.rerun()
-            except gspread.exceptions.APIError as e:
-                st.error(f"Google Sheets error while saving: {e}")
-            except Exception as e:
-                st.error(f"Unexpected error while saving: {e}")
+    headers = {
+        "Authorization": f"Bearer {wa['access_token']}",
+        "Content-Type": "application/json",
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=20)
+    r.raise_for_status()
+    return r.json()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# View / Export
+# Helpers: Auth
 # ─────────────────────────────────────────────────────────────────────────────
-if page == "View / Export":
-    st.subheader("Search, Filter & Export")
-    if st.button("🔄 Refresh data"):
-        sheet_to_list.clear(); pharmacies_list.clear(); insurance_list.clear()
-        clients_list.clear(); client_contacts_map.clear()
+def init_auth():
+    auth_conf = st.secrets.get("auth", {})
+    cookie_name = auth_conf.get("cookie_name", "rcm_intake_app")
+    cookie_key = auth_conf.get("cookie_key", "CHANGE_ME")
+    cookie_expiry_days = auth_conf.get("cookie_expiry_days", 30)
+    # Demo users JSON: {"email":{"name":"Full Name","password":"plain_or_hashed"}}
+    raw_demo = auth_conf.get("demo_users", "{}")
+    try:
+        demo_users = json.loads(raw_demo)
+    except Exception:
+        demo_users = {}
+
+    # Build credentials dict for streamlit_authenticator
+    names, usernames, passwords = [], [], []
+    for email, info in demo_users.items():
+        names.append(info.get("name", email.split("@")[0].title()))
+        usernames.append(email)
+        # NOTE: streamlit_authenticator expects hashed. For demo plain is OK with
+        # hasher if prefixed with "plain:".
+        pwd = info.get("password", "pass123")
+        if not pwd.startswith("pbkdf2:"):
+            # Hash on the fly so we don't store plain secrets in session
+            pwd = stauth.Hasher([pwd]).generate()[0]
+        passwords.append(pwd)
+
+    credentials = {"usernames": {}}
+    for i, u in enumerate(usernames):
+        credentials["usernames"][u] = {"name": names[i], "password": passwords[i]}
+
+    authenticator = stauth.Authenticate(
+        credentials,
+        cookie_name=cookie_name,
+        key=cookie_key,
+        cookie_expiry_days=cookie_expiry_days,
+    )
+    return authenticator
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers: Duplicate check & logging
+# ─────────────────────────────────────────────────────────────────────────────
+def is_duplicate(df: pd.DataFrame, erx: str, member_id: str, net_amount, svc_date: date) -> bool:
+    if df.empty:
+        return False
+    try:
+        # Normalize columns
+        d = df.copy()
+        if "ServiceDate" in d.columns:
+            d["ServiceDate"] = pd.to_datetime(d["ServiceDate"], errors="coerce").dt.date
+        return bool(
+            (
+                (d.get("ERXNumber", "") == erx)
+                & (d.get("MemberID", "") == member_id)
+                & (d.get("Net", "").astype(str) == str(net_amount))
+                & (d.get("ServiceDate", pd.NaT) == svc_date)
+            ).any()
+        )
+    except Exception:
+        return False
+
+def log_action(ws_log, user, action, details: dict):
+    write_header_if_empty(ws_log, ["TS", "User", "Action", "DetailsJSON"])
+    ts = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    row = [ts, user, action, json.dumps(details, ensure_ascii=False)]
+    append_row(ws_log, row)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    # ─── Auth ────────────────────────────────────────────────────────────────
+    authenticator = init_auth()
+    name, auth_status, username = authenticator.login("Login", "sidebar")
+    if not auth_status:
+        st.stop()
+
+    st.sidebar.success(f"Signed in as {name}")
+    if st.sidebar.button("Sign out"):
+        authenticator.logout("Sign out", "sidebar")
         st.rerun()
 
-    @st.cache_data(ttl=20, show_spinner=False)
-    def load_data_df():
-        return pd.DataFrame(ws(DATA_TAB).get_all_records())
+    # ─── GSheets client & worksheets ────────────────────────────────────────
+    gc = get_gspread_client()
+    sh = open_sheet(gc)
+    ws_data = get_ws(gc, DATA_SHEET_NAME)
+    ws_logs = get_ws(gc, LOG_SHEET_NAME)
 
-    df = load_data_df()
-    if df.empty:
-        st.info("No records yet.")
-        st.stop()
+    # ─── Sidebar: Refresh & Export ──────────────────────────────────────────
+    st.sidebar.markdown("### Data Controls")
+    if st.sidebar.button("🔄 Refresh from Google Sheet"):
+        read_df_cached.clear()
+        st.experimental_rerun()
 
-    if "ALL" not in ALLOWED_CLIENTS:
-        df = df[df['ClientID'].isin(ALLOWED_CLIENTS)]
-
-    f1, f2, f3 = st.columns(3)
-    with f1:
-        sel_client = st.multiselect("Client ID", sorted(df['ClientID'].unique().tolist()))
-        sel_status = st.multiselect("Status", sorted(df['Status'].unique().tolist()))
-    with f2:
-        sel_portal = st.multiselect("Portal", sorted(df['Portal'].unique().tolist()))
-        search_ins = st.text_input("Contains Insurance Name/Code")
-    with f3:
-        d_from = st.date_input("From Date", value=None)
-        d_to   = st.date_input("To Date", value=None)
-
-    if sel_client: df = df[df['ClientID'].isin(sel_client)]
-    if sel_status: df = df[df['Status'].isin(sel_status)]
-    if sel_portal: df = df[df['Portal'].isin(sel_portal)]
-    if search_ins:
-        mask = df['InsuranceName'].astype(str).str.contains(search_ins, case=False) | \
-               df['InsuranceCode'].astype(str).str.contains(search_ins, case=False)
-        df = df[mask]
-    if d_from:
-        df = df[pd.to_datetime(df['SubmissionDate']) >= pd.to_datetime(d_from)]
-    if d_to:
-        df = df[pd.to_datetime(df['SubmissionDate']) <= pd.to_datetime(d_to)]
-
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-    def to_excel_bytes(dataframe: pd.DataFrame) -> bytes:
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as w:
-            dataframe.to_excel(w, index=False, sheet_name="Data")
-        return buf.getvalue()
-
-    xbytes = to_excel_bytes(df)
-    st.download_button(
-        "⬇️ Download Excel",
-        data=xbytes,
-        file_name=f"RCM_Intake_Export_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Email / WhatsApp
-# ─────────────────────────────────────────────────────────────────────────────
-if page == "Email / WhatsApp":
-    st.subheader("Send Report")
-
-    df = pd.DataFrame(ws(DATA_TAB).get_all_records())
-    if df.empty:
-        st.info("No records to send.")
-        st.stop()
-
-    universe = set(df['ClientID'].unique())
-    allowed = universe if "ALL" in ALLOWED_CLIENTS else universe.intersection(ALLOWED_CLIENTS)
-    sel_clients = st.multiselect("Client IDs", sorted(allowed), default=sorted(allowed))
-    df = df[df['ClientID'].isin(sel_clients)]
-
-    c1, c2 = st.columns(2)
-    with c1:
-        r_from = st.date_input("From Date", value=None)
-    with c2:
-        r_to = st.date_input("To Date", value=None)
-    if r_from: df = df[pd.to_datetime(df['SubmissionDate']) >= pd.to_datetime(r_from)]
-    if r_to:   df = df[pd.to_datetime(df['SubmissionDate']) <= pd.to_datetime(r_to)]
-
-    if df.empty:
-        st.warning("No data for selected filters.")
-    else:
-        st.success(f"Filtered rows: {len(df)}")
-
-    xbytes = io.BytesIO()
-    with pd.ExcelWriter(xbytes, engine="openpyxl") as w:
-        df.to_excel(w, index=False, sheet_name="Data")
-    xbytes.seek(0)
-
-    st.divider()
-    st.markdown("**Email options** (uses SMTP from secrets)")
-    to_key, cc_key = "to_emails", "cc_emails"
-    st.session_state.setdefault(to_key, ""); st.session_state.setdefault(cc_key, "")
-
-    contacts = client_contacts_map()
-    if len(sel_clients) == 1 and sel_clients[0] in contacts:
-        if st.button("Load recipients from ClientContacts"):
-            st.session_state[to_key] = ", ".join(contacts[sel_clients[0]]["to"])
-            st.session_state[cc_key] = ", ".join(contacts[sel_clients[0]]["cc"])
-
-    to_emails = st.text_input("To (comma-separated)", key=to_key)
-    cc_emails = st.text_input("CC (comma-separated)", key=cc_key)
-    subject = st.text_input("Subject", value="RCM Intake Report")
-    body = st.text_area("Body", value="Please find the attached report.")
-
-    def send_email_with_attachment(to_list, cc_list, subject, body, attachment_bytes, filename):
-        host = SMTP.get("host"); port = int(SMTP.get("port", 587))
-        user = SMTP.get("user"); pwd = SMTP.get("password")
-        sender = SMTP.get("from_email", user)
-        if not all([host, user, pwd, sender]):
-            st.error("SMTP not configured in secrets.")
-            return False
-
-        msg = MIMEMultipart()
-        msg["From"] = sender
-        msg["To"] = ", ".join(to_list)
-        if cc_list: msg["Cc"] = ", ".join(cc_list)
-        msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain"))
-
-        part = MIMEBase("application", "octet-stream")
-        part.set_payload(attachment_bytes)
-        encoders.encode_base64(part)
-        part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
-        msg.attach(part)
-
+    # Download/export
+    with st.sidebar.expander("⬇️ Export"):
         try:
-            server = smtplib.SMTP(host, port); server.starttls()
-            server.login(user, pwd)
-            server.sendmail(sender, to_list + cc_list, msg.as_string())
-            server.quit()
-            return True
+            df_all = read_df_cached(st.secrets["gsheets"]["sheet_url"], DATA_SHEET_NAME)
+            csv = df_all.to_csv(index=False).encode("utf-8")
+            st.download_button("Export Data CSV", csv, "intake_data.csv", "text/csv")
         except Exception as e:
-            st.error(f"Email error: {e}")
-            return False
+            st.sidebar.warning(f"Cannot export now: {e}")
 
-    if st.button("Send Email", type="primary"):
-        if not to_emails.strip():
-            st.error("Enter at least one recipient")
-        else:
-            fname = f"RCM_Intake_Report_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
-            ok = send_email_with_attachment(
-                [e.strip() for e in to_emails.split(",") if e.strip()],
-                [e.strip() for e in cc_emails.split(",") if e.strip()],
-                subject, body, xbytes.getvalue(), fname
+    # ─── Title ──────────────────────────────────────────────────────────────
+    st.title("🧾 RCM Intake")
+    st.caption("Fast data entry to Google Sheets with duplicate warning and WhatsApp confirmation.")
+
+    # ─── Reference lists (optional) ─────────────────────────────────────────
+    def get_reference_options():
+        # If you maintain a 'Reference' sheet with named columns, load them here.
+        # Fallback to static lists if sheet missing.
+        try:
+            df_ref = read_df_cached(st.secrets["gsheets"]["sheet_url"], REFERENCE_SHEET)
+            payers = sorted([x for x in df_ref.get("Payer", []).dropna().unique().tolist() if x])
+            clinicians = sorted([x for x in df_ref.get("Clinician", []).dropna().unique().tolist() if x])
+            return payers or ["Daman", "NAS", "Neuron", "Nextcare"], clinicians or ["Dr A", "Dr B"]
+        except Exception:
+            return ["Daman", "NAS", "Neuron", "Nextcare"], ["Dr A", "Dr B"]
+
+    payers, clinicians = get_reference_options()
+
+    # ─── Form ───────────────────────────────────────────────────────────────
+    # Trick to reset form after successful submission
+    form_key = st.session_state.get("form_key", "intake_form")
+
+    with st.form(key=form_key, border=True):
+        cols1 = st.columns([1, 1, 1, 1])
+        with cols1[0]:
+            service_date = st.date_input("Service Date", value=date.today())
+        with cols1[1]:
+            patient_name = st.text_input("Patient Name")
+        with cols1[2]:
+            member_id = st.text_input("MemberID")
+        with cols1[3]:
+            erx_number = st.text_input("ERXNumber")
+
+        cols2 = st.columns([1, 1, 1, 1])
+        with cols2[0]:
+            payer = st.selectbox("Payer", options=payers, index=0)
+        with cols2[1]:
+            clinician = st.selectbox("Clinician", options=clinicians, index=0)
+        with cols2[2]:
+            net_amount = st.number_input("Net", min_value=0.0, step=0.01, format="%.2f")
+        with cols2[3]:
+            remarks = st.text_area("Remarks (optional)", height=48)
+
+        cols3 = st.columns([1, 1, 1, 1])
+        with cols3[0]:
+            patient_phone = st.text_input("Patient WhatsApp (E.164, e.g., 9715XXXXXXXX)", value="")
+        with cols3[1]:
+            send_whatsapp = st.checkbox("Send WhatsApp confirmation", value=False, disabled=not whatsapp_enabled())
+        with cols3[2]:
+            allow_override = st.checkbox("Allow duplicate override", value=False)
+        with cols3[3]:
+            pass  # spacer
+
+        submitted = st.form_submit_button("💾 Submit", use_container_width=True)
+
+    # ─── On Submit ──────────────────────────────────────────────────────────
+    if submitted:
+        try:
+            # Basic required fields (remarks optional)
+            if not (erx_number and member_id and net_amount is not None):
+                st.error("ERXNumber, MemberID, and Net are required.")
+                st.stop()
+
+            # Load current data (cached)
+            df_existing = read_df_cached(st.secrets["gsheets"]["sheet_url"], DATA_SHEET_NAME)
+
+            # Duplicate check for same day (ERX + MemberID + Net)
+            dup = is_duplicate(df_existing, erx_number, member_id, net_amount, service_date)
+            if dup and not allow_override:
+                st.warning(
+                    "Possible duplicate detected for **today** (ERX + MemberID + Net). "
+                    "Tick **Allow duplicate override** to proceed anyway."
+                )
+                st.stop()
+
+            # Prepare values in a consistent header order
+            header = [
+                "Timestamp", "ServiceDate", "PatientName", "MemberID", "ERXNumber",
+                "Payer", "Clinician", "Net", "Remarks", "EnteredBy"
+            ]
+            write_header_if_empty(ws_data, header)
+
+            now_ts = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+            values = [
+                now_ts,
+                service_date.strftime("%Y-%m-%d"),
+                patient_name,
+                member_id,
+                erx_number,
+                payer,
+                clinician,
+                float(net_amount) if net_amount is not None else "",
+                remarks,
+                username or name,
+            ]
+            append_row(ws_data, values)
+
+            # Optional: WhatsApp confirmation
+            if send_whatsapp and patient_phone:
+                try:
+                    send_whatsapp_message(patient_phone, [patient_name or "-", erx_number, f"{net_amount:.2f}"])
+                    st.info("WhatsApp confirmation sent.")
+                except Exception as e:
+                    st.warning(f"WhatsApp send failed: {e}")
+
+            # Log the action
+            log_action(
+                ws_logs,
+                user=username or name,
+                action="submit",
+                details={
+                    "ServiceDate": service_date.isoformat(),
+                    "MemberID": member_id,
+                    "ERXNumber": erx_number,
+                    "Net": net_amount,
+                    "Override": bool(allow_override and dup),
+                },
             )
-            if ok: st.success("Email sent ✔️")
 
-    st.divider()
-    st.markdown("**WhatsApp share** (free link with prefilled text)")
-    def wa_link(text):
-        from urllib.parse import quote_plus
-        return f"https://wa.me/?text={quote_plus(text)}"
-    wa_msg = st.text_area("Prefilled message",
-                          value=f"RCM Intake report — rows: {len(df)}. Please see attached in email.")
-    st.link_button("Open WhatsApp with message", wa_link(wa_msg))
+            # Invalidate caches & reset form
+            read_df_cached.clear()
+            st.success("✅ Saved! Ready for the next entry.")
+            st.session_state["form_key"] = str(datetime.now().timestamp())
+            st.rerun()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Masters Admin
-# ─────────────────────────────────────────────────────────────────────────────
-if page == "Masters Admin":
-    st.subheader("Masters Admin")
+        except Exception as e:
+            st.error(f"Failed to save: {e}")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["Submission Modes", "Portals", "Status", "Pharmacies", "Clients / Contacts", "Utilities"]
+    # ─── Data Preview (read-only, cached) ────────────────────────────────────
+    with st.expander("📋 Latest Entries (read-only)", expanded=False):
+        try:
+            df = read_df_cached(st.secrets["gsheets"]["sheet_url"], DATA_SHEET_NAME)
+            if not df.empty:
+                st.dataframe(df.tail(50), use_container_width=True, height=320)
+            else:
+                st.info("No entries yet.")
+        except Exception as e:
+            st.warning(f"Cannot load data: {e}")
+
+    # ─── Footer note ────────────────────────────────────────────────────────
+    st.caption(
+        "Reads are cached for ~60s to avoid Google API rate limits. "
+        "Use the sidebar **Refresh** if you recently added data."
     )
 
-    # Simple list editors
-    def simple_list_editor(title):
-        st.markdown(f"**{title}**")
-        vals = sheet_to_list(title)
-        st.write(f"Current values: {', '.join(vals) if vals else '(empty)'}")
-        new_val = st.text_input(f"Add new to {title}", key=f"add_{title}")
-        if st.button(f"Add to {title}", key=f"btn_{title}"):
-            if new_val.strip():
-                wsx = ws(title)
-                wsx.append_row([new_val.strip()])
-                sheet_to_list.clear()
-                st.success("Added")
-
-    with tab1:
-        simple_list_editor(MS_SUBMISSION_MODE)
-    with tab2:
-        simple_list_editor(MS_PORTAL)
-    with tab3:
-        simple_list_editor(MS_STATUS)
-
-    with tab4:
-        st.markdown("**Pharmacies**")
-        ph_df = pd.DataFrame(ws(MS_PHARM).get_all_records())
-        st.dataframe(ph_df, use_container_width=True, hide_index=True)
-        c1, c2 = st.columns(2)
-        with c1:
-            pid = st.text_input("ID", key="ph_id")
-            pname = st.text_input("Name", key="ph_name")
-        if st.button("Add Pharmacy", key="ph_add"):
-            if pid.strip() and pname.strip():
-                ws(MS_PHARM).append_row([pid.strip(), pname.strip()], value_input_option="USER_ENTERED")
-                pharmacies_list.clear()
-                st.success("Pharmacy added")
-
-    with tab5:
-        st.markdown("**Clients**")
-        cl_df = pd.DataFrame(ws(CLIENTS_TAB).get_all_records())
-        st.dataframe(cl_df, use_container_width=True, hide_index=True)
-        c1, c2 = st.columns(2)
-        with c1:
-            cid = st.text_input("ClientID", key="cl_id")
-        with c2:
-            cname = st.text_input("Client Name", key="cl_name")
-        if st.button("Add Client", key="cl_add"):
-            if cid.strip() and cname.strip():
-                ws(CLIENTS_TAB).append_row([cid.strip(), cname.strip()], value_input_option="USER_ENTERED")
-                clients_list.clear()
-                st.success("Client added")
-
-        st.divider()
-        st.markdown("**Client Contacts**")
-        cc_df = pd.DataFrame(ws(CLIENT_CONTACTS_TAB).get_all_records())
-        st.dataframe(cc_df, use_container_width=True, hide_index=True)
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            cc_cid = st.text_input("ClientID (for contacts)", key="cc_id")
-        with c2:
-            cc_to = st.text_input("To (comma-separated)", key="cc_to")
-        with c3:
-            cc_cc = st.text_input("CC (comma-separated)", key="cc_cc")
-        if st.button("Add / Update Contacts", key="cc_save"):
-            # upsert by ClientID
-            wsx = ws(CLIENT_CONTACTS_TAB)
-            all_vals = wsx.get_all_values()
-            header = all_vals[0] if all_vals else ["ClientID","To","CC"]
-            rows = all_vals[1:]
-            updated = False
-            for i, r in enumerate(rows, start=2):
-                if len(r) > 0 and r[0].strip() == cc_cid.strip():
-                    wsx.update(f"A{i}:C{i}", [[cc_cid.strip(), cc_to.strip(), cc_cc.strip()]])
-                    updated = True
-                    break
-            if not updated:
-                wsx.append_row([cc_cid.strip(), cc_to.strip(), cc_cc.strip()], value_input_option="USER_ENTERED")
-            client_contacts_map.clear()
-            st.success("Contacts saved")
-
-    with tab6:
-        st.markdown("**Utilities**")
-        st.caption("Password Hash Helper — generates bcrypt hash for streamlit_authenticator. Paste into Users sheet 'password' column.")
-        plain = st.text_input("Plain password", type="password", key="util_pwd")
-        if plain:
-            hashed = stauth.Hasher([plain]).generate()[0]
-            st.code(hashed, language="text")
-            st.info("Copy the above value into the Users sheet. (bcrypt, starts with $2b$...)")
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Bulk Import Insurance
+# Entrypoint
 # ─────────────────────────────────────────────────────────────────────────────
-if page == "Bulk Import Insurance":
-    st.subheader("Bulk Import Insurance (CSV/XLSX with columns: Code, Name)")
-    uploaded = st.file_uploader("Upload file", type=["csv","xlsx"])
-    if uploaded is not None:
-        try:
-            if uploaded.name.lower().endswith(".csv"):
-                idf = pd.read_csv(uploaded)
-            else:
-                idf = pd.read_excel(uploaded)
-            idf.columns = idf.columns.str.strip()
-            if not {"Code","Name"}.issubset(idf.columns):
-                st.error("File must contain columns: Code, Name")
-            else:
-                st.dataframe(idf, use_container_width=True, hide_index=True)
-                if st.button("Replace Insurance master with this file", type="primary"):
-                    wsx = ws(MS_INSURANCE)
-                    # clear existing (except header)
-                    wsx.clear()
-                    wsx.update("A1", [["Code","Name"]])
-                    if not idf.empty:
-                        wsx.update("A2", idf[["Code","Name"]].astype(str).values.tolist())
-                    insurance_list.clear()
-                    st.success("Insurance master updated")
-        except Exception as e:
-            st.error(f"Import error: {e}")
+if __name__ == "__main__":
+    main()
