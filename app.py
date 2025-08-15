@@ -7,7 +7,12 @@
 # ✅ Duplicate check uses batch_get(F/J/M/Q)
 # ✅ Masters from Google Sheets; Email export
 # ✅ WhatsApp (Management via Cloud API) + FREE manual share (Drive + wa.me)
-# ✅ Role-based navigation: only Admin/Super Admin see non-Intake pages
+# ✅ Role-based navigation:
+#     - user       → Intake Form + Summary
+#     - admin      → Intake Form + View/Export + Summary
+#     - superadmin → All pages + Summary
+# ✅ Hide top-right Streamlit toolbar (Share/Star/Edit/GitHub/⋮) for user & admin
+# ✅ Summary pivot (Portal/E-Claim/Riayati × Date × ClientID) with Grand Total
 # ─────────────────────────────────────────────────────────────────────────────
 
 import io
@@ -28,6 +33,7 @@ from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from email import encoders
 import streamlit_authenticator as stauth
+from urllib.parse import quote_plus
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Branding
@@ -439,32 +445,57 @@ def get_user_role_and_clients(u):
 
 ROLE, ALLOWED_CLIENTS = get_user_role_and_clients(username)
 
+# ── Hide Streamlit toolbar for non-superadmin ────────────────────────────────
+def _hide_toolbar_for_non_superadmin(role: str):
+    if role.lower() != "super admin" and role.lower() != "superadmin":
+        st.markdown(
+            """
+            <style>
+            /* Hide top-right header icons & deploy/overflow menus */
+            [data-testid="stToolbar"] { display: none !important; }
+            header [data-testid="baseButton-header"] { display: none !important; }
+            .stAppDeployButton, [data-testid="stActionMenu"] { display: none !important; }
+            </style>
+            """,
+            unsafe_allow_html=True
+        )
+_hide_toolbar_for_non_superadmin(ROLE)
+
 with st.sidebar:
     st.write(f"**User:** {name or username}")
     st.write(f"**Role:** {ROLE}")
     st.write(f"**Clients:** {', '.join(ALLOWED_CLIENTS)}")
-
-    # Render the authenticator's logout button (no extra st.button)
-    # Use a unique key to avoid collisions across versions.
     try:
-        # If your version accepts location ('sidebar') as 2nd arg:
         authenticator.logout("Logout", "sidebar")
     except TypeError:
-        # Older/newer API where 2nd arg is the key:
         authenticator.logout("Logout", "logout_sidebar_btn")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Navigation (restrict non-admins to Intake Form only)
+# Navigation (role rules updated)
+#   user       → Intake Form + Summary
+#   admin      → Intake Form + View/Export + Summary
+#   superadmin → All pages + Summary
 # ─────────────────────────────────────────────────────────────────────────────
-PAGES_ALL = ["Intake Form", "View / Export", "Email / WhatsApp", "Masters Admin", "Bulk Import Insurance"]
+PAGES_CORE = ["Intake Form", "View / Export", "Email / WhatsApp", "Masters Admin", "Bulk Import Insurance", "Summary"]
 
 def pages_for(role: str):
-    if role in ("Super Admin", "Admin"):
-        return PAGES_ALL
-    return ["Intake Form"]
+    r = role.strip().lower()
+    if r in ("super admin", "superadmin"):
+        return PAGES_CORE
+    if r == "admin":
+        return ["Intake Form", "View / Export", "Summary"]
+    # user
+    return ["Intake Form", "Summary"]
 
 NAV_PAGES = pages_for(ROLE)
 page = st.sidebar.radio("Navigation", NAV_PAGES)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared data loader (used by View/Export and Summary)
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=30, show_spinner=False)
+def load_data_df_all():
+    return pd.DataFrame(retry(lambda: ws(DATA_TAB).get_all_records()))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Intake Form
@@ -486,7 +517,7 @@ def reset_form():
         "patient_share": 0.0,
         "status": "",
         "remark": "",
-        "sel_client": (safe_clients()[0] if pages_for(ROLE) and safe_clients() else ""),
+        "sel_client": (safe_clients()[0] if safe_clients() else ""),
         "allow_dup_override": False,
     }
     for k, v in defaults.items():
@@ -624,7 +655,7 @@ if page == "Intake Form":
                 st.error(f"Unexpected error while saving: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# View / Export (ADMIN ONLY)
+# View / Export (ADMIN & SUPERADMIN)
 # ─────────────────────────────────────────────────────────────────────────────
 if page == "View / Export":
     if ROLE not in ("Super Admin", "Admin"):
@@ -634,13 +665,10 @@ if page == "View / Export":
     if st.button("🔄 Refresh data"):
         _sheet_to_list_raw.clear(); _pharmacies_list_raw.clear(); _insurance_list_raw.clear()
         _clients_list_raw.clear(); _client_contacts_raw.clear(); light_duplicate_snapshot.clear()
+        load_data_df_all.clear()
         st.rerun()
 
-    @st.cache_data(ttl=30, show_spinner=False)
-    def load_data_df():
-        return pd.DataFrame(retry(lambda: ws(DATA_TAB).get_all_records()))
-
-    df = load_data_df()
+    df = load_data_df_all()
     if df.empty:
         st.info("No records yet.")
         st.stop()
@@ -688,7 +716,7 @@ if page == "View / Export":
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Email / WhatsApp (ADMIN ONLY)
+# Email / WhatsApp (ADMIN & SUPERADMIN)
 # ─────────────────────────────────────────────────────────────────────────────
 def whatsapp_cfg_ok():
     w = st.secrets.get("whatsapp", {})
@@ -722,8 +750,6 @@ def send_document_to_numbers(media_id: str, filename: str, note_text: str):
                                  "document":{"id":media_id,"filename":filename}}, timeout=60)
         r2.raise_for_status()
 
-# ---- FREE WhatsApp manual share via Drive (requires google-api-python-client) ----
-from urllib.parse import quote_plus
 @st.cache_resource(show_spinner=False)
 def get_drive_service():
     """
@@ -764,7 +790,6 @@ def drive_upload_and_share(file_bytes: bytes, filename: str, mime: str) -> dict:
 
 def wa_link(phone_e164: str, text: str) -> str:
     return f"https://wa.me/{phone_e164}?text={quote_plus(text)}"
-# ----------------------------------------------------------------------------------
 
 if page == "Email / WhatsApp":
     if ROLE not in ("Super Admin", "Admin"):
@@ -772,7 +797,7 @@ if page == "Email / WhatsApp":
 
     st.subheader("Send Report")
 
-    df_all = pd.DataFrame(retry(lambda: ws(DATA_TAB).get_all_records()))
+    df_all = load_data_df_all()
     if df_all.empty:
         st.info("No records to send.")
         st.stop()
@@ -939,14 +964,13 @@ if page == "Email / WhatsApp":
                     url = wa_link(phone, base_msg)
                     st.link_button(f"Open WhatsApp → {phone}", url)
 
-    # Simple text-only link (no file)
     st.link_button(
         "Open WhatsApp with simple prefilled text",
         f"https://wa.me/?text={quote_plus(f'RCM Intake report — rows: {len(df)}. Check email for attachment.')}"
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Masters Admin (ADMIN ONLY)
+# Masters Admin (ADMIN & SUPERADMIN)
 # ─────────────────────────────────────────────────────────────────────────────
 if page == "Masters Admin":
     if ROLE not in ("Super Admin", "Admin"):
@@ -1042,7 +1066,7 @@ if page == "Masters Admin":
             st.info("Copy the above value into the Users sheet. (bcrypt, starts with $2b$...)")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Bulk Import Insurance (ADMIN ONLY)
+# Bulk Import Insurance (ADMIN & SUPERADMIN)
 # ─────────────────────────────────────────────────────────────────────────────
 if page == "Bulk Import Insurance":
     if ROLE not in ("Super Admin", "Admin"):
@@ -1071,3 +1095,96 @@ if page == "Bulk Import Insurance":
                     st.success("Insurance master updated")
         except Exception as e:
             st.error(f"Import error: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Summary (VISIBLE TO ALL ROLES)
+#   Layout matches your screenshot:
+#     Rows:  Portal mapped to Source (E-Claim for DHPO, Riayati, Insurance Portal/Other), then SubmissionDate
+#     Cols:  ClientID
+#     Value: Sum(NetAmount)
+#     Totals: Grand Total row/column
+# ─────────────────────────────────────────────────────────────────────────────
+def _make_summary_pivot(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    # Filter allowed clients
+    if "ALL" not in ALLOWED_CLIENTS:
+        df = df[df["ClientID"].isin(ALLOWED_CLIENTS)]
+
+    # Clean types
+    df = df.copy()
+    df["SubmissionDate"] = pd.to_datetime(df["SubmissionDate"], errors="coerce").dt.date
+    # NetAmount may be string — coerce
+    df["NetAmount"] = pd.to_numeric(df["NetAmount"], errors="coerce").fillna(0.0)
+
+    # Map Portal → Source label to resemble "E-Claim / Riayati"
+    def map_source(p):
+        p = str(p or "").strip().lower()
+        if p == "dhpo":
+            return "E-Claim"
+        if p == "riayati":
+            return "Riayati"
+        if p == "insurance portal":
+            return "Insurance Portal"
+        return "Other"
+
+    df["Source"] = df["Portal"].map(map_source)
+
+    # Build pivot
+    pvt = pd.pivot_table(
+        df,
+        index=["Source", "SubmissionDate"],
+        columns="ClientID",
+        values="NetAmount",
+        aggfunc="sum",
+        margins=True,
+        margins_name="Grand Total",
+        fill_value=0.0,
+    )
+
+    # Sort by date within each Source, and force Source order
+    pvt = pvt.sort_index(level=1)  # by SubmissionDate
+    source_order = ["E-Claim", "Riayati", "Insurance Portal", "Other", "Grand Total"]
+    # Reindex top level (ignore missing)
+    new_index = []
+    for src in source_order:
+        if src in pvt.index.get_level_values(0):
+            new_index.extend([idx for idx in pvt.index if idx[0] == src])
+    # Add any remaining categories not in source_order
+    for idx in pvt.index:
+        if idx not in new_index:
+            new_index.append(idx)
+    pvt = pvt.reindex(new_index)
+
+    pvt = pvt.reset_index()
+    # Round to 2 decimals for display
+    num_cols = [c for c in pvt.columns if c not in ("Source", "SubmissionDate")]
+    pvt[num_cols] = pvt[num_cols].round(2)
+    return pvt
+
+if page == "Summary":
+    st.subheader("Summary (Date × Client)")
+
+    if st.button("🔄 Refresh summary"):
+        load_data_df_all.clear()
+        st.rerun()
+
+    raw = load_data_df_all()
+    if raw.empty:
+        st.info("No data to summarize yet.")
+    else:
+        pvt = _make_summary_pivot(raw)
+        st.caption("Rows: **Source → Submission Date**. Columns: **ClientID**. Values: **Sum of NetAmount** with Grand Total.")
+        st.dataframe(pvt, use_container_width=True)
+
+        # Download Excel (summary only)
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine="openpyxl") as xw:
+            pvt.to_excel(xw, sheet_name="Summary", index=False)
+        st.download_button(
+            "⬇️ Download Summary (Excel)",
+            data=out.getvalue(),
+            file_name=f"RCM_Intake_Summary_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
