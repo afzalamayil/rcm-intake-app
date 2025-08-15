@@ -34,7 +34,7 @@ import streamlit_authenticator as stauth
 # ─────────────────────────────────────────────────────────────────────────────
 LOGO_PATH = "assets/logo.png"
 st.set_page_config(
-    page_title="RCM Intake (Option B)",
+    page_title="RCM Intake",
     page_icon=LOGO_PATH if os.path.exists(LOGO_PATH) else "📋",
     layout="wide"
 )
@@ -44,7 +44,7 @@ except TypeError:
     col_logo, col_title = st.columns([1, 8])
 if os.path.exists(LOGO_PATH):
     col_logo.image(LOGO_PATH, use_container_width=True)
-col_title.markdown("### RCM Intake — Streamlit (Option B)")
+col_title.markdown("### RCM Intake")
 st.caption("Stack: Streamlit + Google Sheets • Email via SMTP • WhatsApp Cloud (mgmt) + Free WA links")
 
 # ─────────────────────────────────────────────────────────────────────────────
