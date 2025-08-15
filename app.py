@@ -45,7 +45,6 @@ except TypeError:
 if os.path.exists(LOGO_PATH):
     col_logo.image(LOGO_PATH, use_container_width=True)
 col_title.markdown("### RCM Intake")
-st.caption("Stack: Streamlit + Google Sheets • Email via SMTP • WhatsApp Cloud (mgmt) + Free WA links")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Secrets
