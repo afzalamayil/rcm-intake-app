@@ -12,7 +12,8 @@
 #     - admin      → Intake Form + View/Export + Summary
 #     - superadmin → All pages + Summary
 # ✅ Hide top-right Streamlit toolbar (Share/Star/Edit/GitHub/⋮) for user & admin
-# ✅ Summary pivot (Portal/E-Claim/Riayati × Date × ClientID) with Grand Total
+# ✅ Summary pivot: Columns=PharmacyName; Rows=SubmissionMode→SubmissionDate; Values=Sum(NetAmount)
+#    with Grand Total, and filters for Date range, Pharmacy, Insurance (name/code contains)
 # ─────────────────────────────────────────────────────────────────────────────
 
 import io
@@ -447,11 +448,10 @@ ROLE, ALLOWED_CLIENTS = get_user_role_and_clients(username)
 
 # ── Hide Streamlit toolbar for non-superadmin ────────────────────────────────
 def _hide_toolbar_for_non_superadmin(role: str):
-    if role.lower() != "super admin" and role.lower() != "superadmin":
+    if role.lower() not in ("super admin", "superadmin"):
         st.markdown(
             """
             <style>
-            /* Hide top-right header icons & deploy/overflow menus */
             [data-testid="stToolbar"] { display: none !important; }
             header [data-testid="baseButton-header"] { display: none !important; }
             .stAppDeployButton, [data-testid="stActionMenu"] { display: none !important; }
@@ -471,10 +471,7 @@ with st.sidebar:
         authenticator.logout("Logout", "logout_sidebar_btn")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Navigation (role rules updated)
-#   user       → Intake Form + Summary
-#   admin      → Intake Form + View/Export + Summary
-#   superadmin → All pages + Summary
+# Navigation
 # ─────────────────────────────────────────────────────────────────────────────
 PAGES_CORE = ["Intake Form", "View / Export", "Email / WhatsApp", "Masters Admin", "Bulk Import Insurance", "Summary"]
 
@@ -484,14 +481,13 @@ def pages_for(role: str):
         return PAGES_CORE
     if r == "admin":
         return ["Intake Form", "View / Export", "Summary"]
-    # user
-    return ["Intake Form", "Summary"]
+    return ["Intake Form", "Summary"]  # user
 
 NAV_PAGES = pages_for(ROLE)
 page = st.sidebar.radio("Navigation", NAV_PAGES)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared data loader (used by View/Export and Summary)
+# Shared data loader
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=30, show_spinner=False)
 def load_data_df_all():
@@ -647,6 +643,7 @@ if page == "Intake Form":
                 st.toast("Saved ✔️")
                 _sheet_to_list_raw.clear(); _pharmacies_list_raw.clear(); _insurance_list_raw.clear()
                 _clients_list_raw.clear(); _client_contacts_raw.clear(); light_duplicate_snapshot.clear()
+                load_data_df_all.clear()
                 st.session_state["_clear_form"] = True
                 st.rerun()
             except gspread.exceptions.APIError as e:
@@ -673,8 +670,8 @@ if page == "View / Export":
         st.info("No records yet.")
         st.stop()
 
-    if "ALL" not in ALLOWED_CLIENTS:
-        df = df[df['ClientID'].isin(ALLOWED_CLIENTS)]
+    if ALLOWED_CLIENTS and ALLOWED_CLIENTS != ["ALL"]:
+        df = df[df['ClientID'].astype(str).isin(ALLOWED_CLIENTS)]
 
     f1, f2, f3 = st.columns(3)
     with f1:
@@ -773,7 +770,6 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 def drive_upload_and_share(file_bytes: bytes, filename: str, mime: str) -> dict:
-    """Upload to Drive (optional [drive].reports_folder_id), make public, return links."""
     from googleapiclient.http import MediaIoBaseUpload
     import io as _io
     service = get_drive_service()
@@ -786,7 +782,7 @@ def drive_upload_and_share(file_bytes: bytes, filename: str, mime: str) -> dict:
     fid = file["id"]
     service.permissions().create(fileId=fid, body={"type": "anyone", "role": "reader"}).execute()
     file = service.files().get(fileId=fid, fields="id, webViewLink, webContentLink").execute()
-    return file  # id, webViewLink, webContentLink
+    return file
 
 def wa_link(phone_e164: str, text: str) -> str:
     return f"https://wa.me/{phone_e164}?text={quote_plus(text)}"
@@ -881,7 +877,6 @@ if page == "Email / WhatsApp":
             )
             if ok: st.success("Email sent ✔️")
 
-    # ── WhatsApp MANAGEMENT (Cloud API; paid by Meta) ────────────────────────
     st.divider()
     st.markdown("**WhatsApp (Management, Cloud API) — send CSV to configured recipients**")
     period_days_default = st.secrets.get("whatsapp_management", {}).get("default_period_days", 1)
@@ -908,12 +903,12 @@ if page == "Email / WhatsApp":
                 except Exception as e:
                     st.error(f"WhatsApp send failed: {e}")
 
-    # ── FREE WhatsApp manual sharing via Drive (+ wa.me buttons) ─────────────
     st.divider()
     st.markdown("### WhatsApp (free, manual send)")
     st.caption("Uploads the filtered Excel to Drive (public read-only) and creates WhatsApp buttons per client number. "
                "You still tap Send in WhatsApp (Click-to-Chat).")
 
+    xbytes.seek(0)
     wa_filename = f"RCM_Intake_Report_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
     uploaded_info = None
     if st.button("📤 Upload report to Google Drive & generate WhatsApp buttons", type="secondary"):
@@ -1098,44 +1093,53 @@ if page == "Bulk Import Insurance":
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary (VISIBLE TO ALL ROLES)
-#   Layout matches your screenshot:
-#     Rows:  Portal mapped to Source (E-Claim for DHPO, Riayati, Insurance Portal/Other), then SubmissionDate
-#     Cols:  ClientID
-#     Value: Sum(NetAmount)
-#     Totals: Grand Total row/column
+# Columns = PharmacyName; Rows = SubmissionMode → SubmissionDate
+# Filters: date range, pharmacy, insurance name/code
 # ─────────────────────────────────────────────────────────────────────────────
-def _make_summary_pivot(df: pd.DataFrame) -> pd.DataFrame:
+def _make_summary_pivot(df: pd.DataFrame,
+                        date_from: date|None = None,
+                        date_to: date|None = None,
+                        sel_pharmacies: list[str] | None = None,
+                        insurance_query: str | None = None) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
-    # Filter allowed clients
-    if "ALL" not in ALLOWED_CLIENTS:
-        df = df[df["ClientID"].isin(ALLOWED_CLIENTS)]
+    # Apply allowed-clients restriction ONLY when meaningful
+    if ALLOWED_CLIENTS and ALLOWED_CLIENTS != ["ALL"]:
+        df = df[df["ClientID"].astype(str).isin(ALLOWED_CLIENTS)]
 
-    # Clean types
+    # Clean & coerce
     df = df.copy()
-    df["SubmissionDate"] = pd.to_datetime(df["SubmissionDate"], errors="coerce").dt.date
-    # NetAmount may be string — coerce
-    df["NetAmount"] = pd.to_numeric(df["NetAmount"], errors="coerce").fillna(0.0)
+    df["SubmissionDate"]  = pd.to_datetime(df["SubmissionDate"], errors="coerce").dt.date
+    df["NetAmount"]       = pd.to_numeric(df["NetAmount"], errors="coerce").fillna(0.0)
+    df["PharmacyName"]    = df["PharmacyName"].replace("", pd.NA).fillna("Unknown")
+    df["SubmissionMode"]  = df["SubmissionMode"].replace("", pd.NA).fillna("Unknown")
+    df["InsuranceName"]   = df.get("InsuranceName", "")
+    df["InsuranceCode"]   = df.get("InsuranceCode", "")
 
-    # Map Portal → Source label to resemble "E-Claim / Riayati"
-    def map_source(p):
-        p = str(p or "").strip().lower()
-        if p == "dhpo":
-            return "E-Claim"
-        if p == "riayati":
-            return "Riayati"
-        if p == "insurance portal":
-            return "Insurance Portal"
-        return "Other"
+    # Filters
+    if date_from:
+        df = df[df["SubmissionDate"] >= date_from]
+    if date_to:
+        df = df[df["SubmissionDate"] <= date_to]
+    if sel_pharmacies:
+        df = df[df["PharmacyName"].isin(sel_pharmacies)]
+    if insurance_query:
+        q = str(insurance_query).strip()
+        if q:
+            df = df[
+                df["InsuranceName"].astype(str).str.contains(q, case=False, na=False) |
+                df["InsuranceCode"].astype(str).str.contains(q, case=False, na=False)
+            ]
 
-    df["Source"] = df["Portal"].map(map_source)
+    if df.empty:
+        return pd.DataFrame()
 
     # Build pivot
     pvt = pd.pivot_table(
         df,
-        index=["Source", "SubmissionDate"],
-        columns="ClientID",
+        index=["SubmissionMode", "SubmissionDate"],
+        columns="PharmacyName",
         values="NetAmount",
         aggfunc="sum",
         margins=True,
@@ -1143,28 +1147,17 @@ def _make_summary_pivot(df: pd.DataFrame) -> pd.DataFrame:
         fill_value=0.0,
     )
 
-    # Sort by date within each Source, and force Source order
-    pvt = pvt.sort_index(level=1)  # by SubmissionDate
-    source_order = ["E-Claim", "Riayati", "Insurance Portal", "Other", "Grand Total"]
-    # Reindex top level (ignore missing)
-    new_index = []
-    for src in source_order:
-        if src in pvt.index.get_level_values(0):
-            new_index.extend([idx for idx in pvt.index if idx[0] == src])
-    # Add any remaining categories not in source_order
-    for idx in pvt.index:
-        if idx not in new_index:
-            new_index.append(idx)
-    pvt = pvt.reindex(new_index)
+    # Sort rows by mode then date; sort columns alphabetically
+    pvt = pvt.sort_index(level=[0, 1])
+    pvt = pvt.reindex(sorted(pvt.columns, key=lambda x: str(x)), axis=1)
 
     pvt = pvt.reset_index()
-    # Round to 2 decimals for display
-    num_cols = [c for c in pvt.columns if c not in ("Source", "SubmissionDate")]
+    num_cols = [c for c in pvt.columns if c not in ("SubmissionMode", "SubmissionDate")]
     pvt[num_cols] = pvt[num_cols].round(2)
     return pvt
 
 if page == "Summary":
-    st.subheader("Summary (Date × Client)")
+    st.subheader("Summary (Submission Mode → Date × Pharmacy)")
 
     if st.button("🔄 Refresh summary"):
         load_data_df_all.clear()
@@ -1174,17 +1167,44 @@ if page == "Summary":
     if raw.empty:
         st.info("No data to summarize yet.")
     else:
-        pvt = _make_summary_pivot(raw)
-        st.caption("Rows: **Source → Submission Date**. Columns: **ClientID**. Values: **Sum of NetAmount** with Grand Total.")
-        st.dataframe(pvt, use_container_width=True)
+        # Filter UI
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            date_from = st.date_input("From date", value=None)
+        with c2:
+            date_to = st.date_input("To date", value=None)
+        with c3:
+            insurance_q = st.text_input("Insurance filter (name/code contains)")
 
-        # Download Excel (summary only)
-        out = io.BytesIO()
-        with pd.ExcelWriter(out, engine="openpyxl") as xw:
-            pvt.to_excel(xw, sheet_name="Summary", index=False)
-        st.download_button(
-            "⬇️ Download Summary (Excel)",
-            data=out.getvalue(),
-            file_name=f"RCM_Intake_Summary_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        # Pharmacy options (respect allowed clients)
+        filt = raw.copy()
+        if ALLOWED_CLIENTS and ALLOWED_CLIENTS != ["ALL"]:
+            filt = filt[filt["ClientID"].astype(str).isin(ALLOWED_CLIENTS)]
+        pharm_options = sorted(pd.Series(filt.get("PharmacyName", [])).dropna().unique().tolist())
+        sel_pharm = st.multiselect("Pharmacy name", pharm_options)
+
+        # Build pivot
+        pvt = _make_summary_pivot(
+            raw,
+            date_from=date_from if date_from else None,
+            date_to=date_to if date_to else None,
+            sel_pharmacies=sel_pharm if sel_pharm else None,
+            insurance_query=insurance_q if insurance_q else None,
         )
+
+        st.caption("Rows: **Submission Mode → Submission Date**. Columns: **Pharmacy Name**. Values: **Sum of NetAmount** with Grand Total.")
+        if pvt.empty:
+            st.warning("No rows match the selected filters.")
+        else:
+            st.dataframe(pvt, use_container_width=True)
+
+            # Download
+            out = io.BytesIO()
+            with pd.ExcelWriter(out, engine="openpyxl") as xw:
+                pvt.to_excel(xw, sheet_name="Summary", index=False)
+            st.download_button(
+                "⬇️ Download Summary (Excel)",
+                data=out.getvalue(),
+                file_name=f"RCM_Intake_Summary_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
