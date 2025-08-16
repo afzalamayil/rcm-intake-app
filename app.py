@@ -418,23 +418,30 @@ def modules_enabled_for(client_id: str, role: str) -> list[tuple[str,str]]:
     return [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") for _, r in df.iterrows()]
 
 @st.cache_data(ttl=60)
+@st.cache_data(ttl=60)
 def schema_df() -> pd.DataFrame:
+    # Always read with expected headers so downstream filters never KeyError
     df = read_sheet_df(MS_FORM_SCHEMA, REQUIRED_HEADERS[MS_FORM_SCHEMA]).fillna("")
-    # normalize
+
+    # Ensure all expected columns exist even if the sheet is newly created
     for col in REQUIRED_HEADERS[MS_FORM_SCHEMA]:
-        if col not in df.columns: df[col] = ""
-    df["ClientID"] = df["ClientID"].astype(str).str.strip()
-    df["Module"] = df["Module"].astype(str).str.strip()
-    df["FieldKey"] = df["FieldKey"].astype(str).str.strip()
-    df["Label"] = df["Label"].astype(str)
-    df["Type"] = df["Type"].astype(str).lower().str.strip()
-    df["Required"] = df["Required"].astype(str).str.upper().isin(["TRUE","1","YES"])
+        if col not in df.columns:
+            df[col] = ""
+
+    # Normalize types and whitespace
+    df["ClientID"]       = df["ClientID"].astype(str).str.strip()
+    df["Module"]         = df["Module"].astype(str).str.strip()
+    df["FieldKey"]       = df["FieldKey"].astype(str).str.strip()
+    df["Label"]          = df["Label"].astype(str)
+    df["Type"]           = df["Type"].astype(str).str.lower().str.strip()   # ← fixed
+    df["Required"]       = df["Required"].astype(str).str.upper().isin(["TRUE","1","YES"])
     df["RoleVisibility"] = df["RoleVisibility"].astype(str)
-    df["Order"] = pd.to_numeric(df["Order"], errors="coerce").fillna(9999).astype(int)
-    df["SaveTo"] = df["SaveTo"].astype(str).str.strip()
-    df["Options"] = df["Options"].astype(str)
-    df["Default"] = df["Default"].astype(str)
-    df["ReadOnlyRoles"] = df["ReadOnlyRoles"].astype(str)
+    df["Order"]          = pd.to_numeric(df["Order"], errors="coerce").fillna(9999).astype(int)
+    df["SaveTo"]         = df["SaveTo"].astype(str).str.strip()
+    df["Options"]        = df["Options"].astype(str)
+    df["Default"]        = df["Default"].astype(str)
+    df["ReadOnlyRoles"]  = df["ReadOnlyRoles"].astype(str)
+
     return df
 
 def _options_from_token(token: str) -> list[str]:
