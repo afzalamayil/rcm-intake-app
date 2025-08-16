@@ -443,6 +443,11 @@ def schema_df() -> pd.DataFrame:
     df["ReadOnlyRoles"]  = df["ReadOnlyRoles"].astype(str)
 
     return df
+# Debug schema view - only superadmin sees it
+if st.session_state.get("role") == "superadmin":
+    st.subheader("🔍 Debug: FormSchema Preview")
+    df_schema = schema_df()
+    st.dataframe(df_schema.head(20))
 
 def _options_from_token(token: str) -> list[str]:
     token = (token or "").strip()
