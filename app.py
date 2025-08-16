@@ -828,7 +828,7 @@ def _make_summary_pivot(df: pd.DataFrame,
     combined = pd.concat(blocks)
 
     # Grand total row
-    grand = pd.DataFrame([combined.sum(numeric_only=True)])
+    grand = pd.DataFrame([base.sum(numeric_only=True)])
     grand.index = pd.MultiIndex.from_tuples([("Grand Total","")], names=base.index.names)
     combined = pd.concat([combined, grand])
 
