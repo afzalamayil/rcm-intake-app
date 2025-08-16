@@ -1,17 +1,24 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# File: app.py — RITE TECH (Pharmacy-based ACL)
+# File: app.py — RITE TECH (Dynamic, Per-Client, Multi-Module + ACL)
 # ─────────────────────────────────────────────────────────────────────────────
-# ✅ Toolbar hidden globally (incl. login); shown only for Super Admin post-login
-# ✅ Auth from Users sheet (bcrypt); per-user Pharmacy IDs ACL (pharmacies column)
-# ✅ Intake writes PharmacyID + PharmacyName to Data sheet
-# ✅ View/Export & Summary filtered by allowed Pharmacy IDs
-# ✅ Summary: cols=PharmacyName, rows=SubmissionMode→SubmissionDate, per-mode subtotal, grand total
-# ✅ Filters: date range, pharmacy, insurance (name/code contains)
-# ✅ Retry wrappers, cached reads, masters admin, email/WhatsApp utilities
+# ✅ Super Admin-only toolbar; hidden globally otherwise (incl. login)
+# ✅ Auth from Users sheet (bcrypt); per-user Pharmacy IDs ACL (pharmacies col)
+# ✅ Per-client modules (tabs): Pharmacy, Approvals, Lab, ... (configurable)
+# ✅ Per-client field schemas (types, required, options, role visibility, order)
+# ✅ Dynamic form rendering; writes to a per-module sheet (e.g., Data_Pharmacy)
+# ✅ Masters-backed options: MS:Insurance / MS:Status / MS:Portal / MS:SubmissionMode
+# ✅ Auto-create required sheets and module data sheets
+# ✅ Optional duplicate check per module via Modules!DupKeys (pipe-separated)
+# ✅ View/Export for any module
+# ✅ Email with Excel attachment; WhatsApp Cloud API (optional)
+# ✅ Summary pivot (choose module + numeric field), per-mode subtotals + grand total
+# ✅ Super Admin Config UI: Modules, ClientModules, FormSchema + Password Hash tool
+# ✅ Caching + retry wrappers for scale and rate-limit resilience
 # ─────────────────────────────────────────────────────────────────────────────
 
 import io
 import os
+import re
 import json
 import time
 import random
@@ -39,7 +46,6 @@ st.set_page_config(
     page_icon=LOGO_PATH if os.path.exists(LOGO_PATH) else "📋",
     layout="wide"
 )
-# Hide toolbar everywhere (login included)
 st.markdown("""
 <style>
 [data-testid="stToolbar"] { display:none !important; }
@@ -54,7 +60,7 @@ except TypeError:
     col_logo, col_title = st.columns([1, 8])
 if os.path.exists(LOGO_PATH):
     col_logo.image(LOGO_PATH, use_container_width=True)
-col_title.markdown("### RCM Intake")
+col_title.markdown("### RCM Intake — Dynamic")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Secrets
@@ -82,10 +88,18 @@ missing = [k for k in REQUIRED_GS_KEYS if k not in GS]
 if missing:
     st.error("Google Sheets credentials missing in secrets: " + ", ".join(missing)); st.stop()
 
-SPREADSHEET_ID = GS.get("spreadsheet_id", "").strip()
+def _extract_spreadsheet_id(gs: dict) -> str:
+    url = (gs.get("sheet_url") or "").strip()
+    if url:
+        m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
+        if m: return m.group(1)
+    return (gs.get("spreadsheet_id") or "").strip()
+
+SPREADSHEET_ID = _extract_spreadsheet_id(GS)
 SPREADSHEET_NAME = GS.get("spreadsheet_name", "RCM_Intake_DB").strip()
+
 if not SPREADSHEET_ID and not SPREADSHEET_NAME:
-    st.error("Provide either [gsheets].spreadsheet_id or spreadsheet_name in secrets."); st.stop()
+    st.error("Provide either [gsheets].sheet_url OR spreadsheet_id OR spreadsheet_name in secrets."); st.stop()
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
           "https://www.googleapis.com/auth/drive"]
@@ -95,7 +109,7 @@ def retry(fn, attempts=8, base=0.7):
         try: return fn()
         except Exception as e:
             msg = str(e).lower()
-            if any(x in msg for x in ["429","rate","quota","deadline","temporar","internal","backenderror"]):
+            if any(x in msg for x in ["429","rate","quota","deadline","temporar","internal","backenderror","backend error"]):
                 time.sleep(min(base * (2**i), 6) + random.random()*0.5); continue
             raise
     raise RuntimeError("Exceeded retries due to rate limiting.")
@@ -109,42 +123,49 @@ def get_gspread_client():
 @st.cache_resource(show_spinner=False)
 def get_spreadsheet(_gc):
     try:
-        return retry(lambda: _gc.open_by_key(SPREADSHEET_ID)) if SPREADSHEET_ID else retry(lambda: _gc.open(SPREADSHEET_NAME))
+        if SPREADSHEET_ID:
+            return retry(lambda: _gc.open_by_key(SPREADSHEET_ID))
+        return retry(lambda: _gc.open(SPREADSHEET_NAME))
     except gspread.SpreadsheetNotFound:
-        if not SPREADSHEET_ID: return retry(lambda: _gc.create(SPREADSHEET_NAME))
-        st.error("Spreadsheet ID not found or no access. Share to service account."); st.stop()
+        if not SPREADSHEET_ID: 
+            return retry(lambda: _gc.create(SPREADSHEET_NAME))
+        st.error("Spreadsheet ID not found or no access. Share the sheet with your service account email."); st.stop()
 
 gc = get_gspread_client()
 sh = get_spreadsheet(gc)
 
 def ws(name: str):
     try: return retry(lambda: sh.worksheet(name))
-    except gspread.WorksheetNotFound: return retry(lambda: sh.add_worksheet(name, rows=200, cols=26))
+    except gspread.WorksheetNotFound: return retry(lambda: sh.add_worksheet(name, rows=1000, cols=80))
 
 def list_titles(): return {w.title for w in retry(lambda: sh.worksheets())}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tabs, headers, seeds
+# Masters & Config sheets
 # ─────────────────────────────────────────────────────────────────────────────
-DATA_TAB = "Data"
+DATA_TAB = "Data"                   # legacy (optional)
 USERS_TAB = "Users"
 MS_PHARM = "Pharmacies"
 MS_INSURANCE = "Insurance"
 MS_SUBMISSION_MODE = "SubmissionMode"
 MS_PORTAL = "Portal"
 MS_STATUS = "Status"
-MS_REMARKS = "Remarks"
-CLIENTS_TAB = "Clients"              # kept for compatibility; not used in ACL
+CLIENTS_TAB = "Clients"             # optional
 CLIENT_CONTACTS_TAB = "ClientContacts"
+
+# Dynamic config
+MS_MODULES = "Modules"              # catalog of modules
+MS_CLIENT_MODULES = "ClientModules" # per-client enable map
+MS_FORM_SCHEMA = "FormSchema"       # per-client+module field schema
 
 DEFAULT_TABS = [
     DATA_TAB, USERS_TAB, MS_PHARM, MS_INSURANCE,
-    MS_SUBMISSION_MODE, MS_PORTAL, MS_STATUS, MS_REMARKS,
-    CLIENTS_TAB, CLIENT_CONTACTS_TAB
+    MS_SUBMISSION_MODE, MS_PORTAL, MS_STATUS,
+    CLIENTS_TAB, CLIENT_CONTACTS_TAB,
+    MS_MODULES, MS_CLIENT_MODULES, MS_FORM_SCHEMA
 ]
 
 REQUIRED_HEADERS = {
-    # NOTE: now includes PharmacyID & PharmacyName
     DATA_TAB: [
         "Timestamp","SubmittedBy","Role",
         "PharmacyID","PharmacyName",
@@ -153,7 +174,7 @@ REQUIRED_HEADERS = {
         "MemberID","EID","ClaimID","ApprovalCode",
         "NetAmount","PatientShare","Remark","Status"
     ],
-    USERS_TAB: ["username","name","password","role","pharmacies"],   # <-- ACL by pharmacy IDs
+    USERS_TAB: ["username","name","password","role","pharmacies","client_id"],
     MS_SUBMISSION_MODE: ["Value"],
     MS_PORTAL: ["Value"],
     MS_STATUS: ["Value"],
@@ -161,6 +182,9 @@ REQUIRED_HEADERS = {
     MS_INSURANCE: ["Code","Name"],
     CLIENTS_TAB: ["ClientID","Name"],
     CLIENT_CONTACTS_TAB: ["ClientID","To","CC","WhatsApp"],
+    MS_MODULES: ["Module","SheetName","DefaultEnabled","DupKeys","NumericFieldsJSON"],
+    MS_CLIENT_MODULES: ["ClientID","Module","Enabled"],
+    MS_FORM_SCHEMA: ["ClientID","Module","FieldKey","Label","Type","Required","Options","Default","RoleVisibility","Order","SaveTo"],
 }
 
 SEED_SIMPLE = {
@@ -168,33 +192,68 @@ SEED_SIMPLE = {
     MS_PORTAL: ["DHPO","Riayati","Insurance Portal"],
     MS_STATUS: ["Submitted","Approved","Rejected","Pending","RA Pending"],
 }
+SEED_MODULES = [
+    # Module, SheetName, DefaultEnabled, DupKeys, NumericFieldsJSON
+    ["Pharmacy","Data_Pharmacy","TRUE","ERXNumber|NetAmount|SubmissionDate","[\"NetAmount\",\"PatientShare\"]"],
+    ["Approvals","Data_Approvals","TRUE","","[]"],
+    ["Lab","Data_Lab","FALSE","","[]"],
+]
 
-def ensure_tabs_and_headers_light():
+def ensure_tabs_and_headers():
     existing = list_titles()
     for t in DEFAULT_TABS:
-        if t not in existing: retry(lambda: sh.add_worksheet(t, rows=200, cols=26))
+        if t not in existing: retry(lambda: sh.add_worksheet(t, rows=1000, cols=80))
     for tab, headers in REQUIRED_HEADERS.items():
         wsx = ws(tab); head = retry(lambda: wsx.row_values(1))
-        if not head or [h.lower() for h in head] != [h.lower() for h in headers]:
+        if not head:
             retry(lambda: wsx.update("A1", [headers]))
+        else:
+            # Non-destructive header merge to avoid data loss if headers evolved
+            merged = list(dict.fromkeys(head + [h for h in headers if h not in head]))
+            if merged != head:
+                retry(lambda: wsx.update("A1", [merged]))
     # seed simple lists
     for tab, values in SEED_SIMPLE.items():
         wsx = ws(tab)
-        if not retry(lambda: wsx.acell("A2").value):
+        vals = retry(lambda: wsx.get_all_values())
+        if len(vals) <= 1:
             retry(lambda: wsx.update("A1", [["Value"], *[[v] for v in values]]))
+    # seed modules
+    mws = ws(MS_MODULES)
+    mvals = retry(lambda: mws.get_all_values())
+    if len(mvals) <= 1:
+        retry(lambda: mws.update("A1", [REQUIRED_HEADERS[MS_MODULES]]))
+        retry(lambda: mws.update("A2", SEED_MODULES))
 
 @st.cache_resource(show_spinner=False)
-def _init_sheets_once(): ensure_tabs_and_headers_light(); return True
+def _init_sheets_once():
+    ensure_tabs_and_headers()
+    _ensure_module_sheets_exist()
+    return True
+
+def _ensure_module_sheets_exist():
+    df = pd.DataFrame(retry(lambda: ws(MS_MODULES).get_all_records())).fillna("")
+    for _, r in df.iterrows():
+        sheet = (r.get("SheetName") or "").strip() or f"Data_{str(r.get('Module') or '').strip()}"
+        if not sheet: continue
+        if sheet not in list_titles():
+            retry(lambda: sh.add_worksheet(sheet, rows=2000, cols=120))
+        wsx = ws(sheet)
+        head = retry(lambda: wsx.row_values(1))
+        if not head:
+            meta = ["Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module"]
+            retry(lambda: wsx.update("A1", [meta]))
+
 _init_sheets_once()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Cached reads / masters
 # ─────────────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=45, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def pharm_master() -> pd.DataFrame:
-    df = pd.DataFrame(retry(lambda: ws(MS_PHARM).get_all_records())); df = df.fillna("")
+    df = pd.DataFrame(retry(lambda: ws(MS_PHARM).get_all_records())).fillna("")
     if not {"ID","Name"}.issubset(df.columns):
-        return pd.DataFrame(columns=["ID","Name"])
+        return pd.DataFrame(columns=["ID","Name","Display"])
     df["ID"] = df["ID"].astype(str).str.strip()
     df["Name"] = df["Name"].astype(str).str.strip()
     df["Display"] = df["ID"] + " - " + df["Name"]
@@ -204,7 +263,15 @@ def pharm_display_list() -> list[str]:
     df = pharm_master()
     return df["Display"].tolist() if not df.empty else ["—"]
 
-@st.cache_data(ttl=45, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
+def insurance_master() -> pd.DataFrame:
+    df = pd.DataFrame(retry(lambda: ws(MS_INSURANCE).get_all_records())).fillna("")
+    if df.empty: return pd.DataFrame(columns=["Code","Name","Display"])
+    if "Display" not in df.columns:
+        df["Display"] = (df.get("Code","").astype(str).str.strip()+" - "+df.get("Name","").astype(str).str.strip()).str.strip(" -")
+    return df[["Code","Name","Display"]]
+
+@st.cache_data(ttl=60, show_spinner=False)
 def _list_from_sheet(title, col_candidates=("Value","Name","Mode","Portal","Status")):
     rows = retry(lambda: ws(title).get_all_values())
     if not rows: return []
@@ -215,59 +282,15 @@ def _list_from_sheet(title, col_candidates=("Value","Name","Mode","Portal","Stat
             return [r[i] for r in rows[1:] if len(r) > i and r[i]]
     return [r[0] for r in rows[1:] if r and r[0]]
 
-def safe_list(title, fallback): 
+def safe_list(title, fallback):
     try:
         lst = _list_from_sheet(title)
         return lst if lst else list(fallback)
     except Exception:
         return list(fallback)
 
-@st.cache_data(ttl=45, show_spinner=False)
-def insurance_master() -> pd.DataFrame:
-    df = pd.DataFrame(retry(lambda: ws(MS_INSURANCE).get_all_records())).fillna("")
-    if df.empty: return pd.DataFrame(columns=["Code","Name","Display"])
-    if "Display" not in df.columns:
-        df["Display"] = (df.get("Code","").astype(str).str.strip()+" - "+df.get("Name","").astype(str).str.strip()).str.strip(" -")
-    return df[["Code","Name","Display"]]
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Duplicate snapshot
-# ─────────────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=30, show_spinner=False)
-def light_duplicate_snapshot():
-    # E:SubmissionMode, F:SubmissionDate, J:ERXNumber, Q:NetAmount (indices changed due to header update)
-    ranges = [f"{DATA_TAB}!F:F", f"{DATA_TAB}!I:I", f"{DATA_TAB}!J:J", f"{DATA_TAB}!Q:Q"]
-    values = retry(lambda: sh.batch_get(ranges))
-    def col(i): return values[i][1:] if (i < len(values) and values[i]) else []
-    dates, modes, erx, nets = (col(i) for i in range(4))
-    out = []
-    N = max(len(dates), len(modes), len(erx), len(nets))
-    for i in range(N):
-        out.append({
-            "SubmissionDate": (dates[i][0] if i < len(dates) and dates[i] else ""),
-            "SubmissionMode": (modes[i][0] if i < len(modes) and modes[i] else ""),
-            "ERXNumber":      (erx[i][0] if i < len(erx) and erx[i] else ""),
-            "NetAmount":      (nets[i][0] if i < len(nets) and nets[i] else "")
-        })
-    return pd.DataFrame(out)
-
-def is_potential_duplicate(erx_number: str, net_amount: float, subm_date: date):
-    try:
-        df = light_duplicate_snapshot()
-        if df.empty: return False, pd.DataFrame()
-        df["SubmissionDate"] = pd.to_datetime(df["SubmissionDate"], errors="coerce").dt.date
-        same_day = df[df["SubmissionDate"] == subm_date]
-        net_str = f"{float(net_amount):.2f}"
-        dup = same_day[
-            same_day["ERXNumber"].astype(str).str.strip().eq(str(erx_number).strip()) &
-            same_day["NetAmount"].astype(str).str.strip().eq(net_str)
-        ]
-        return (not dup.empty), dup
-    except Exception:
-        return False, pd.DataFrame()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Authentication & per-user pharmacy ACL
+# Authentication & per-user pharmacy ACL + client_id
 # ─────────────────────────────────────────────────────────────────────────────
 def load_users_df():
     try:
@@ -279,14 +302,15 @@ def load_users_df():
 USERS_DF = load_users_df()
 ROLE_MAP = json.loads(ROLE_MAP_JSON or "{}")
 
+# Fallback when Users is empty
 if USERS_DF is None and not ROLE_MAP:
-    ROLE_MAP = {"admin@example.com": {"role": "Super Admin", "pharmacies": ["ALL"]}}
+    ROLE_MAP = {"admin@example.com": {"role": "Super Admin", "pharmacies": ["ALL"], "client_id":"DEFAULT"}}
 
 def build_authenticator(cookie_suffix: str = ""):
     if USERS_DF is not None and not USERS_DF.empty:
-        names = USERS_DF['name'].tolist()
-        usernames = USERS_DF['username'].tolist()
-        passwords = USERS_DF['password'].tolist()  # bcrypt
+        names = USERS_DF.get('name', pd.Series([""]*len(USERS_DF))).tolist()
+        usernames = USERS_DF.get('username', pd.Series([""]*len(USERS_DF))).tolist()
+        passwords = USERS_DF.get('password', pd.Series([""]*len(USERS_DF))).tolist()  # bcrypt
         creds = {"usernames": {u: {"name": n, "password": p} for n, u, p in zip(names, usernames, passwords)}}
     else:
         demo = json.loads(AUTH.get("demo_users", "{}")) or {"admin@example.com":{"name":"Admin","password":"admin123"}}
@@ -314,22 +338,20 @@ if not authentication_status:
     if authentication_status is False: st.error("Invalid credentials")
     st.stop()
 
-def get_user_role_and_pharmacies(u):
+def get_user_role_pharms_client(u):
     if USERS_DF is not None and not USERS_DF.empty:
         row = USERS_DF[USERS_DF['username'] == u]
         if not row.empty:
             role = row.iloc[0].get('role', 'User')
             pharms = [p.strip() for p in str(row.iloc[0].get('pharmacies','ALL')).split(',') if p.strip()]
-            return role, (pharms or ["ALL"])
+            client_id = str(row.iloc[0].get('client_id','DEFAULT')).strip() or "DEFAULT"
+            return role, (pharms or ["ALL"]), client_id
     if u in ROLE_MAP:
-        m = ROLE_MAP[u]; return m.get("role","User"), m.get("pharmacies", ["ALL"])
-    return "User", ["ALL"]
+        m = ROLE_MAP[u]; return m.get("role","User"), m.get("pharmacies", ["ALL"]), m.get("client_id","DEFAULT")
+    return "User", ["ALL"], "DEFAULT"
 
-ROLE, ALLOWED_PHARM_IDS = get_user_role_and_pharmacies(username)
-# normalize
-ALLOWED_PHARM_IDS = [str(p).strip() for p in (ALLOWED_PHARM_IDS or [])]
+ROLE, ALLOWED_PHARM_IDS, CLIENT_ID = get_user_role_pharms_client(username)
 
-# Re-enable toolbar ONLY for Super Admin
 def _show_toolbar_for_superadmin(role: str):
     if str(role).strip().lower() in ("super admin","superadmin"):
         st.markdown("""
@@ -344,514 +366,696 @@ _show_toolbar_for_superadmin(ROLE)
 with st.sidebar:
     st.write(f"**User:** {name or username}")
     st.write(f"**Role:** {ROLE}")
+    st.write(f"**Client:** {CLIENT_ID}")
     st.write(f"**Pharmacies:** {', '.join(ALLOWED_PHARM_IDS)}")
     try: authenticator.logout("Logout", "sidebar")
     except TypeError: authenticator.logout("Logout", "logout_sidebar_btn")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Navigation
+# Dynamic modules engine
 # ─────────────────────────────────────────────────────────────────────────────
-PAGES = ["Intake Form", "View / Export", "Email / WhatsApp", "Masters Admin", "Bulk Import Insurance", "Summary"]
-def pages_for(role: str):
-    r = role.strip().lower()
-    if r in ("super admin","superadmin"): return PAGES
-    if r == "admin": return ["Intake Form","View / Export","Summary"]
-    return ["Intake Form","Summary"]
-page = st.sidebar.radio("Navigation", pages_for(ROLE))
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared loader
-# ─────────────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=30, show_spinner=False)
-def load_data_df_all():
-    df = pd.DataFrame(retry(lambda: ws(DATA_TAB).get_all_records()))
+@st.cache_data(ttl=60)
+def modules_catalog_df() -> pd.DataFrame:
+    df = pd.DataFrame(retry(lambda: ws(MS_MODULES).get_all_records())).fillna("")
+    if not df.empty:
+        df["Module"] = df["Module"].astype(str).str.strip()
+        df["SheetName"] = df["SheetName"].astype(str).str.strip()
+        df["DefaultEnabled"] = df["DefaultEnabled"].astype(str).str.upper().isin(["TRUE","1","YES"])
+        df["DupKeys"] = df.get("DupKeys","").astype(str)
+        df["NumericFieldsJSON"] = df.get("NumericFieldsJSON","[]").astype(str)
     return df
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Intake Form
-# ─────────────────────────────────────────────────────────────────────────────
-def reset_form():
-    defaults = {
-        "employee_name": "",
-        "submission_date": date.today(),
-        "submission_mode": "",
-        "pharmacy_display": "",
-        "portal": "",
-        "erx_number": "",
-        "insurance_display": "",
-        "member_id": "",
-        "eid": "",
-        "claim_id": "",
-        "approval_code": "",
-        "net_amount": 0.0,
-        "patient_share": 0.0,
-        "status": "",
-        "remark": "",
-        "allow_dup_override": False,
-    }
-    for k,v in defaults.items(): st.session_state.setdefault(k, v)
+@st.cache_data(ttl=60)
+def client_modules_df() -> pd.DataFrame:
+    df = pd.DataFrame(retry(lambda: ws(MS_CLIENT_MODULES).get_all_records())).fillna("")
+    if not df.empty:
+        df["ClientID"] = df["ClientID"].astype(str).str.strip()
+        df["Module"] = df["Module"].astype(str).str.strip()
+        df["Enabled"] = df["Enabled"].astype(str).str.upper().isin(["TRUE","1","YES"])
+    return df
 
-if page == "Intake Form":
-    st.subheader("New Submission")
+def modules_enabled_for(client_id: str, role: str) -> list[tuple[str,str]]:
+    cat = modules_catalog_df()
+    if cat.empty: return []
+    if str(role).strip().lower() in ("super admin","superadmin"):
+        return [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") for _, r in cat.iterrows()]
+    cm = client_modules_df()
+    if cm.empty:
+        return [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") 
+                for _, r in cat[cat["DefaultEnabled"]].iterrows()]
+    allowed = set(cm[(cm["ClientID"]==client_id) & (cm["Enabled"])]["Module"].tolist())
+    df = cat[cat["Module"].isin(allowed)]
+    return [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") for _, r in df.iterrows()]
 
-    submission_modes = safe_list(MS_SUBMISSION_MODE, ["Walk-in","Phone","Email","Portal"])
-    portals          = safe_list(MS_PORTAL, ["DHPO","Riayati","Insurance Portal"])
-    statuses         = safe_list(MS_STATUS, ["Submitted","Approved","Rejected","Pending","RA Pending"])
-    pharm_df         = pharm_master()
-    ins_df           = insurance_master()
+@st.cache_data(ttl=60)
+def schema_df() -> pd.DataFrame:
+    df = pd.DataFrame(retry(lambda: ws(MS_FORM_SCHEMA).get_all_records())).fillna("")
+    if not df.empty:
+        df["ClientID"] = df["ClientID"].astype(str).str.strip()
+        df["Module"] = df["Module"].astype(str).str.strip()
+        df["FieldKey"] = df["FieldKey"].astype(str).str.strip()
+        df["Label"] = df["Label"].astype(str)
+        df["Type"] = df["Type"].astype(str).str.lower().str.strip()
+        df["Required"] = df["Required"].astype(str).str.upper().isin(["TRUE","1","YES"])
+        df["RoleVisibility"] = df["RoleVisibility"].astype(str)
+        df["Order"] = pd.to_numeric(df["Order"], errors="coerce").fillna(9999).astype(int)
+        df["SaveTo"] = df["SaveTo"].astype(str).str.strip()
+        df["Options"] = df["Options"].astype(str)
+        df["Default"] = df["Default"].astype(str)
+    return df
 
-    # limit selectable pharmacies to user's allowed list
-    if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"]:
-        pharm_df = pharm_df[pharm_df["ID"].isin(ALLOWED_PHARM_IDS)]
-    pharm_choices = pharm_df["Display"].tolist() if not pharm_df.empty else ["—"]
-
-    if st.session_state.get("_clear_form", False):
-        for k in list(st.session_state.keys()):
-            if k in ("employee_name","submission_date","submission_mode","pharmacy_display","portal","erx_number",
-                     "insurance_display","member_id","eid","claim_id","approval_code","net_amount","patient_share",
-                     "status","remark","allow_dup_override"):
-                del st.session_state[k]
-        reset_form(); st.session_state["_clear_form"]=False
-    reset_form()
-
-    with st.form("intake_form", clear_on_submit=False):
-        c1, c2, c3 = st.columns(3, gap="large")
-        with c1:
-            st.text_input("Employee Name*", key="employee_name")
-            st.date_input("Submission Date*", value=st.session_state["submission_date"], key="submission_date")
-            st.selectbox("Submission Mode*", submission_modes, key="submission_mode")
-        with c2:
-            st.selectbox("Pharmacy (ID - Name)*", pharm_choices, key="pharmacy_display")
-            st.selectbox("Portal* (DHPO / Riayati / Insurance Portal)", portals, key="portal")
-            st.text_input("ERX Number*", key="erx_number")
-        with c3:
-            st.selectbox("Insurance (Code - Name)*", ins_df["Display"].tolist() if not ins_df.empty else ["—"], key="insurance_display")
-            st.text_input("Member ID*", key="member_id")
-            st.text_input("EID*", key="eid")
-
-        st.text_input("Claim ID*", key="claim_id")
-        st.text_input("Approval Code*", key="approval_code")
-
-        d1, d2, d3 = st.columns(3, gap="large")
-        with d1:
-            st.number_input("Net Amount*", min_value=0.0, step=0.01, format="%.2f", key="net_amount")
-        with d2:
-            st.number_input("Patient Share*", min_value=0.0, step=0.01, format="%.2f", key="patient_share")
-        with d3:
-            st.selectbox("Status*", statuses, key="status")
-
-        st.text_area("Remark (optional)", key="remark")
-        st.checkbox("Allow duplicate override", key="allow_dup_override")
-
-        submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
-
-    if submitted:
-        required = {
-            "Employee Name": st.session_state.employee_name,
-            "Submission Date": st.session_state.submission_date,
-            "Pharmacy": st.session_state.pharmacy_display,
-            "Submission Mode": st.session_state.submission_mode,
-            "Portal": st.session_state.portal,
-            "ERX Number": st.session_state.erx_number,
-            "Insurance": st.session_state.insurance_display,
-            "Member ID": st.session_state.member_id,
-            "EID": st.session_state.eid,
-            "Claim ID": st.session_state.claim_id,
-            "Approval Code": st.session_state.approval_code,
-            "Net Amount": st.session_state.net_amount,
-            "Patient Share": st.session_state.patient_share,
-            "Status": st.session_state.status,
-        }
-        missing = [k for k,v in required.items() if (isinstance(v,str) and not v.strip()) or v is None]
-        if missing: st.error("Missing required fields: " + ", ".join(missing))
-        else:
-            # parse pharmacy
-            ph_id, ph_name = "", ""
-            if " - " in st.session_state.pharmacy_display:
-                ph_id, ph_name = st.session_state.pharmacy_display.split(" - ", 1)
-                ph_id, ph_name = ph_id.strip(), ph_name.strip()
-            # ensure user can submit only for allowed pharmacies
-            if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"] and ph_id not in ALLOWED_PHARM_IDS:
-                st.error("You are not allowed to submit for this pharmacy."); st.stop()
-
-            # parse insurance
-            ins_code, ins_name = "", ""
-            if " - " in st.session_state.insurance_display:
-                ins_code, ins_name = st.session_state.insurance_display.split(" - ", 1)
-                ins_code, ins_name = ins_code.strip(), ins_name.strip()
-            else:
-                ins_name = st.session_state.insurance_display
-
-            is_dup, _ = is_potential_duplicate(st.session_state.erx_number, st.session_state.net_amount, st.session_state.submission_date)
-            if is_dup and not st.session_state.allow_dup_override:
-                st.warning("Possible duplicate for today (ERX + Net). Tick override to proceed."); st.stop()
-
-            record = [
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                username or name,
-                ROLE,
-                ph_id, ph_name,
-                st.session_state.employee_name.strip(),
-                st.session_state.submission_date.strftime("%Y-%m-%d"),
-                st.session_state.submission_mode,
-                st.session_state.portal,
-                st.session_state.erx_number.strip(),
-                ins_code, ins_name,
-                st.session_state.member_id.strip(),
-                st.session_state.eid.strip(),
-                st.session_state.claim_id.strip(),
-                st.session_state.approval_code.strip(),
-                f"{float(st.session_state.net_amount):.2f}",
-                f"{float(st.session_state.patient_share):.2f}",
-                st.session_state.remark.strip(),
-                st.session_state.status
-            ]
-
-            try:
-                retry(lambda: ws(DATA_TAB).append_row(record, value_input_option="USER_ENTERED"))
-                st.toast("Saved ✔️")
-                pharm_master.clear(); insurance_master.clear(); load_data_df_all.clear(); light_duplicate_snapshot.clear()
-                st.session_state["_clear_form"]=True; st.rerun()
-            except gspread.exceptions.APIError as e:
-                st.error(f"Google Sheets error while saving: {e}")
-            except Exception as e:
-                st.error(f"Unexpected error while saving: {e}")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# View / Export (Admin + Super Admin)
-# ─────────────────────────────────────────────────────────────────────────────
-if page == "View / Export":
-    if ROLE not in ("Super Admin","Admin"): st.stop()
-
-    st.subheader("Search, Filter & Export")
-    if st.button("🔄 Refresh data"):
-        load_data_df_all.clear(); st.rerun()
-
-    df = load_data_df_all()
-    if df.empty: st.info("No records yet."); st.stop()
-
-    # Filter to allowed pharmacies
-    if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"]:
-        df = df[df['PharmacyID'].astype(str).str.strip().isin(ALLOWED_PHARM_IDS)]
-    if df.empty:
-        st.warning("No data for your permitted pharmacies."); st.stop()
-
-    # Filter UI
-    pharm_df = pharm_master()
-    if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"]:
-        pharm_df = pharm_df[pharm_df["ID"].isin(ALLOWED_PHARM_IDS)]
-    pharm_options = pharm_df["Name"].tolist()
-
-    f1, f2, f3 = st.columns(3)
-    with f1:
-        sel_pharm = st.multiselect("Pharmacy", sorted(pharm_options))
-        sel_status = st.multiselect("Status", sorted(df['Status'].dropna().unique().tolist()))
-    with f2:
-        sel_portal = st.multiselect("Portal", sorted(df['Portal'].dropna().unique().tolist()))
-        search_ins = st.text_input("Contains Insurance Name/Code")
-    with f3:
-        d_from = st.date_input("From Date", value=None)
-        d_to   = st.date_input("To Date", value=None)
-
-    # Apply filters
-    if sel_pharm:
-        df = df[df['PharmacyName'].isin(sel_pharm)]
-    if sel_status: df = df[df['Status'].isin(sel_status)]
-    if sel_portal: df = df[df['Portal'].isin(sel_portal)]
-    if search_ins:
-        mask = df['InsuranceName'].astype(str).str.contains(search_ins, case=False, na=False) | \
-               df['InsuranceCode'].astype(str).str.contains(search_ins, case=False, na=False)
-        df = df[mask]
-    if d_from: df = df[pd.to_datetime(df['SubmissionDate'], errors="coerce") >= pd.to_datetime(d_from)]
-    if d_to:   df = df[pd.to_datetime(df['SubmissionDate'], errors="coerce") <= pd.to_datetime(d_to)]
-
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-    # Download
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w: df.to_excel(w, index=False, sheet_name="Data")
-    st.download_button("⬇️ Download Excel", data=buf.getvalue(),
-        file_name=f"RCM_Intake_Export_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Email / WhatsApp (Admin + Super Admin)
-# ─────────────────────────────────────────────────────────────────────────────
-def whatsapp_cfg_ok():
-    w = st.secrets.get("whatsapp", {}); m = st.secrets.get("whatsapp_management", {})
-    return bool(w.get("phone_number_id") and w.get("access_token") and m.get("recipients"))
-
-def upload_media_to_whatsapp(file_bytes: bytes, filename: str, mime: str = "text/csv") -> str:
-    wa = st.secrets["whatsapp"]; url = f"https://graph.facebook.com/v20.0/{wa['phone_number_id']}/media"
-    headers = {"Authorization": f"Bearer {wa['access_token']}"}
-    files = {"file": (filename, file_bytes, mime), "type": (None, mime)}
-    r = requests.post(url, headers=headers, files=files, timeout=60); r.raise_for_status()
-    return r.json().get("id")
-
-def send_document_to_numbers(media_id: str, filename: str, note_text: str):
-    wa = st.secrets["whatsapp"]; mgmt = st.secrets["whatsapp_management"]
-    recipients = [x.strip() for x in mgmt["recipients"].split(",") if x.strip()]
-    url = f"https://graph.facebook.com/v20.0/{wa['phone_number_id']}/messages"
-    headers = {"Authorization": f"Bearer {wa['access_token']}", "Content-Type": "application/json"}
-    for num in recipients:
-        try:
-            requests.post(url, headers=headers, json={"messaging_product":"whatsapp","to":num,"type":"text",
-                        "text":{"preview_url":False,"body":note_text}}, timeout=30).raise_for_status()
-        except Exception: pass
-        r2 = requests.post(url, headers=headers, json={"messaging_product":"whatsapp","to":num,"type":"document",
-                        "document":{"id":media_id,"filename":filename}}, timeout=60)
-        r2.raise_for_status()
-
-@st.cache_resource(show_spinner=False)
-def get_drive_service():
+def _options_from_token(token: str) -> list[str]:
+    token = (token or "").strip()
+    if not token: return []
+    if token.startswith("MS:"):
+        key = token.split(":",1)[1].strip().lower()
+        if key == "insurance":
+            df = insurance_master()
+            return df["Display"].tolist() if not df.empty else []
+        if key == "status":
+            return safe_list(MS_STATUS, [])
+        if key == "portal":
+            return safe_list(MS_PORTAL, [])
+        if key == "submissionmode":
+            return safe_list(MS_SUBMISSION_MODE, [])
+        return []
+    if token.startswith("L:"):
+        return [x.strip() for x in token[2:].split("|") if x.strip()]
     try:
-        from googleapiclient.discovery import build
-        from google.oauth2.service_account import Credentials as GCreds
+        arr = json.loads(token)
+        if isinstance(arr, list): return [str(x) for x in arr]
     except Exception:
-        st.warning("Install 'google-api-python-client' to enable Drive upload."); raise
-    gs_info = dict(GS); gs_info["private_key"] = gs_info.get("private_key","").replace("\\n","\n")
-    scopes = ["https://www.googleapis.com/auth/drive","https://www.googleapis.com/auth/drive.file"]
-    creds = GCreds.from_service_account_info(gs_info, scopes=scopes); return build("drive","v3",credentials=creds)
+        pass
+    return []
 
-def drive_upload_and_share(file_bytes: bytes, filename: str, mime: str) -> dict:
-    from googleapiclient.http import MediaIoBaseUpload
-    service = get_drive_service()
-    folder_id = st.secrets.get("drive", {}).get("reports_folder_id", "").strip()
-    meta = {"name": filename}; 
-    if folder_id: meta["parents"]=[folder_id]
-    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime, resumable=False)
-    file = service.files().create(body=meta, media_body=media, fields="id, webViewLink, webContentLink").execute()
-    fid = file["id"]; service.permissions().create(fileId=fid, body={"type":"anyone","role":"reader"}).execute()
-    return service.files().get(fileId=fid, fields="id, webViewLink, webContentLink").execute()
+def _role_visible(rolespec: str, role: str) -> bool:
+    rs = (rolespec or "").strip()
+    if not rs or rs.lower() == "all": return True
+    allowed = [x.strip().lower() for x in rs.split("|") if x.strip()]
+    return str(role).strip().lower() in allowed
 
-def wa_link(phone_e164: str, text: str) -> str:
-    return f"https://wa.me/{phone_e164}?text={quote_plus(text)}"
+def _dup_key_string(dup_keys: list[str], data_map: dict) -> str:
+    parts = []
+    for k in dup_keys:
+        k = k.strip()
+        parts.append(f"{k}={str(data_map.get(k,''))}")
+    return "|".join(parts)
 
-if page == "Email / WhatsApp":
-    if ROLE not in ("Super Admin","Admin"): st.stop()
+def _check_duplicate_if_needed(sheet_name: str, module_name: str, data_map: dict) -> bool:
+    """Return True if duplicate found based on Modules!DupKeys"""
+    cat = modules_catalog_df()
+    row = cat[cat["Module"]==module_name]
+    if row.empty: return False
+    raw_keys = (row.iloc[0].get("DupKeys") or "").strip()
+    if not raw_keys:
+        return False
+    dup_keys = [k.strip() for k in raw_keys.split("|") if k.strip()]
+    if not dup_keys:
+        return False
+    try:
+        df = pd.DataFrame(retry(lambda: ws(sheet_name).get_all_records()))
+        if df.empty: return False
+        # Normalize types to string compare
+        for c in dup_keys:
+            if c not in df.columns: 
+                return False  # key missing in sheet -> cannot compare
+        # Filter to same pharmacy if available
+        if "PharmacyID" in df.columns and "PharmacyID" in data_map:
+            df = df[df["PharmacyID"].astype(str).str.strip() == str(data_map["PharmacyID"]).strip()]
+        # If SubmissionDate key part exists, coerce date both sides
+        if "SubmissionDate" in dup_keys and "SubmissionDate" in df.columns and "SubmissionDate" in data_map:
+            try:
+                target_date = pd.to_datetime(str(data_map["SubmissionDate"]), errors="coerce").date()
+                df["_SD"] = pd.to_datetime(df["SubmissionDate"], errors="coerce").dt.date
+                df = df[df["_SD"] == target_date]
+            except Exception:
+                pass
+        # Now compare all dup_keys equality
+        mask = pd.Series([True]*len(df))
+        for k in dup_keys:
+            sv = str(data_map.get(k,"")).strip()
+            mask = mask & (df.get(k,"").astype(str).str.strip() == sv)
+        return bool(df[mask].shape[0] > 0)
+    except Exception:
+        return False
 
-    st.subheader("Send Report")
-    df_all = load_data_df_all()
-    if df_all.empty: st.info("No records to send."); st.stop()
+def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role: str):
+    sdf = schema_df()
+    rows = sdf[(sdf["Module"]==module_name) & (sdf["ClientID"]==client_id)]
+    if rows.empty:
+        rows = sdf[(sdf["Module"]==module_name) & (sdf["ClientID"]=="DEFAULT")]
+    rows = rows.sort_values("Order")
 
-    # limit to allowed pharmacies
-    if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"]:
-        df_all = df_all[df_all['PharmacyID'].astype(str).str.strip().isin(ALLOWED_PHARM_IDS)]
+    if rows.empty:
+        st.info("No schema configured for this module.")
+        return
 
-    # pick pharmacies
-    pharm_df = pharm_master()
-    if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"]:
-        pharm_df = pharm_df[pharm_df["ID"].isin(ALLOWED_PHARM_IDS)]
-    sel_pharms = st.multiselect("Pharmacies", sorted(pharm_df["Name"].tolist()), default=sorted(pharm_df["Name"].tolist()))
-    df = df_all[df_all["PharmacyName"].isin(sel_pharms)]
-
-    c1, c2 = st.columns(2)
-    with c1: r_from = st.date_input("From Date", value=None)
-    with c2: r_to   = st.date_input("To Date", value=None)
-    if r_from: df = df[pd.to_datetime(df['SubmissionDate'], errors="coerce") >= pd.to_datetime(r_from)]
-    if r_to:   df = df[pd.to_datetime(df['SubmissionDate'], errors="coerce") <= pd.to_datetime(r_to)]
-
-    st.success(f"Filtered rows: {len(df)}") if not df.empty else st.warning("No data for selected filters.")
-
-    xbytes = io.BytesIO()
-    with pd.ExcelWriter(xbytes, engine="openpyxl") as w: df.to_excel(w, index=False, sheet_name="Data")
-    xbytes.seek(0)
-
-    st.divider(); st.markdown("**Email options**")
-    to_emails = st.text_input("To (comma-separated)")
-    cc_emails = st.text_input("CC (comma-separated)")
-    subject = st.text_input("Subject", value="RCM Intake Report")
-    body = st.text_area("Body", value="Please find the attached report.")
-
-    def send_email_with_attachment(to_list, cc_list, subject, body, attachment_bytes, filename):
-        host = SMTP.get("host"); port = int(SMTP.get("port", 587))
-        user = SMTP.get("user"); pwd = SMTP.get("password"); sender = SMTP.get("from_email", user)
-        if not all([host,user,pwd,sender]): st.error("SMTP not configured."); return False
-        msg = MIMEMultipart(); msg["From"]=sender; msg["To"]=", ".join(to_list); 
-        if cc_list: msg["Cc"]=", ".join(cc_list)
-        msg["Subject"]=subject; msg.attach(MIMEText(body,"plain"))
-        part = MIMEBase("application","octet-stream"); part.set_payload(attachment_bytes); encoders.encode_base64(part)
-        part.add_header("Content-Disposition", f'attachment; filename="{filename}"'); msg.attach(part)
-        try:
-            server = smtplib.SMTP(host, port); server.starttls(); server.login(user,pwd)
-            server.sendmail(sender, to_list+cc_list, msg.as_string()); server.quit(); return True
-        except Exception as e: st.error(f"Email error: {e}"); return False
-
-    if st.button("Send Email", type="primary"):
-        if not to_emails.strip(): st.error("Enter at least one recipient")
-        else:
-            fname = f"RCM_Intake_Report_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
-            ok = send_email_with_attachment([e.strip() for e in to_emails.split(",") if e.strip()],
-                                            [e.strip() for e in cc_emails.split(",") if e.strip()],
-                                            subject, body, xbytes.getvalue(), fname)
-            if ok: st.success("Email sent ✔️")
-
-    st.divider(); st.markdown("**WhatsApp (Cloud API)**")
-    period_days_default = st.secrets.get("whatsapp_management", {}).get("default_period_days", 1)
-    days = st.number_input("Days to include (1=today)", min_value=1, max_value=90, value=int(period_days_default))
-    note = st.text_area("Message body", value=f"RCM Intake report — rows: {len(df)}.")
-    wa_ready = whatsapp_cfg_ok()
-    if st.button("Send to Management via WhatsApp", disabled=not wa_ready):
-        if not wa_ready: st.error("WhatsApp Cloud not configured.")
-        else:
-            df_all["SubmissionDate_dt"] = pd.to_datetime(df_all.get("SubmissionDate"), errors="coerce").dt.date
-            start_date = (date.today() - timedelta(days=int(days)-1))
-            df_send = df_all[df_all["SubmissionDate_dt"].between(start_date, date.today())].drop(columns=["SubmissionDate_dt"])
-            if df_send.empty: st.warning("No rows in selected period.")
-            else:
-                csv_bytes = df_send.to_csv(index=False).encode("utf-8")
-                fname = st.secrets.get("whatsapp_management", {}).get("document_filename","RCM_Intake_Report.csv")
-                try:
-                    media_id = upload_media_to_whatsapp(csv_bytes, fname, "text/csv")
-                    send_document_to_numbers(media_id, fname, note)
-                    st.success("Report sent on WhatsApp ✔️")
-                except Exception as e:
-                    st.error(f"WhatsApp send failed: {e}")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Masters Admin (Admin + Super Admin)
-# ─────────────────────────────────────────────────────────────────────────────
-if page == "Masters Admin":
-    if ROLE not in ("Super Admin","Admin"): st.stop()
-    st.subheader("Masters Admin")
-
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Submission Modes","Portals","Status","Pharmacies","Utilities"])
-
-    def simple_list_editor(title):
-        st.markdown(f"**{title}**")
-        vals = _list_from_sheet(title) or []
-        st.write(f"Current: {', '.join(vals) if vals else '(empty)'}")
-        new_val = st.text_input(f"Add to {title}", key=f"add_{title}")
-        if st.button(f"Add", key=f"btn_{title}"):
-            if new_val.strip():
-                retry(lambda: ws(title).append_row([new_val.strip()]))
-                _list_from_sheet.clear(); st.success("Added")
-
-    with tab1: simple_list_editor(MS_SUBMISSION_MODE)
-    with tab2: simple_list_editor(MS_PORTAL)
-    with tab3: simple_list_editor(MS_STATUS)
-
-    with tab4:
-        st.markdown("**Pharmacies**")
-        ph_df = pharm_master()
-        st.dataframe(ph_df, use_container_width=True, hide_index=True)
-        c1, c2 = st.columns(2)
-        with c1: pid = st.text_input("ID", key="ph_id")
-        with c2: pname = st.text_input("Name", key="ph_name")
-        if st.button("Add Pharmacy", key="ph_add"):
-            if pid.strip() and pname.strip():
-                retry(lambda: ws(MS_PHARM).append_row([pid.strip(), pname.strip()], value_input_option="USER_ENTERED"))
-                pharm_master.clear(); st.success("Pharmacy added")
-
-    with tab5:
-        st.caption("Password Hash Helper (bcrypt)")
-        plain = st.text_input("Plain password", type="password", key="util_pwd")
-        if plain:
-            st.code(stauth.Hasher([plain]).generate()[0], language="text")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Bulk Import Insurance (Admin + Super Admin)
-# ─────────────────────────────────────────────────────────────────────────────
-if page == "Bulk Import Insurance":
-    if ROLE not in ("Super Admin","Admin"): st.stop()
-    st.subheader("Bulk Import Insurance (CSV/XLSX with columns: Code, Name)")
-    uploaded = st.file_uploader("Upload file", type=["csv","xlsx"])
-    if uploaded:
-        try:
-            idf = pd.read_csv(uploaded) if uploaded.name.lower().endswith(".csv") else pd.read_excel(uploaded)
-            idf.columns = idf.columns.str.strip()
-            if not {"Code","Name"}.issubset(idf.columns):
-                st.error("File must contain columns: Code, Name")
-            else:
-                st.dataframe(idf, use_container_width=True, hide_index=True)
-                if st.button("Replace Insurance master", type="primary"):
-                    wsx = ws(MS_INSURANCE); retry(lambda: wsx.clear()); retry(lambda: wsx.update("A1", [["Code","Name"]]))
-                    if not idf.empty: retry(lambda: wsx.update("A2", idf[["Code","Name"]].astype(str).values.tolist()))
-                    insurance_master.clear(); st.success("Insurance master updated")
-        except Exception as e:
-            st.error(f"Import error: {e}")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Summary (ALL ROLES) — Pharmacy-based, subtotals & grand total
-# ─────────────────────────────────────────────────────────────────────────────
-def _make_summary_pivot(df: pd.DataFrame,
-                        date_from: date|None = None,
-                        date_to: date|None = None,
-                        sel_pharmacies: list[str] | None = None,
-                        insurance_query: str | None = None) -> pd.DataFrame:
-    if df.empty: return pd.DataFrame()
-
-    # Restrict to allowed pharmacies
-    if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"]:
-        df = df[df["PharmacyID"].astype(str).str.strip().isin(ALLOWED_PHARM_IDS)]
-
-    # Coerce
-    df = df.copy()
-    df["SubmissionDate"] = pd.to_datetime(df["SubmissionDate"], errors="coerce").dt.date
-    df["NetAmount"]      = pd.to_numeric(df["NetAmount"], errors="coerce").fillna(0.0)
-    df["PharmacyName"]   = df["PharmacyName"].replace("", pd.NA).fillna("Unknown")
-    df["SubmissionMode"] = df["SubmissionMode"].replace("", pd.NA).fillna("Unknown")
-    df["InsuranceName"]  = df.get("InsuranceName","")
-    df["InsuranceCode"]  = df.get("InsuranceCode","")
-
-    # Filters
-    if date_from: df = df[df["SubmissionDate"] >= date_from]
-    if date_to:   df = df[df["SubmissionDate"] <= date_to]
-    if sel_pharmacies: df = df[df["PharmacyName"].isin(sel_pharmacies)]
-    if insurance_query:
-        q = str(insurance_query).strip()
-        if q:
-            df = df[
-                df["InsuranceName"].astype(str).str.contains(q, case=False, na=False) |
-                df["InsuranceCode"].astype(str).str.contains(q, case=False, na=False)
-            ]
-
-    if df.empty: return pd.DataFrame()
-
-    # Base pivot
-    base = pd.pivot_table(
-        df,
-        index=["SubmissionMode","SubmissionDate"],
-        columns="PharmacyName",
-        values="NetAmount",
-        aggfunc="sum",
-        fill_value=0.0
-    ).sort_index(level=[0,1])
-    base = base.reindex(sorted(base.columns, key=lambda x: str(x)), axis=1)
-
-    # Per-mode subtotal (first row) + dates
-    blocks = []
-    for mode, chunk in base.groupby(level=0, sort=False):
-        subtotal = pd.DataFrame([chunk.sum(numeric_only=True)])
-        subtotal.index = pd.MultiIndex.from_tuples([(mode, "— Total —")], names=base.index.names)
-        blocks.append(pd.concat([subtotal, chunk]))
-    combined = pd.concat(blocks)
-
-    # Grand total row
-    grand = pd.DataFrame([base.sum(numeric_only=True)])
-    grand.index = pd.MultiIndex.from_tuples([("Grand Total","")], names=base.index.names)
-    combined = pd.concat([combined, grand])
-
-    combined = combined.reset_index()
-    num_cols = [c for c in combined.columns if c not in ("SubmissionMode","SubmissionDate")]
-    combined[num_cols] = combined[num_cols].round(2)
-    return combined
-
-if page == "Summary":
-    st.subheader("Summary (Submission Mode → Date × Pharmacy)")
-
-    if st.button("🔄 Refresh summary"):
-        load_data_df_all.clear(); st.rerun()
-
-    raw = load_data_df_all()
-    if raw.empty:
-        st.info("No data to summarize yet.")
-    else:
-        # Pharmacy options (respect ACL)
+    with st.form(f"dyn_form_{module_name}", clear_on_submit=False):
         pharm_df = pharm_master()
         if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"]:
             pharm_df = pharm_df[pharm_df["ID"].isin(ALLOWED_PHARM_IDS)]
-        pharm_options = sorted(pharm_df["Name"].dropna().unique().tolist())
+        pharm_choices = pharm_df["Display"].tolist() if not pharm_df.empty else ["—"]
+        sel_ph = st.selectbox("Pharmacy (ID - Name)*", pharm_choices, key=f"{module_name}_pharmacy_display")
+
+        values = {}
+        for _, r in rows.iterrows():
+            if not _role_visible(r["RoleVisibility"], role):
+                continue
+            fkey = r["FieldKey"]; label = r["Label"]; typ = r["Type"]
+            required = bool(r["Required"]); default = r["Default"]; opts = _options_from_token(r["Options"])
+            k = f"{module_name}_{fkey}"
+
+            if typ == "text":
+                values[fkey] = st.text_input(label + ("*" if required else ""), value=default, key=k)
+            elif typ == "textarea":
+                values[fkey] = st.text_area(label + ("*" if required else ""), value=default, key=k)
+            elif typ == "number":
+                try: dv = float(default) if default not in ("", None) else 0.0
+                except Exception: dv = 0.0
+                values[fkey] = st.number_input(label + ("*" if required else ""), value=float(dv), step=0.01, format="%.2f", key=k)
+            elif typ == "date":
+                try: d = pd.to_datetime(default).date() if default else date.today()
+                except Exception: d = date.today()
+                values[fkey] = st.date_input(label + ("*" if required else ""), value=d, key=k)
+            elif typ == "select":
+                if not opts: opts = ["—"]
+                values[fkey] = st.selectbox(label + ("*" if required else ""), options=opts, key=k)
+            elif typ == "multiselect":
+                values[fkey] = st.multiselect(label + ("*" if required else ""), options=opts, key=k)
+            elif typ == "checkbox":
+                values[fkey] = st.checkbox(label, value=str(default).strip().lower() in ("true","1","yes"), key=k)
+            else:
+                values[fkey] = st.text_input(label + ("*" if required else ""), value=default, key=k)
+
+        submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
+
+    if not submitted:
+        return
+
+    # Required validation
+    missing = []
+    for _, r in rows.iterrows():
+        if not _role_visible(r["RoleVisibility"], role): 
+            continue
+        if bool(r["Required"]):
+            val = values.get(r["FieldKey"])
+            if (isinstance(val, str) and not val.strip()) or val is None or (isinstance(val, list) and not val):
+                missing.append(r["Label"])
+    if missing:
+        st.error("Missing required fields: " + ", ".join(missing))
+        return
+
+    # Pharmacy parse + ACL
+    ph_id, ph_name = "", ""
+    ph_disp = st.session_state.get(f"{module_name}_pharmacy_display","")
+    if " - " in ph_disp:
+        ph_id, ph_name = [x.strip() for x in ph_disp.split(" - ",1)]
+    if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"] and ph_id not in ALLOWED_PHARM_IDS:
+        st.error("You are not allowed to submit for this pharmacy."); return
+
+    # Ensure headers (meta + SaveTo)
+    meta = ["Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module"]
+    save_map = {r["FieldKey"]: (r["SaveTo"] or r["FieldKey"]) for _, r in rows.iterrows() if _role_visible(r["RoleVisibility"], role)}
+    target_headers = meta + list(dict.fromkeys(save_map.values()))
+    wsx = ws(sheet_name)
+    head = retry(lambda: wsx.row_values(1))
+    if [h.lower() for h in head] != [h.lower() for h in target_headers]:
+        existing = [h for h in head if h]
+        merged = list(dict.fromkeys((existing or []) + target_headers))
+        retry(lambda: wsx.update("A1", [merged]))
+        target_headers = merged
+
+    # Build data row & map (also needed for duplicate check)
+    data_map = {
+        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "SubmittedBy": username or name,
+        "Role": ROLE,
+        "ClientID": CLIENT_ID,
+        "PharmacyID": ph_id,
+        "PharmacyName": ph_name,
+        "Module": module_name,
+    }
+    for fk, col in save_map.items():
+        val = values.get(fk)
+        if isinstance(val, (date, datetime)): val = pd.to_datetime(val).strftime("%Y-%m-%d")
+        if isinstance(val, list): val = ", ".join([str(x) for x in val])
+        if isinstance(val, float):
+            try: val = f"{float(val):.2f}"
+            except: pass
+        data_map[col] = "" if val is None else str(val)
+
+    # Duplicate check (optional based on Modules!DupKeys)
+    try:
+        if _check_duplicate_if_needed(sheet_name, module_name, data_map):
+            st.warning("This looks like a duplicate entry for this module (based on configured duplicate keys). If you still need to save, ask Super Admin to relax DupKeys in Modules sheet.")
+            return
+    except Exception as e:
+        st.info(f"Duplicate check skipped: {e}")
+
+    row = [data_map.get(h, "") for h in target_headers]
+    try:
+        retry(lambda: wsx.append_row(row, value_input_option="USER_ENTERED"))
+        st.success("Saved ✔️")
+    except Exception as e:
+        st.error(f"Save failed: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Navigation (dynamic modules + static pages)
+# ─────────────────────────────────────────────────────────────────────────────
+STATIC_PAGES = ["View / Export", "Email / WhatsApp", "Masters Admin", "Bulk Import Insurance", "Summary"]
+
+def nav_pages_for(role: str):
+    module_pairs = modules_enabled_for(CLIENT_ID, role)  # [(Module, SheetName)]
+    if role.strip().lower() in ("super admin","superadmin"):
+        return module_pairs, STATIC_PAGES
+    if role.strip().lower() == "admin":
+        return module_pairs, ["View / Export","Summary"]
+    return module_pairs, ["Summary"]
+
+module_pairs, static_pages = nav_pages_for(ROLE)
+
+st.sidebar.markdown("### Modules")
+module_choice = None
+if module_pairs:
+    module_choice = st.sidebar.radio("Dynamic Modules", [m for (m, _) in module_pairs], index=0)
+
+st.sidebar.markdown("---")
+static_choice = st.sidebar.radio("Other Pages", static_pages, index=0 if not module_pairs else None)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared helpers for data loading by module sheet
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=45, show_spinner=False)
+def load_module_df(sheet_name: str) -> pd.DataFrame:
+    df = pd.DataFrame(retry(lambda: ws(sheet_name).get_all_records()))
+    return df
+
+def _apply_common_filters(df: pd.DataFrame):
+    if df.empty: return df
+    # Restrict to allowed pharmacies
+    if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"] and "PharmacyID" in df.columns:
+        df = df[df['PharmacyID'].astype(str).str.strip().isin(ALLOWED_PHARM_IDS)]
+    return df
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Render dynamic module or static pages
+# ─────────────────────────────────────────────────────────────────────────────
+if module_choice:
+    sheet_name = dict(module_pairs).get(module_choice)
+    st.subheader(f"{module_choice} — Dynamic Intake")
+    _render_dynamic_form(module_choice, sheet_name, CLIENT_ID, ROLE)
+
+else:
+    page = static_choice or "Summary"
+
+    # View / Export
+    if page == "View / Export":
+        if ROLE not in ("Super Admin","Admin"): st.stop()
+        st.subheader("Search, Filter & Export")
+        # Choose module/sheet
+        cat = modules_catalog_df()
+        choices = [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") for _, r in cat.iterrows()]
+        mod_names = [m for m,_ in choices]
+        sel_mod = st.selectbox("Module", mod_names)
+        sheet_name = dict(choices)[sel_mod]
+
+        if st.button("🔄 Refresh"):
+            load_module_df.clear(); pharm_master.clear(); insurance_master.clear(); schema_df.clear(); modules_catalog_df.clear()
+            st.rerun()
+
+        df = load_module_df(sheet_name)
+        df = _apply_common_filters(df)
+        if df.empty: st.info("No records yet."); st.stop()
+
+        # Filter UIs (best-effort: render only if columns exist)
+        fcols = st.columns(3)
+        with fcols[0]:
+            ph_opts = sorted(df.get("PharmacyName", pd.Series([], dtype=str)).dropna().unique().tolist())
+            sel_pharm = st.multiselect("Pharmacy", ph_opts)
+            sel_status = st.multiselect("Status", sorted(df.get('Status', pd.Series([], dtype=str)).dropna().unique().tolist()))
+        with fcols[1]:
+            sel_portal = st.multiselect("Portal", sorted(df.get('Portal', pd.Series([], dtype=str)).dropna().unique().tolist()))
+            search_ins = st.text_input("Contains Insurance Name/Code")
+        with fcols[2]:
+            d_from = st.date_input("From Date", value=None)
+            d_to   = st.date_input("To Date", value=None)
+
+        def _dt(s): return pd.to_datetime(s, errors="coerce")
+        if sel_pharm and "PharmacyName" in df: df = df[df['PharmacyName'].isin(sel_pharm)]
+        if sel_status and "Status" in df: df = df[df['Status'].isin(sel_status)]
+        if sel_portal and "Portal" in df: df = df[df['Portal'].isin(sel_portal)]
+        if search_ins and {"InsuranceName","InsuranceCode"}.issubset(df.columns):
+            mask = df['InsuranceName'].astype(str).str.contains(search_ins, case=False, na=False) | \
+                   df['InsuranceCode'].astype(str).str.contains(search_ins, case=False, na=False)
+            df = df[mask]
+        if d_from and "SubmissionDate" in df: df = df[_dt(df['SubmissionDate']) >= pd.to_datetime(d_from)]
+        if d_to and "SubmissionDate" in df:   df = df[_dt(df['SubmissionDate']) <= pd.to_datetime(d_to)]
+
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        # Download
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as w: df.to_excel(w, index=False, sheet_name=sel_mod or "Data")
+        st.download_button("⬇️ Download Excel", data=buf.getvalue(),
+            file_name=f"{sel_mod}_Export_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # Email / WhatsApp
+    elif page == "Email / WhatsApp":
+        if ROLE not in ("Super Admin","Admin"): st.stop()
+        st.subheader("Send Report")
+
+        cat = modules_catalog_df()
+        choices = [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") for _, r in cat.iterrows()]
+        mod_names = [m for m,_ in choices]
+        sel_mod = st.selectbox("Module", mod_names)
+        sheet_name = dict(choices)[sel_mod]
+
+        df_all = load_module_df(sheet_name)
+        df_all = _apply_common_filters(df_all)
+        if df_all.empty: st.info("No records to send."); st.stop()
+
+        # pick pharmacies
+        pharm_df = pharm_master()
+        if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"]:
+            pharm_df = pharm_df[pharm_df["ID"].isin(ALLOWED_PHARM_IDS)]
+        sel_pharms = st.multiselect("Pharmacies", sorted(pharm_df["Name"].tolist()),
+                                    default=sorted(pharm_df["Name"].tolist()))
+        df = df_all[df_all.get("PharmacyName","").isin(sel_pharms)] if "PharmacyName" in df_all else df_all.copy()
+
+        c1, c2 = st.columns(2)
+        with c1: r_from = st.date_input("From Date", value=None)
+        with c2: r_to   = st.date_input("To Date", value=None)
+        if "SubmissionDate" in df:
+            if r_from: df = df[pd.to_datetime(df['SubmissionDate'], errors="coerce") >= pd.to_datetime(r_from)]
+            if r_to:   df = df[pd.to_datetime(df['SubmissionDate'], errors="coerce") <= pd.to_datetime(r_to)]
+
+        st.success(f"Filtered rows: {len(df)}") if not df.empty else st.warning("No data for selected filters.")
+
+        xbytes = io.BytesIO()
+        with pd.ExcelWriter(xbytes, engine="openpyxl") as w: df.to_excel(w, index=False, sheet_name=sel_mod or "Data")
+        xbytes.seek(0)
+
+        st.divider(); st.markdown("**Email options**")
+        to_emails = st.text_input("To (comma-separated)")
+        cc_emails = st.text_input("CC (comma-separated)")
+        subject = st.text_input("Subject", value=f"{sel_mod} Report")
+        body = st.text_area("Body", value=f"Please find the attached {sel_mod} report.")
+
+        def send_email_with_attachment(to_list, cc_list, subject, body, attachment_bytes, filename):
+            host = SMTP.get("host"); port = int(SMTP.get("port", 587))
+            user = SMTP.get("user"); pwd = SMTP.get("password"); sender = SMTP.get("from_email", user)
+            if not all([host,user,pwd,sender]): st.error("SMTP not configured."); return False
+            msg = MIMEMultipart(); msg["From"]=sender; msg["To"]=", ".join(to_list); 
+            if cc_list: msg["Cc"]=", ".join(cc_list)
+            msg["Subject"]=subject; msg.attach(MIMEText(body,"plain"))
+            part = MIMEBase("application","octet-stream"); part.set_payload(attachment_bytes); encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f'attachment; filename="{filename}"'); msg.attach(part)
+            try:
+                server = smtplib.SMTP(host, port); server.starttls(); server.login(user,pwd)
+                server.sendmail(sender, to_list+cc_list, msg.as_string()); server.quit(); return True
+            except Exception as e: st.error(f"Email error: {e}"); return False
+
+        if st.button("Send Email", type="primary"):
+            if not to_emails.strip(): st.error("Enter at least one recipient")
+            else:
+                fname = f"{sel_mod}_Report_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+                ok = send_email_with_attachment([e.strip() for e in to_emails.split(",") if e.strip()],
+                                                [e.strip() for e in cc_emails.split(",") if e.strip()],
+                                                subject, body, xbytes.getvalue(), fname)
+                if ok: st.success("Email sent ✔️")
+
+        # WhatsApp (Cloud API, optional)
+        st.divider(); st.markdown("**WhatsApp (Cloud API)**")
+        def whatsapp_cfg_ok():
+            w = st.secrets.get("whatsapp", {}); m = st.secrets.get("whatsapp_management", {})
+            return bool(w.get("phone_number_id") and w.get("access_token") and m.get("recipients"))
+        def upload_media_to_whatsapp(file_bytes: bytes, filename: str, mime: str = "text/csv") -> str:
+            wa = st.secrets["whatsapp"]; url = f"https://graph.facebook.com/v20.0/{wa['phone_number_id']}/media"
+            headers = {"Authorization": f"Bearer {wa['access_token']}"}
+            files = {"file": (filename, file_bytes, mime), "type": (None, mime)}
+            r = requests.post(url, headers=headers, files=files, timeout=60); r.raise_for_status()
+            return r.json().get("id")
+        def send_document_to_numbers(media_id: str, filename: str, note_text: str):
+            wa = st.secrets["whatsapp"]; mgmt = st.secrets["whatsapp_management"]
+            recipients = [x.strip() for x in mgmt["recipients"].split(",") if x.strip()]
+            url = f"https://graph.facebook.com/v20.0/{wa['phone_number_id']}/messages"
+            headers = {"Authorization": f"Bearer {wa['access_token']}", "Content-Type": "application/json"}
+            for num in recipients:
+                try:
+                    requests.post(url, headers=headers, json={"messaging_product":"whatsapp","to":num,"type":"text",
+                                "text":{"preview_url":False,"body":note_text}}, timeout=30).raise_for_status()
+                except Exception: pass
+                r2 = requests.post(url, headers=headers, json={"messaging_product":"whatsapp","to":num,"type":"document",
+                                "document":{"id":media_id,"filename":filename}}, timeout=60)
+                r2.raise_for_status()
+
+        days = st.number_input("Days to include (1=today)", min_value=1, max_value=90,
+                               value=int(st.secrets.get("whatsapp_management", {}).get("default_period_days", 1)))
+        note = st.text_area("Message body", value=f"{sel_mod} report — rows: {len(df)}.")
+        wa_ready = whatsapp_cfg_ok()
+        if st.button("Send to Management via WhatsApp", disabled=not wa_ready):
+            if not wa_ready: st.error("WhatsApp Cloud not configured.")
+            else:
+                if "SubmissionDate" in df_all.columns:
+                    df_all["SubmissionDate_dt"] = pd.to_datetime(df_all["SubmissionDate"], errors="coerce").dt.date
+                    start_date = (date.today() - timedelta(days=int(days)-1))
+                    df_send = df_all[df_all["SubmissionDate_dt"].between(start_date, date.today())].drop(columns=["SubmissionDate_dt"])
+                else:
+                    # If module doesn't have SubmissionDate, just send the current filtered frame
+                    df_send = df.copy()
+
+                if df_send.empty:
+                    st.warning("No rows in selected period.")
+                else:
+                    csv_bytes = df_send.to_csv(index=False).encode("utf-8")
+                    fname = st.secrets.get("whatsapp_management", {}).get("document_filename", f"{sel_mod}_Report.csv")
+                    try:
+                        media_id = upload_media_to_whatsapp(csv_bytes, fname, "text/csv")
+                        send_document_to_numbers(media_id, fname, note)
+                        st.success("Report sent on WhatsApp ✔️")
+                    except Exception as e:
+                        st.error(f"WhatsApp send failed: {e}")
+
+    # Masters Admin (with config editors)
+    elif page == "Masters Admin":
+        if ROLE not in ("Super Admin","Admin"): st.stop()
+        st.subheader("Masters & Configuration")
+
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+            "Submission Modes","Portals","Status","Pharmacies",
+            "Modules","Client Modules","Form Schema"
+        ])
+
+        def simple_list_editor(title):
+            st.markdown(f"**{title}**")
+            vals = _list_from_sheet(title) or []
+            st.write(f"Current: {', '.join(vals) if vals else '(empty)'}")
+            new_val = st.text_input(f"Add to {title}", key=f"add_{title}")
+            if st.button(f"Add", key=f"btn_{title}"):
+                if new_val.strip():
+                    retry(lambda: ws(title).append_row([new_val.strip()]))
+                    _list_from_sheet.clear(); st.success("Added ✅")
+
+        with tab1: simple_list_editor(MS_SUBMISSION_MODE)
+        with tab2: simple_list_editor(MS_PORTAL)
+        with tab3: simple_list_editor(MS_STATUS)
+
+        with tab4:
+            st.markdown("**Pharmacies**")
+            ph_df = pharm_master()
+            st.dataframe(ph_df, use_container_width=True, hide_index=True)
+            c1, c2 = st.columns(2)
+            with c1: pid = st.text_input("ID", key="ph_id")
+            with c2: pname = st.text_input("Name", key="ph_name")
+            if st.button("Add Pharmacy", key="ph_add"):
+                if pid.strip() and pname.strip():
+                    retry(lambda: ws(MS_PHARM).append_row([pid.strip(), pname.strip()], value_input_option="USER_ENTERED"))
+                    pharm_master.clear(); st.success("Pharmacy added ✅")
+
+        with tab5:
+            st.markdown("**Modules Catalog**")
+            mdf = modules_catalog_df()
+            st.dataframe(mdf, use_container_width=True, hide_index=True)
+
+            mc1, mc2, mc3 = st.columns(3)
+            with mc1:
+                new_mod = st.text_input("Module name", placeholder="e.g., PriorAuth")
+                new_sheet = st.text_input("Sheet name (optional)", placeholder="Data_PriorAuth")
+            with mc2:
+                def_enabled = st.checkbox("Default Enabled", value=True)
+                dup_keys = st.text_input("Duplicate keys (pipe-separated)", placeholder="ClaimID|NetAmount|SubmissionDate")
+            with mc3:
+                numeric_json = st.text_input("Numeric fields JSON", value="[]", help='e.g., ["NetAmount","PatientShare"]')
+                if st.button("Add Module", type="primary"):
+                    if not new_mod.strip():
+                        st.error("Module name is required.")
+                    else:
+                        row = [
+                            new_mod.strip(),
+                            new_sheet.strip() or f"Data_{new_mod.strip()}",
+                            "TRUE" if def_enabled else "FALSE",
+                            dup_keys.strip(),
+                            numeric_json.strip() or "[]"
+                        ]
+                        retry(lambda: ws(MS_MODULES).append_row(row, value_input_option="USER_ENTERED"))
+                        modules_catalog_df.clear(); _ensure_module_sheets_exist(); st.success("Module added ✅")
+
+            st.divider()
+            sel_mod_to_create = st.selectbox("Create/repair data sheet for module", [""] + (mdf["Module"].tolist() if not mdf.empty else []))
+            if st.button("Create/Repair Sheet", disabled=(not sel_mod_to_create)):
+                _ensure_module_sheets_exist(); st.success("Ensured data sheet exists with meta headers ✅")
+
+            st.divider()
+            st.caption("Password Hash Helper (bcrypt)")
+            plain = st.text_input("Plain password", type="password", key="util_pwd")
+            if plain:
+                st.code(stauth.Hasher([plain]).generate()[0], language="text")
+
+        with tab6:
+            st.markdown("**Client Modules**")
+            cm = client_modules_df()
+            st.dataframe(cm, use_container_width=True, hide_index=True)
+            c1, c2, c3 = st.columns(3)
+            with c1: cm_client = st.text_input("ClientID", value=CLIENT_ID if ROLE!="Super Admin" else "")
+            with c2:
+                cat = modules_catalog_df()
+                cm_mod = st.selectbox("Module", cat["Module"].tolist() if not cat.empty else [])
+            with c3:
+                cm_enabled = st.checkbox("Enabled", value=True)
+                if st.button("Add/Enable for Client", type="primary"):
+                    if not cm_client.strip() or not cm_mod.strip():
+                        st.error("ClientID and Module are required.")
+                    else:
+                        retry(lambda: ws(MS_CLIENT_MODULES).append_row([cm_client.strip(), cm_mod.strip(), "TRUE" if cm_enabled else "FALSE"]))
+                        client_modules_df.clear(); st.success("Client module updated ✅")
+
+        with tab7:
+            st.markdown("**Form Schema (Per Client + Module)**")
+            sdf = schema_df()
+            cat = modules_catalog_df()
+            mod_sel = st.selectbox("Module", cat["Module"].tolist() if not cat.empty else [])
+            cids = sorted(set(["DEFAULT"] + sdf["ClientID"].dropna().astype(str).unique().tolist()))
+            cid_sel = st.selectbox("ClientID", cids, index=(cids.index(CLIENT_ID) if CLIENT_ID in cids else 0))
+            view = sdf[(sdf["Module"]==mod_sel) & (sdf["ClientID"]==cid_sel)]
+            if view.empty:
+                st.info("No schema rows yet for this selection (runtime will fall back to DEFAULT).")
+            else:
+                st.dataframe(view.sort_values("Order"), use_container_width=True, hide_index=True)
+
+            st.divider()
+            st.markdown("**Add Schema Row**")
+            sc1, sc2, sc3 = st.columns(3)
+            with sc1:
+                fk = st.text_input("FieldKey", placeholder="e.g., erx_number")
+                lbl = st.text_input("Label", placeholder="ERX Number")
+                typ = st.selectbox("Type", ["text","textarea","number","date","select","multiselect","checkbox"])
+            with sc2:
+                req = st.checkbox("Required", value=True)
+                opts = st.text_input("Options", placeholder="MS:Insurance or L:Opt1|Opt2 or JSON []")
+                default = st.text_input("Default", placeholder="")
+            with sc3:
+                vis = st.text_input("RoleVisibility", value="All", help="All or pipe: User|Admin|Super Admin")
+                order = st.number_input("Order", value=100, min_value=1, step=1)
+                saveto = st.text_input("SaveTo", placeholder="Column header to save as")
+                if st.button("Add Row", type="primary"):
+                    if not (fk.strip() and lbl.strip() and mod_sel.strip() and cid_sel.strip()):
+                        st.error("ClientID, Module, FieldKey, Label are required.")
+                    else:
+                        row = [cid_sel.strip(), mod_sel.strip(), fk.strip(), lbl.strip(), typ.strip(),
+                               "TRUE" if req else "FALSE", opts.strip(), default.strip(), vis.strip(), int(order), saveto.strip() or fk.strip()]
+                        retry(lambda: ws(MS_FORM_SCHEMA).append_row(row, value_input_option="USER_ENTERED"))
+                        schema_df.clear(); st.success("Schema row added ✅")
+
+            st.divider()
+            st.markdown("**Delete Schema Row (by FieldKey)**")
+            del_fk = st.text_input("FieldKey to delete")
+            if st.button("Delete Rows for selection"):
+                if not (del_fk.strip() and mod_sel.strip() and cid_sel.strip()):
+                    st.error("Provide FieldKey, Module, ClientID.")
+                else:
+                    vals = retry(lambda: ws(MS_FORM_SCHEMA).get_all_values())
+                    if not vals:
+                        st.warning("FormSchema sheet is empty.")
+                    else:
+                        header = vals[0]; rows = vals[1:]
+                        df_all = pd.DataFrame(rows, columns=header)
+                        mask = ~((df_all["ClientID"].astype(str)==cid_sel) &
+                                 (df_all["Module"].astype(str)==mod_sel) &
+                                 (df_all["FieldKey"].astype(str)==del_fk))
+                        new_df = df_all[mask]
+                        w = ws(MS_FORM_SCHEMA); retry(lambda: w.clear())
+                        retry(lambda: w.update("A1", [header]))
+                        if not new_df.empty:
+                            retry(lambda: w.update("A2", new_df.values.tolist()))
+                        schema_df.clear()
+                        st.success("Deleted (if existed) ✅")
+
+    # Bulk Import Insurance
+    elif page == "Bulk Import Insurance":
+        if ROLE not in ("Super Admin","Admin"): st.stop()
+        st.subheader("Bulk Import Insurance (CSV/XLSX with columns: Code, Name)")
+        uploaded = st.file_uploader("Upload file", type=["csv","xlsx"])
+        if uploaded:
+            try:
+                idf = pd.read_csv(uploaded) if uploaded.name.lower().endswith(".csv") else pd.read_excel(uploaded)
+                idf.columns = idf.columns.str.strip()
+                if not {"Code","Name"}.issubset(idf.columns):
+                    st.error("File must contain columns: Code, Name")
+                else:
+                    st.dataframe(idf, use_container_width=True, hide_index=True)
+                    if st.button("Replace Insurance master", type="primary"):
+                        wsx = ws(MS_INSURANCE); retry(lambda: wsx.clear()); retry(lambda: wsx.update("A1", [["Code","Name"]]))
+                        if not idf.empty: retry(lambda: wsx.update("A2", idf[["Code","Name"]].astype(str).values.tolist()))
+                        insurance_master.clear(); st.success("Insurance master updated ✅")
+            except Exception as e:
+                st.error(f"Import error: {e}")
+
+    # Summary (per module; selectable numeric field)
+    elif page == "Summary":
+        st.subheader("Summary (SubmissionMode → Date × Pharmacy)")
+
+        cat = modules_catalog_df()
+        if cat.empty:
+            st.info("No modules defined yet."); st.stop()
+
+        choices = [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") for _, r in cat.iterrows()]
+        mod_names = [m for m,_ in choices]
+        sel_mod = st.selectbox("Module", mod_names)
+        sheet_name = dict(choices)[sel_mod]
+
+        raw = load_module_df(sheet_name)
+        raw = _apply_common_filters(raw)
+        if raw.empty:
+            st.info("No data to summarize yet."); st.stop()
+
+        # Choose numeric field to sum
+        numeric_candidates = []
+        try:
+            val = cat[cat["Module"]==sel_mod]["NumericFieldsJSON"].tolist()[0]
+            arr = json.loads(val) if isinstance(val, str) else []
+            numeric_candidates.extend([a for a in arr if a in raw.columns])
+        except Exception:
+            pass
+        for c in raw.columns:
+            if c.lower() in ("netamount","patientshare") and c not in numeric_candidates:
+                numeric_candidates.append(c)
+        if not numeric_candidates:
+            # Try to guess numeric columns
+            for c in raw.columns:
+                try:
+                    pd.to_numeric(raw[c], errors="raise"); numeric_candidates.append(c)
+                except Exception:
+                    continue
+            numeric_candidates = numeric_candidates[:10]
+
+        measure = st.selectbox("Value to sum", options=numeric_candidates or raw.columns.tolist(), index=0)
+
+        # Filters
+        pharm_df_local = pharm_master()
+        if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"]:
+            pharm_df_local = pharm_df_local[pharm_df_local["ID"].isin(ALLOWED_PHARM_IDS)]
+        pharm_options = sorted(pharm_df_local["Name"].dropna().unique().tolist())
 
         c1, c2, c3 = st.columns(3)
         with c1: date_from = st.date_input("From date", value=None)
@@ -859,21 +1063,77 @@ if page == "Summary":
         with c3: insurance_q = st.text_input("Insurance filter (name/code contains)")
         sel_pharm = st.multiselect("Pharmacy name", pharm_options)
 
-        pvt = _make_summary_pivot(
-            raw,
-            date_from=date_from or None,
-            date_to=date_to or None,
-            sel_pharmacies=sel_pharm or None,
-            insurance_query=insurance_q or None,
-        )
+        df = raw.copy()
+        if "SubmissionDate" in df:
+            df["SubmissionDate"] = pd.to_datetime(df["SubmissionDate"], errors="coerce").dt.date
+        if measure in df:
+            df[measure] = pd.to_numeric(df[measure], errors="coerce").fillna(0.0)
+        df["PharmacyName"]   = df.get("PharmacyName","").replace("", pd.NA).fillna("Unknown")
+        df["SubmissionMode"] = df.get("SubmissionMode","").replace("", pd.NA).fillna("Unknown")
+        df["InsuranceName"]  = df.get("InsuranceName","")
+        df["InsuranceCode"]  = df.get("InsuranceCode","")
 
-        st.caption("Rows: **Submission Mode → (— Total — then dates)**. Columns: **Pharmacy Name**. Values: **Sum of NetAmount**. Grand Total at bottom.")
-        if pvt.empty:
-            st.warning("No rows match the selected filters.")
+        if date_from and "SubmissionDate" in df: df = df[df["SubmissionDate"] >= date_from]
+        if date_to and "SubmissionDate" in df:   df = df[df["SubmissionDate"] <= date_to]
+        if sel_pharm: df = df[df["PharmacyName"].isin(sel_pharm)]
+        if insurance_q:
+            q = str(insurance_q).strip()
+            if q and {"InsuranceName","InsuranceCode"}.issubset(df.columns):
+                df = df[
+                    df["InsuranceName"].astype(str).str.contains(q, case=False, na=False) |
+                    df["InsuranceCode"].astype(str).str.contains(q, case=False, na=False)
+                ]
+        if df.empty:
+            st.warning("No rows match the selected filters."); st.stop()
+
+        # Pivot
+        if not {"SubmissionMode","PharmacyName"}.issubset(df.columns):
+            st.warning("Required columns not present for this module."); st.stop()
+
+        idx_levels = ["SubmissionMode"]
+        if "SubmissionDate" in df:
+            idx_levels.append("SubmissionDate")
+
+        base = pd.pivot_table(
+            df,
+            index=idx_levels,
+            columns="PharmacyName",
+            values=measure,
+            aggfunc="sum",
+            fill_value=0.0
+        ).sort_index()
+
+        base = base.reindex(sorted(base.columns, key=lambda x: str(x)), axis=1)
+
+        # Per-mode subtotal + dates, then grand total
+        def _as_df(x): return x if isinstance(x, pd.DataFrame) else pd.DataFrame(x)
+        blocks = []
+        for mode, chunk in base.groupby(level=0, sort=False):
+            subtotal = _as_df(chunk.sum(numeric_only=True))
+            if len(idx_levels) == 2:
+                subtotal = pd.DataFrame([subtotal.iloc[0]])
+                subtotal.index = pd.MultiIndex.from_tuples([(mode, "— Total —")], names=base.index.names)
+            else:
+                subtotal.index = pd.MultiIndex.from_tuples([(mode, )], names=base.index.names)
+            blocks.append(pd.concat([subtotal, chunk]))
+        combined = pd.concat(blocks)
+
+        grand = pd.DataFrame([base.sum(numeric_only=True)])
+        if len(idx_levels)==2:
+            grand.index = pd.MultiIndex.from_tuples([("Grand Total","")], names=base.index.names)
         else:
-            st.dataframe(pvt, use_container_width=True)
-            out = io.BytesIO()
-            with pd.ExcelWriter(out, engine="openpyxl") as xw: pvt.to_excel(xw, sheet_name="Summary", index=False)
-            st.download_button("⬇️ Download Summary (Excel)", data=out.getvalue(),
-                               file_name=f"RCM_Intake_Summary_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            grand.index = pd.MultiIndex.from_tuples([("Grand Total",)], names=base.index.names)
+        combined = pd.concat([combined, grand])
+
+        combined = combined.reset_index()
+        num_cols = [c for c in combined.columns if c not in ("SubmissionMode","SubmissionDate")]
+        combined[num_cols] = combined[num_cols].round(2)
+
+        st.caption("Rows: **Submission Mode → (— Total — then dates if available)**. Columns: **Pharmacy Name**. Values: **Sum of selected measure**. Grand Total at bottom.")
+        st.dataframe(combined, use_container_width=True)
+
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine="openpyxl") as xw: combined.to_excel(xw, sheet_name="Summary", index=False)
+        st.download_button("⬇️ Download Summary (Excel)", data=out.getvalue(),
+                           file_name=f"{sel_mod}_Summary_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
