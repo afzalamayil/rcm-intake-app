@@ -1044,296 +1044,311 @@ else:
 
     # Masters Admin
     elif page == "Masters Admin":
-    if ROLE not in ("Super Admin","Admin"): st.stop()
-    st.subheader("Masters & Configuration")
+        if ROLE not in ("Super Admin","Admin"):
+            st.stop()
+        st.subheader("Masters & Configuration")
 
-    tab1, tab2, tab3, tab4, tabD, tab5, tab6, tab7, tabU, tabUM = st.tabs([
-        "Submission Modes","Portals","Status","Pharmacies","Doctors",
-        "Modules","Client Modules","Form Schema","Users","User Modules"
-    ])
+        tab1, tab2, tab3, tab4, tabD, tab5, tab6, tab7, tabU, tabUM = st.tabs([
+            "Submission Modes","Portals","Status","Pharmacies","Doctors",
+            "Modules","Client Modules","Form Schema","Users","User Modules"
+        ])
 
-    def simple_list_editor(title):
-        st.markdown(f"**{title}**")
-        vals = _list_from_sheet(title) or []
-        st.write(f"Current: {', '.join(vals) if vals else '(empty)'}")
-        new_val = st.text_input(f"Add to {title}", key=f"add_{title}")
-        if st.button(f"Add", key=f"btn_{title}"):
-            if new_val.strip():
-                retry(lambda: ws(title).append_row([new_val.strip()]))
-                _list_from_sheet.clear(); st.success("Added ✅")
+        def simple_list_editor(title):
+            st.markdown(f"**{title}**")
+            vals = _list_from_sheet(title) or []
+            st.write(f"Current: {', '.join(vals) if vals else '(empty)'}")
+            new_val = st.text_input(f"Add to {title}", key=f"add_{title}")
+            if st.button("Add", key=f"btn_{title}"):
+                if new_val.strip():
+                    retry(lambda: ws(title).append_row([new_val.strip()]))
+                    _list_from_sheet.clear()
+                    st.success("Added ✅")
 
-    with tab1: simple_list_editor(MS_SUBMISSION_MODE)
-    with tab2: simple_list_editor(MS_PORTAL)
-    with tab3: simple_list_editor(MS_STATUS)
-with tab4:
-    st.markdown("**Pharmacies**")
-    ph_df = pharm_master()
-    st.dataframe(ph_df, use_container_width=True, hide_index=True)
-    c1, c2 = st.columns(2)
-    with c1: pid = st.text_input("ID", key="ph_id")
-    with c2: pname = st.text_input("Name", key="ph_name")
-    if st.button("Add Pharmacy", key="ph_add"):
-        if pid.strip() and pname.strip():
-            retry(lambda: ws(MS_PHARM).append_row([pid.strip(), pname.strip()], value_input_option="USER_ENTERED"))
-            pharm_master.clear(); st.success("Pharmacy added ✅")
+        with tab1:
+            simple_list_editor(MS_SUBMISSION_MODE)
+        with tab2:
+            simple_list_editor(MS_PORTAL)
+        with tab3:
+            simple_list_editor(MS_STATUS)
 
-with tabD:
-    st.markdown("**Doctors (Client-Scoped)**")
-    ddf_all = doctors_master(client_id=None)
-    st.dataframe(ddf_all, use_container_width=True, hide_index=True)
+        with tab4:
+            st.markdown("**Pharmacies**")
+            ph_df = pharm_master()
+            st.dataframe(ph_df, use_container_width=True, hide_index=True)
+            c1, c2 = st.columns(2)
+            with c1:
+                pid = st.text_input("ID", key="ph_id")
+            with c2:
+                pname = st.text_input("Name", key="ph_name")
+            if st.button("Add Pharmacy", key="ph_add"):
+                if pid.strip() and pname.strip():
+                    retry(lambda: ws(MS_PHARM).append_row([pid.strip(), pname.strip()], value_input_option="USER_ENTERED"))
+                    pharm_master.clear()
+                    st.success("Pharmacy added ✅")
 
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        did = st.text_input("DoctorID", placeholder="e.g., D001")
-    with c2:
-        dname = st.text_input("Doctor Name", placeholder="Dr. Ahmed Ali")
-    with c3:
-        dspec = st.text_input("Specialty", placeholder="Pediatrics")
-    with c4:
-        dclient = st.text_input("ClientID", value=CLIENT_ID, key="doc_client_id")
+        with tabD:
+            st.markdown("**Doctors (Client-Scoped)**")
+            ddf_all = doctors_master(client_id=None)
+            st.dataframe(ddf_all, use_container_width=True, hide_index=True)
 
-    if st.button("Add Doctor", key="doc_add"):
-        if did.strip() and dname.strip() and dclient.strip():
-            retry(lambda: ws(MS_DOCTORS).append_row(
-                [did.strip(), dname.strip(), dspec.strip(), dclient.strip()],
-                value_input_option="USER_ENTERED"
-            ))
-            doctors_master.clear()
-            st.success("Doctor added ✅")
-        else:
-            st.error("DoctorID, Doctor Name and ClientID are required.")
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                did = st.text_input("DoctorID", placeholder="e.g., D001")
+            with c2:
+                dname = st.text_input("Doctor Name", placeholder="Dr. Ahmed Ali")
+            with c3:
+                dspec = st.text_input("Specialty", placeholder="Pediatrics")
+            with c4:
+                dclient = st.text_input("ClientID", value=CLIENT_ID, key="doc_client_id")
 
-with tabU:
-    st.markdown("**Users**")
-    udf = _safe_users_df()
-    st.dataframe(udf, use_container_width=True, hide_index=True)
+            if st.button("Add Doctor", key="doc_add"):
+                if did.strip() and dname.strip() and dclient.strip():
+                    retry(lambda: ws(MS_DOCTORS).append_row(
+                        [did.strip(), dname.strip(), dspec.strip(), dclient.strip()],
+                        value_input_option="USER_ENTERED"
+                    ))
+                    doctors_master.clear()
+                    st.success("Doctor added ✅")
+                else:
+                    st.error("DoctorID, Doctor Name and ClientID are required.")
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        u_username = st.text_input("Username (email)")
-    with c2:
-        u_name = st.text_input("Display Name")
-    with c3:
-        u_role = st.selectbox("Role", ["User","Admin","Super Admin"])
+        with tabU:
+            st.markdown("**Users**")
+            udf = _safe_users_df()
+            st.dataframe(udf, use_container_width=True, hide_index=True)
 
-    c4, c5, c6 = st.columns(3)
-    with c4:
-        u_client = st.text_input("ClientID", value=CLIENT_ID, key="users_client_id")
-    with c5:
-        u_pharms = st.text_input("Pharmacy IDs (comma-separated)", placeholder="ALL or e.g. P001,P002")
-    with c6:
-        u_pwd = st.text_input("Password (plain)", type="password")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                u_username = st.text_input("Username (email)")
+            with c2:
+                u_name = st.text_input("Display Name")
+            with c3:
+                u_role = st.selectbox("Role", ["User","Admin","Super Admin"])
 
-    if st.button("Add / Update User", type="primary"):
-        if not (u_username.strip() and u_name.strip() and u_role.strip()):
-            st.error("Username, Name, Role are required.")
-        else:
-            hashed = stauth.Hasher([u_pwd]).generate()[0] if u_pwd else ""
-            vals   = retry(lambda: ws(USERS_TAB).get_all_values()) or [REQUIRED_HEADERS[USERS_TAB]]
-            header = vals[0]; rows = vals[1:]
-            dfu = pd.DataFrame(rows, columns=header) if rows else pd.DataFrame(columns=header)
-            mask = dfu["username"].astype(str).str.lower() == u_username.strip().lower()
-            if mask.any():
-                idx = dfu.index[mask][0]
-                if hashed: dfu.at[idx,"password"] = hashed
-                dfu.at[idx,"name"]       = u_name.strip()
-                dfu.at[idx,"role"]       = u_role.strip()
-                dfu.at[idx,"pharmacies"] = (u_pharms.strip() or "ALL")
-                dfu.at[idx,"client_id"]  = (u_client.strip() or "DEFAULT")
-            else:
-                dfu.loc[len(dfu)] = {
-                    "username": u_username.strip(),
-                    "name": u_name.strip(),
-                    "password": hashed or "",
-                    "role": u_role.strip(),
-                    "pharmacies": (u_pharms.strip() or "ALL"),
-                    "client_id": (u_client.strip() or "DEFAULT"),
-                }
-            w = ws(USERS_TAB)
-            retry(lambda: w.clear())
-            retry(lambda: w.update("A1", [REQUIRED_HEADERS[USERS_TAB]]))
-            if not dfu.empty:
-                retry(lambda: w.update("A2", dfu[REQUIRED_HEADERS[USERS_TAB]].astype(str).values.tolist()))
-            # refresh cache (no 'global' needed at module level)
-            USERS_DF = load_users_df()
-            st.success("User saved ✅")
+            c4, c5, c6 = st.columns(3)
+            with c4:
+                u_client = st.text_input("ClientID", value=CLIENT_ID, key="users_client_id")
+            with c5:
+                u_pharms = st.text_input("Pharmacy IDs (comma-separated)", placeholder="ALL or e.g. P001,P002")
+            with c6:
+                u_pwd = st.text_input("Password (plain)", type="password")
 
-with tabUM:
-    st.markdown("**User Modules (Per-User Visibility Override)**")
-    all_mods = modules_catalog_df()["Module"].tolist()
-    udf = _safe_users_df()
-    user_choices = udf["username"].tolist() if not udf.empty else []
-    sel_user = st.selectbox("Username", user_choices)
+            if st.button("Add / Update User", type="primary"):
+                if not (u_username.strip() and u_name.strip() and u_role.strip()):
+                    st.error("Username, Name, Role are required.")
+                else:
+                    hashed = stauth.Hasher([u_pwd]).generate()[0] if u_pwd else ""
+                    vals   = retry(lambda: ws(USERS_TAB).get_all_values()) or [REQUIRED_HEADERS[USERS_TAB]]
+                    header = vals[0]; rows = vals[1:]
+                    dfu = pd.DataFrame(rows, columns=header) if rows else pd.DataFrame(columns=header)
+                    mask = dfu["username"].astype(str).str.lower() == u_username.strip().lower()
+                    if mask.any():
+                        idx = dfu.index[mask][0]
+                        if hashed:
+                            dfu.at[idx,"password"] = hashed
+                        dfu.at[idx,"name"]       = u_name.strip()
+                        dfu.at[idx,"role"]       = u_role.strip()
+                        dfu.at[idx,"pharmacies"] = (u_pharms.strip() or "ALL")
+                        dfu.at[idx,"client_id"]  = (u_client.strip() or "DEFAULT")
+                    else:
+                        dfu.loc[len(dfu)] = {
+                            "username": u_username.strip(),
+                            "name": u_name.strip(),
+                            "password": hashed or "",
+                            "role": u_role.strip(),
+                            "pharmacies": (u_pharms.strip() or "ALL"),
+                            "client_id": (u_client.strip() or "DEFAULT"),
+                        }
+                    w = ws(USERS_TAB)
+                    retry(lambda: w.clear())
+                    retry(lambda: w.update("A1", [REQUIRED_HEADERS[USERS_TAB]]))
+                    if not dfu.empty:
+                        retry(lambda: w.update("A2", dfu[REQUIRED_HEADERS[USERS_TAB]].astype(str).values.tolist()))
+                    # refresh cache
+                    USERS_DF = load_users_df()
+                    st.success("User saved ✅")
+                    # st.rerun()  # optional refresh
 
-    if sel_user:
-        um = user_modules_df()
-        current = sorted(um[(um["Username"].str.lower()==sel_user.lower()) & (um["Enabled"])]["Module"].tolist())
-        pick = st.multiselect("Modules visible to this user", options=all_mods, default=current)
+        with tabUM:
+            st.markdown("**User Modules (Per-User Visibility Override)**")
+            all_mods = modules_catalog_df()["Module"].tolist()
+            udf = _safe_users_df()
+            user_choices = udf["username"].tolist() if not udf.empty else []
+            sel_user = st.selectbox("Username", user_choices)
 
-        st.caption("Tip: leaving this user with **no rows** here means they inherit the Client Modules setting.")
-        if st.button("Save User Modules", type="primary"):
-            vals = retry(lambda: ws(MS_USER_MODULES).get_all_values()) or [REQUIRED_HEADERS[MS_USER_MODULES]]
-            header = vals[0]; rows = vals[1:]
-            dfum = pd.DataFrame(rows, columns=header) if rows else pd.DataFrame(columns=header)
-            dfum = dfum[dfum["Username"].str.lower() != sel_user.lower()]
-            for m in pick:
-                dfum.loc[len(dfum)] = {"Username": sel_user, "Module": m, "Enabled": "TRUE"}
-            w = ws(MS_USER_MODULES)
-            retry(lambda: w.clear())
-            retry(lambda: w.update("A1", [REQUIRED_HEADERS[MS_USER_MODULES]]))
-            if not dfum.empty:
-                retry(lambda: w.update("A2", dfum[REQUIRED_HEADERS[MS_USER_MODULES]].astype(str).values.tolist()))
-            user_modules_df.clear()
-            st.success("User Modules saved ✅")
+            if sel_user:
+                um = user_modules_df()
+                current = sorted(um[(um["Username"].str.lower()==sel_user.lower()) & (um["Enabled"])]["Module"].tolist())
+                pick = st.multiselect("Modules visible to this user", options=all_mods, default=current)
 
-with tab5:
-    # Modules Catalog (unchanged from your version)
-    st.markdown("**Modules Catalog**")
-    mdf = modules_catalog_df()
-    st.dataframe(mdf, use_container_width=True, hide_index=True)
-    mc1, mc2, mc3 = st.columns(3)
-    with mc1:
-        new_mod = st.text_input("Module name", placeholder="e.g., Radiology")
-        new_sheet = st.text_input("Sheet name (optional)", placeholder="Data_Radiology")
-    with mc2:
-        def_enabled = st.checkbox("Default Enabled", value=True)
-        dup_keys = st.text_input("Duplicate keys (pipe-separated)", placeholder="ClaimID|NetAmount|SubmissionDate")
-    with mc3:
-        numeric_json = st.text_input("Numeric fields JSON", value="[]", help='e.g., ["NetAmount","PatientShare"]')
-        if st.button("Add Module", type="primary"):
-            if not new_mod.strip():
-                st.error("Module name is required.")
-            else:
-                row = [
-                    new_mod.strip(),
-                    new_sheet.strip() or f"Data_{new_mod.strip()}",
-                    "TRUE" if def_enabled else "FALSE",
-                    dup_keys.strip(),
-                    numeric_json.strip() or "[]"
-                ]
-                retry(lambda: ws(MS_MODULES).append_row(row, value_input_option="USER_ENTERED"))
+                st.caption("Tip: leaving this user with **no rows** here means they inherit the Client Modules setting.")
+                if st.button("Save User Modules", type="primary"):
+                    vals = retry(lambda: ws(MS_USER_MODULES).get_all_values()) or [REQUIRED_HEADERS[MS_USER_MODULES]]
+                    header = vals[0]; rows = vals[1:]
+                    dfum = pd.DataFrame(rows, columns=header) if rows else pd.DataFrame(columns=header)
+                    dfum = dfum[dfum["Username"].str.lower() != sel_user.lower()]
+                    for m in pick:
+                        dfum.loc[len(dfum)] = {"Username": sel_user, "Module": m, "Enabled": "TRUE"}
+                    w = ws(MS_USER_MODULES)
+                    retry(lambda: w.clear())
+                    retry(lambda: w.update("A1", [REQUIRED_HEADERS[MS_USER_MODULES]]))
+                    if not dfum.empty:
+                        retry(lambda: w.update("A2", dfum[REQUIRED_HEADERS[MS_USER_MODULES]].astype(str).values.tolist()))
+                    user_modules_df.clear()
+                    st.success("User Modules saved ✅")
+
+        with tab5:
+            st.markdown("**Modules Catalog**")
+            mdf = modules_catalog_df()
+            st.dataframe(mdf, use_container_width=True, hide_index=True)
+            mc1, mc2, mc3 = st.columns(3)
+            with mc1:
+                new_mod = st.text_input("Module name", placeholder="e.g., Radiology")
+                new_sheet = st.text_input("Sheet name (optional)", placeholder="Data_Radiology")
+            with mc2:
+                def_enabled = st.checkbox("Default Enabled", value=True)
+                dup_keys = st.text_input("Duplicate keys (pipe-separated)", placeholder="ClaimID|NetAmount|SubmissionDate")
+            with mc3:
+                numeric_json = st.text_input("Numeric fields JSON", value="[]", help='e.g., ["NetAmount","PatientShare"]')
+                if st.button("Add Module", type="primary"):
+                    if not new_mod.strip():
+                        st.error("Module name is required.")
+                    else:
+                        row = [
+                            new_mod.strip(),
+                            new_sheet.strip() or f"Data_{new_mod.strip()}",
+                            "TRUE" if def_enabled else "FALSE",
+                            dup_keys.strip(),
+                            numeric_json.strip() or "[]"
+                        ]
+                        retry(lambda: ws(MS_MODULES).append_row(row, value_input_option="USER_ENTERED"))
+                        _ensure_module_sheets_exist()
+                        try:
+                            seed_form_schema_for_module(new_mod.strip(), client_id="DEFAULT")
+                        except Exception as e:
+                            st.warning(f"FormSchema auto-seed skipped: {e}")
+                        try:
+                            if ROLE in ("Super Admin","Admin"):
+                                retry(lambda: ws(MS_CLIENT_MODULES).append_row(
+                                    [CLIENT_ID, new_mod.strip(), "TRUE"], value_input_option="USER_ENTERED"))
+                                client_modules_df.clear()
+                        except Exception as e:
+                            st.warning(f"Auto-enable for client skipped: {e}")
+                        modules_catalog_df.clear()
+                        st.success("Module added and initialized ✅")
+
+            st.divider()
+            sel_mod_to_create = st.selectbox(
+                "Create/repair data sheet for module",
+                [""] + (mdf["Module"].tolist() if not mdf.empty else [])
+            )
+            if st.button("Create/Repair Sheet", disabled=(not sel_mod_to_create)):
                 _ensure_module_sheets_exist()
-                try:
-                    seed_form_schema_for_module(new_mod.strip(), client_id="DEFAULT")
-                except Exception as e:
-                    st.warning(f"FormSchema auto-seed skipped: {e}")
-                try:
-                    if ROLE in ("Super Admin","Admin"):
-                        retry(lambda: ws(MS_CLIENT_MODULES).append_row(
-                            [CLIENT_ID, new_mod.strip(), "TRUE"], value_input_option="USER_ENTERED"))
-                        client_modules_df.clear()
-                except Exception as e:
-                    st.warning(f"Auto-enable for client skipped: {e}")
-                modules_catalog_df.clear()
-                st.success("Module added and initialized ✅")
+                st.success("Ensured data sheet exists with meta headers ✅")
 
-    st.divider()
-    sel_mod_to_create = st.selectbox(
-        "Create/repair data sheet for module",
-        [""] + (mdf["Module"].tolist() if not mdf.empty else [])
-    )
-    if st.button("Create/Repair Sheet", disabled=(not sel_mod_to_create)):
-        _ensure_module_sheets_exist(); st.success("Ensured data sheet exists with meta headers ✅")
+            st.divider()
+            st.caption("Password Hash Helper (bcrypt)")
+            plain = st.text_input("Plain password", type="password", key="util_pwd")
+            if plain:
+                st.code(stauth.Hasher([plain]).generate()[0], language="text")
 
-    st.divider()
-    st.caption("Password Hash Helper (bcrypt)")
-    plain = st.text_input("Plain password", type="password", key="util_pwd")
-    if plain:
-        st.code(stauth.Hasher([plain]).generate()[0], language="text")
+        with tab6:
+            st.markdown("**Client Modules**")
+            cm = client_modules_df()
+            st.dataframe(cm, use_container_width=True, hide_index=True)
 
-with tab6:
-    st.markdown("**Client Modules**")
-    cm = client_modules_df()
-    st.dataframe(cm, use_container_width=True, hide_index=True)
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                cm_client = st.text_input(
+                    "ClientID",
+                    value=CLIENT_ID if ROLE != "Super Admin" else "",
+                    key="cm_client_id"
+                )
+            with c2:
+                cat = modules_catalog_df()
+                cm_mod = st.selectbox("Module", cat["Module"].tolist() if not cat.empty else [])
+            with c3:
+                cm_enabled = st.checkbox("Enabled", value=True)
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        cm_client = st.text_input(
-            "ClientID",
-            value=CLIENT_ID if ROLE != "Super Admin" else "",
-            key="cm_client_id"
-        )
-    with c2:
-        cat = modules_catalog_df()
-        cm_mod = st.selectbox("Module", cat["Module"].tolist() if not cat.empty else [])
-    with c3:
-        cm_enabled = st.checkbox("Enabled", value=True)
+            if st.button("Add/Enable for Client", type="primary"):
+                if not cm_client.strip() or not cm_mod.strip():
+                    st.error("ClientID and Module are required.")
+                else:
+                    retry(lambda: ws(MS_CLIENT_MODULES).append_row(
+                        [cm_client.strip(), cm_mod.strip(), "TRUE" if cm_enabled else "FALSE"],
+                        value_input_option="USER_ENTERED"))
+                    client_modules_df.clear()
+                    st.success("Client module updated ✅")
 
-    if st.button("Add/Enable for Client", type="primary"):
-            if not cm_client.strip() or not cm_mod.strip():
-                st.error("ClientID and Module are required.")
+        with tab7:
+            st.markdown("**Form Schema (Per Client + Module)**")
+            sdf = schema_df()
+            cat = modules_catalog_df()
+            mod_sel = st.selectbox("Module", cat["Module"].tolist() if not cat.empty else [])
+            cids = sorted(set(["DEFAULT"] + sdf["ClientID"].dropna().astype(str).unique().tolist()))
+            cid_sel = st.selectbox("ClientID", cids, index=(cids.index(CLIENT_ID) if CLIENT_ID in cids else 0))
+            view = sdf[(sdf["Module"]==mod_sel) & (sdf["ClientID"]==cid_sel)]
+            if view.empty:
+                st.info("No schema rows yet for this selection (runtime falls back to DEFAULT).")
             else:
-                retry(lambda: ws(MS_CLIENT_MODULES).append_row(
-                    [cm_client.strip(), cm_mod.strip(), "TRUE" if cm_enabled else "FALSE"],
-                    value_input_option="USER_ENTERED"))
-                client_modules_df.clear(); st.success("Client module updated ✅")
+                st.dataframe(view.sort_values("Order"), use_container_width=True, hide_index=True)
 
-with tab7:
-    st.markdown("**Form Schema (Per Client + Module)**")
-    sdf = schema_df()
-    cat = modules_catalog_df()
-    mod_sel = st.selectbox("Module", cat["Module"].tolist() if not cat.empty else [])
-    cids = sorted(set(["DEFAULT"] + sdf["ClientID"].dropna().astype(str).unique().tolist()))
-    cid_sel = st.selectbox("ClientID", cids, index=(cids.index(CLIENT_ID) if CLIENT_ID in cids else 0))
-    view = sdf[(sdf["Module"]==mod_sel) & (sdf["ClientID"]==cid_sel)]
-    if view.empty:
-        st.info("No schema rows yet for this selection (runtime falls back to DEFAULT).")
-    else:
-        st.dataframe(view.sort_values("Order"), use_container_width=True, hide_index=True)
+            st.divider()
+            st.markdown("**Add Schema Row**")
+            sc1, sc2, sc3 = st.columns(3)
+            with sc1:
+                fk = st.text_input("FieldKey", placeholder="e.g., erx_number")
+                lbl = st.text_input("Label", placeholder="ERX Number")
+                typ = st.selectbox("Type", ["text","textarea","number","date","select","multiselect","checkbox"])
+            with sc2:
+                req = st.checkbox("Required", value=True)
+                opts = st.text_input("Options", placeholder="MS:Insurance or L:Opt1|Opt2 or JSON []")
+                default = st.text_input("Default", placeholder="")
+            with sc3:
+                vis = st.text_input("RoleVisibility", value="All", help="All or pipe: User|Admin|Super Admin")
+                order = st.number_input("Order", value=100, min_value=1, step=1)
+                saveto = st.text_input("SaveTo", placeholder="Column header to save as")
+                ro = st.text_input("ReadOnlyRoles", value="", help="e.g., User or User|Admin")
+                if st.button("Add Row", type="primary"):
+                    if not (fk.strip() and lbl.strip() and mod_sel.strip() and cid_sel.strip()):
+                        st.error("ClientID, Module, FieldKey, Label are required.")
+                    else:
+                        row = [cid_sel.strip(), mod_sel.strip(), fk.strip(), lbl.strip(), typ.strip(),
+                               "TRUE" if req else "FALSE", opts.strip(), default.strip(), vis.strip(), int(order),
+                               saveto.strip() or fk.strip(), ro.strip()]
+                        retry(lambda: ws(MS_FORM_SCHEMA).append_row(row, value_input_option="USER_ENTERED"))
+                        schema_df.clear()
+                        st.success("Schema row added ✅")
 
-    st.divider()
-    st.markdown("**Add Schema Row**")
-    sc1, sc2, sc3 = st.columns(3)
-    with sc1:
-        fk = st.text_input("FieldKey", placeholder="e.g., erx_number")
-        lbl = st.text_input("Label", placeholder="ERX Number")
-        typ = st.selectbox("Type", ["text","textarea","number","date","select","multiselect","checkbox"])
-    with sc2:
-        req = st.checkbox("Required", value=True)
-        opts = st.text_input("Options", placeholder="MS:Insurance or L:Opt1|Opt2 or JSON []")
-        default = st.text_input("Default", placeholder="")
-    with sc3:
-        vis = st.text_input("RoleVisibility", value="All", help="All or pipe: User|Admin|Super Admin")
-        order = st.number_input("Order", value=100, min_value=1, step=1)
-        saveto = st.text_input("SaveTo", placeholder="Column header to save as")
-        ro = st.text_input("ReadOnlyRoles", value="", help="e.g., User or User|Admin")
-        if st.button("Add Row", type="primary"):
-            if not (fk.strip() and lbl.strip() and mod_sel.strip() and cid_sel.strip()):
-                st.error("ClientID, Module, FieldKey, Label are required.")
-            else:
-                row = [cid_sel.strip(), mod_sel.strip(), fk.strip(), lbl.strip(), typ.strip(),
-                       "TRUE" if req else "FALSE", opts.strip(), default.strip(), vis.strip(), int(order),
-                       saveto.strip() or fk.strip(), ro.strip()]
-                retry(lambda: ws(MS_FORM_SCHEMA).append_row(row, value_input_option="USER_ENTERED"))
-                schema_df.clear(); st.success("Schema row added ✅")
-
-    st.divider()
-    st.markdown("**Delete Schema Row (by FieldKey)**")
-    del_fk = st.text_input("FieldKey to delete")
-    if st.button("Delete Rows for selection"):
-        if not (del_fk.strip() and mod_sel.strip() and cid_sel.strip()):
-            st.error("Provide FieldKey, Module, ClientID.")
-        else:
-            vals = retry(lambda: ws(MS_FORM_SCHEMA).get_all_values())
-            if not vals:
-                st.warning("FormSchema sheet is empty.")
-            else:
-                header = vals[0]; rows = vals[1:]
-                df_all = pd.DataFrame(rows, columns=header)
-                mask = ~((df_all["ClientID"].astype(str)==cid_sel) &
-                         (df_all["Module"].astype(str)==mod_sel) &
-                         (df_all["FieldKey"].astype(str)==del_fk))
-                new_df = df_all[mask]
-                w = ws(MS_FORM_SCHEMA); retry(lambda: w.clear())
-                retry(lambda: w.update("A1", [header]))
-                if not new_df.empty:
-                    retry(lambda: w.update("A2", new_df.values.tolist()))
-                schema_df.clear()
-                st.success("Deleted (if existed) ✅")
+            st.divider()
+            st.markdown("**Delete Schema Row (by FieldKey)**")
+            del_fk = st.text_input("FieldKey to delete")
+            if st.button("Delete Rows for selection"):
+                if not (del_fk.strip() and mod_sel.strip() and cid_sel.strip()):
+                    st.error("Provide FieldKey, Module, ClientID.")
+                else:
+                    vals = retry(lambda: ws(MS_FORM_SCHEMA).get_all_values())
+                    if not vals:
+                        st.warning("FormSchema sheet is empty.")
+                    else:
+                        header = vals[0]; rows = vals[1:]
+                        df_all = pd.DataFrame(rows, columns=header)
+                        mask = ~((df_all["ClientID"].astype(str)==cid_sel) &
+                                 (df_all["Module"].astype(str)==mod_sel) &
+                                 (df_all["FieldKey"].astype(str)==del_fk))
+                        new_df = df_all[mask]
+                        w = ws(MS_FORM_SCHEMA)
+                        retry(lambda: w.clear())
+                        retry(lambda: w.update("A1", [header]))
+                        if not new_df.empty:
+                            retry(lambda: w.update("A2", new_df.values.tolist()))
+                        schema_df.clear()
+                        st.success("Deleted (if existed) ✅")
 
     # Bulk Import Insurance
     elif page == "Bulk Import Insurance":
-        if ROLE not in ("Super Admin","Admin"): st.stop()
+        if ROLE not in ("Super Admin","Admin"):
+            st.stop()
         st.subheader("Bulk Import Insurance (CSV/XLSX with columns: Code, Name)")
         uploaded = st.file_uploader("Upload file", type=["csv","xlsx"])
         if uploaded:
@@ -1350,7 +1365,8 @@ with tab7:
                         retry(lambda: wsx.update("A1", [["Code","Name"]]))
                         if not idf.empty:
                             retry(lambda: wsx.update("A2", idf[["Code","Name"]].astype(str).values.tolist()))
-                        insurance_master.clear(); st.success("Insurance master updated ✅")
+                        insurance_master.clear()
+                        st.success("Insurance master updated ✅")
             except Exception as e:
                 st.error(f"Import error: {e}")
 
@@ -1360,7 +1376,8 @@ with tab7:
 
         cat = modules_catalog_df()
         if cat.empty:
-            st.info("No modules defined yet."); st.stop()
+            st.info("No modules defined yet.")
+            st.stop()
 
         choices = [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") for _, r in cat.iterrows()]
         mod_names = [m for m,_ in choices]
@@ -1370,7 +1387,8 @@ with tab7:
         raw = load_module_df(sheet_name)
         raw = _apply_common_filters(raw)
         if raw.empty:
-            st.info("No data to summarize yet."); st.stop()
+            st.info("No data to summarize yet.")
+            st.stop()
 
         # numeric field to sum
         numeric_candidates = []
@@ -1386,7 +1404,8 @@ with tab7:
         if not numeric_candidates:
             for c in raw.columns:
                 try:
-                    pd.to_numeric(raw[c], errors="raise"); numeric_candidates.append(c)
+                    pd.to_numeric(raw[c], errors="raise")
+                    numeric_candidates.append(c)
                 except Exception:
                     continue
             numeric_candidates = numeric_candidates[:10]
@@ -1400,9 +1419,12 @@ with tab7:
         pharm_options = sorted(pharm_df_local["Name"].dropna().unique().tolist())
 
         c1, c2, c3 = st.columns(3)
-        with c1: date_from = st.date_input("From date", value=None)
-        with c2: date_to   = st.date_input("To date", value=None)
-        with c3: insurance_q = st.text_input("Insurance filter (name/code contains)")
+        with c1:
+            date_from = st.date_input("From date", value=None)
+        with c2:
+            date_to   = st.date_input("To date", value=None)
+        with c3:
+            insurance_q = st.text_input("Insurance filter (name/code contains)")
         sel_pharm = st.multiselect("Pharmacy name", pharm_options)
 
         df = raw.copy()
@@ -1415,9 +1437,12 @@ with tab7:
         df["InsuranceName"]  = df.get("InsuranceName","")
         df["InsuranceCode"]  = df.get("InsuranceCode","")
 
-        if date_from and "SubmissionDate" in df: df = df[df["SubmissionDate"] >= date_from]
-        if date_to and "SubmissionDate" in df:   df = df[df["SubmissionDate"] <= date_to]
-        if sel_pharm: df = df[df["PharmacyName"].isin(sel_pharm)]
+        if date_from and "SubmissionDate" in df:
+            df = df[df["SubmissionDate"] >= date_from]
+        if date_to and "SubmissionDate" in df:
+            df = df[df["SubmissionDate"] <= date_to]
+        if sel_pharm:
+            df = df[df["PharmacyName"].isin(sel_pharm)]
         if insurance_q:
             q = str(insurance_q).strip()
             if q and {"InsuranceName","InsuranceCode"}.issubset(df.columns):
@@ -1426,11 +1451,13 @@ with tab7:
                     df["InsuranceCode"].astype(str).str.contains(q, case=False, na=False)
                 ]
         if df.empty:
-            st.warning("No rows match the selected filters."); st.stop()
+            st.warning("No rows match the selected filters.")
+            st.stop()
 
         # pivot
         if not {"SubmissionMode","PharmacyName"}.issubset(df.columns):
-            st.warning("Required columns not present for this module."); st.stop()
+            st.warning("Required columns not present for this module.")
+            st.stop()
 
         idx_levels = ["SubmissionMode"]
         if "SubmissionDate" in df:
@@ -1448,7 +1475,9 @@ with tab7:
         base = base.reindex(sorted(base.columns, key=lambda x: str(x)), axis=1)
 
         # subtotals + grand total
-        def _as_df(x): return x if isinstance(x, pd.DataFrame) else pd.DataFrame(x)
+        def _as_df(x): 
+            return x if isinstance(x, pd.DataFrame) else pd.DataFrame(x)
+
         blocks = []
         for mode, chunk in base.groupby(level=0, sort=False):
             subtotal = _as_df(chunk.sum(numeric_only=True))
@@ -1475,7 +1504,11 @@ with tab7:
         st.dataframe(combined, use_container_width=True)
 
         out = io.BytesIO()
-        with pd.ExcelWriter(out, engine="openpyxl") as xw: combined.to_excel(xw, sheet_name="Summary", index=False)
-        st.download_button("⬇️ Download Summary (Excel)", data=out.getvalue(),
-                           file_name=f"{sel_mod}_Summary_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        with pd.ExcelWriter(out, engine="openpyxl") as xw:
+            combined.to_excel(xw, sheet_name="Summary", index=False)
+        st.download_button(
+            "⬇️ Download Summary (Excel)",
+            data=out.getvalue(),
+            file_name=f"{sel_mod}_Summary_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
