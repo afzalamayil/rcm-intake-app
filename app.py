@@ -12,6 +12,7 @@
 # ✅ View/Export, Email/WhatsApp, Summary
 # ✅ Robust sheet readers that NEVER KeyError when sheets are empty/missing
 # ✅ Caching + retry for scale and rate-limit resilience
+# ✅ Auto-seed FormSchema when adding a module + auto-enable for clients
 # ─────────────────────────────────────────────────────────────────────────────
 
 import io
@@ -138,21 +139,18 @@ def ws(name: str):
 
 def list_titles(): return {w.title for w in retry(lambda: sh.worksheets())}
 
-# Robust reader: ALWAYS returns a DataFrame with the requested headers (even when sheet is empty)
+# Robust reader: ALWAYS returns a DataFrame with the requested headers (even when sheet is empty/missing)
 def read_sheet_df(title: str, required_headers: list[str] | None = None) -> pd.DataFrame:
     vals = retry(lambda: ws(title).get_all_values())
     if not vals:
-        # construct empty sheet if needed
         if required_headers:
             retry(lambda: ws(title).update("A1", [required_headers]))
             return pd.DataFrame(columns=required_headers)
         return pd.DataFrame()
     header = [h.strip() for h in vals[0]] if vals[0] else []
     rows = vals[1:] if len(vals) > 1 else []
-    # extend header to include any required headers
     if required_headers:
         header = list(dict.fromkeys(header + [h for h in required_headers if h not in header]))
-    # pad rows
     rows = [r + [""]*(len(header)-len(r)) for r in rows]
     df = pd.DataFrame(rows, columns=header)
     return df.fillna("")
@@ -201,7 +199,7 @@ REQUIRED_HEADERS = {
     CLIENT_CONTACTS_TAB: ["ClientID","To","CC","WhatsApp"],
     MS_MODULES: ["Module","SheetName","DefaultEnabled","DupKeys","NumericFieldsJSON"],
     MS_CLIENT_MODULES: ["ClientID","Module","Enabled"],
-    # NOTE: includes ReadOnlyRoles for role-based read-only controls
+    # includes ReadOnlyRoles for role-based read-only controls
     MS_FORM_SCHEMA: ["ClientID","Module","FieldKey","Label","Type","Required","Options","Default","RoleVisibility","Order","SaveTo","ReadOnlyRoles"],
 }
 
@@ -224,7 +222,6 @@ def ensure_tabs_and_headers():
     for tab, headers in REQUIRED_HEADERS.items():
         df = read_sheet_df(tab, headers)  # ensures header row exists
         if df.columns.tolist() != headers:
-            # merge without data loss
             merged = list(dict.fromkeys(df.columns.tolist() + [h for h in headers if h not in df.columns]))
             retry(lambda: ws(tab).update("A1", [merged]))
     # seed simple lists
@@ -307,7 +304,6 @@ def safe_list(title, fallback):
 def load_users_df():
     try:
         df = read_sheet_df(USERS_TAB, REQUIRED_HEADERS[USERS_TAB]).copy()
-        # Normalize expected columns even if missing in sheet (like client_id)
         for col in REQUIRED_HEADERS[USERS_TAB]:
             if col not in df.columns: df[col] = ""
         if not df.empty: df.columns = df.columns.str.strip().str.lower()
@@ -357,7 +353,6 @@ def get_user_role_pharms_client(u):
             pharms = [p.strip() for p in str(row.iloc[0].get('pharmacies','ALL')).split(',') if p.strip()]
             client_id = str(row.iloc[0].get('client_id','DEFAULT')).strip() or "DEFAULT"
             return role, (pharms or ["ALL"]), client_id
-    # fallback
     return "User", ["ALL"], "DEFAULT"
 
 ROLE, ALLOWED_PHARM_IDS, CLIENT_ID = get_user_role_pharms_client(username)
@@ -418,22 +413,16 @@ def modules_enabled_for(client_id: str, role: str) -> list[tuple[str,str]]:
     return [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") for _, r in df.iterrows()]
 
 @st.cache_data(ttl=60)
-@st.cache_data(ttl=60)
 def schema_df() -> pd.DataFrame:
-    # Always read with expected headers so downstream filters never KeyError
     df = read_sheet_df(MS_FORM_SCHEMA, REQUIRED_HEADERS[MS_FORM_SCHEMA]).fillna("")
-
-    # Ensure all expected columns exist even if the sheet is newly created
     for col in REQUIRED_HEADERS[MS_FORM_SCHEMA]:
         if col not in df.columns:
             df[col] = ""
-
-    # Normalize types and whitespace
     df["ClientID"]       = df["ClientID"].astype(str).str.strip()
     df["Module"]         = df["Module"].astype(str).str.strip()
     df["FieldKey"]       = df["FieldKey"].astype(str).str.strip()
     df["Label"]          = df["Label"].astype(str)
-    df["Type"]           = df["Type"].astype(str).str.lower().str.strip()   # ← fixed
+    df["Type"]           = df["Type"].astype(str).str.lower().str.strip()
     df["Required"]       = df["Required"].astype(str).str.upper().isin(["TRUE","1","YES"])
     df["RoleVisibility"] = df["RoleVisibility"].astype(str)
     df["Order"]          = pd.to_numeric(df["Order"], errors="coerce").fillna(9999).astype(int)
@@ -441,13 +430,12 @@ def schema_df() -> pd.DataFrame:
     df["Options"]        = df["Options"].astype(str)
     df["Default"]        = df["Default"].astype(str)
     df["ReadOnlyRoles"]  = df["ReadOnlyRoles"].astype(str)
-
     return df
-# Debug schema view - only superadmin sees it
-if st.session_state.get("role") == "superadmin":
-    st.subheader("🔍 Debug: FormSchema Preview")
-    df_schema = schema_df()
-    st.dataframe(df_schema.head(20))
+
+# Only Super Admin sees debug schema preview
+if str(ROLE).strip().lower() in ("super admin", "superadmin"):
+    with st.expander("🔍 Debug: FormSchema Preview (first 50 rows)"):
+        st.dataframe(schema_df().head(50), use_container_width=True, hide_index=True)
 
 def _options_from_token(token: str) -> list[str]:
     token = (token or "").strip()
@@ -505,10 +493,8 @@ def _check_duplicate_if_needed(sheet_name: str, module_name: str, data_map: dict
         if df.empty: return False
         for c in dup_keys:
             if c not in df.columns: return False
-        # filter same pharmacy if provided
         if "PharmacyID" in df.columns and "PharmacyID" in data_map:
             df = df[df["PharmacyID"].astype(str).str.strip() == str(data_map["PharmacyID"]).strip()]
-        # handle SubmissionDate equality
         if "SubmissionDate" in dup_keys and "SubmissionDate" in df.columns and "SubmissionDate" in data_map:
             try:
                 target_date = pd.to_datetime(str(data_map["SubmissionDate"]), errors="coerce").date()
@@ -523,6 +509,70 @@ def _check_duplicate_if_needed(sheet_name: str, module_name: str, data_map: dict
         return bool(df[mask].shape[0] > 0)
     except Exception:
         return False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto-seeding helper for FormSchema
+# ─────────────────────────────────────────────────────────────────────────────
+def seed_form_schema_for_module(module: str, client_id: str = "DEFAULT"):
+    """
+    Create sensible default schema rows for a module.
+    Safe to call multiple times; it skips if rows already exist for (client,module).
+    """
+    module = (module or "").strip()
+    client_id = (client_id or "DEFAULT").strip() or "DEFAULT"
+    if not module:
+        return
+
+    # Skip when already seeded
+    sdf = schema_df()
+    if not sdf[(sdf["ClientID"] == client_id) & (sdf["Module"] == module)].empty:
+        return
+
+    # Core fields shared across modules
+    base = [
+        [client_id, module, "employee_name",   "Employee Name",     "text",     "TRUE",  "", "", "All",  10, "EmployeeName",   ""],
+        [client_id, module, "submission_date", "Submission Date",   "date",     "TRUE",  "", "", "All",  20, "SubmissionDate", ""],
+        [client_id, module, "submission_mode", "Submission Mode",   "select",   "TRUE",  "MS:SubmissionMode", "", "All",  30, "SubmissionMode", ""],
+        [client_id, module, "portal",          "Portal",            "select",   "FALSE", "MS:Portal",        "", "All",  40, "Portal",         ""],
+        [client_id, module, "status",          "Status",            "select",   "TRUE",  "MS:Status",        "", "All",  50, "Status",         ""],
+        [client_id, module, "insurance",       "Insurance",         "select",   "FALSE", "MS:Insurance",     "", "All",  60, "InsuranceName",  ""],
+        [client_id, module, "remark",          "Remark",            "textarea", "FALSE", "",                 "", "All",  70, "Remark",         ""],
+    ]
+
+    pharmacy_extra = [
+        [client_id, module, "erx_number",    "ERX Number",    "text",   "TRUE",  "", "", "All", 110, "ERXNumber",    ""],
+        [client_id, module, "member_id",     "Member ID",     "text",   "TRUE",  "", "", "All", 120, "MemberID",     ""],
+        [client_id, module, "eid",           "EID",           "text",   "FALSE", "", "", "All", 130, "EID",          ""],
+        [client_id, module, "claim_id",      "Claim ID",      "text",   "FALSE", "", "", "All", 140, "ClaimID",      ""],
+        [client_id, module, "approval_code", "Approval Code", "text",   "FALSE", "", "", "All", 150, "ApprovalCode", ""],
+        [client_id, module, "net_amount",    "Net Amount",    "number", "TRUE",  "", "", "All", 160, "NetAmount",    ""],
+        [client_id, module, "patient_share", "Patient Share", "number", "FALSE", "", "", "All", 170, "PatientShare", ""],
+    ]
+
+    lab_extra = [
+        [client_id, module, "order_number", "Order Number", "text",   "TRUE",  "", "", "All", 110, "OrderNumber", ""],
+        [client_id, module, "test_name",    "Test Name",    "text",   "TRUE",  "", "", "All", 120, "TestName",    ""],
+        [client_id, module, "result_value", "Result Value", "text",   "FALSE", "", "", "All", 130, "ResultValue", ""],
+    ]
+
+    radiology_extra = [
+        [client_id, module, "order_number", "Order Number",     "text",    "TRUE",  "", "", "All", 110, "OrderNumber",     ""],
+        [client_id, module, "modality",     "Modality",         "select",  "TRUE",  "L:X-Ray|CT|MRI|Ultrasound", "", "All", 120, "Modality", ""],
+        [client_id, module, "study_desc",   "Study Description","text",    "FALSE", "", "", "All", 130, "StudyDescription", ""],
+    ]
+
+    packs = {
+        "pharmacy": base + pharmacy_extra,
+        "approvals": base,  # extend later if needed
+        "lab": base + lab_extra,
+        "radiology": base + radiology_extra,
+    }
+
+    rows = packs.get(module.lower(), base)
+    w = ws(MS_FORM_SCHEMA)
+    for r in rows:
+        retry(lambda: w.append_row(r, value_input_option="USER_ENTERED"))
+    schema_df.clear()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Form rendering
@@ -917,7 +967,6 @@ else:
         with tab1: simple_list_editor(MS_SUBMISSION_MODE)
         with tab2: simple_list_editor(MS_PORTAL)
         with tab3: simple_list_editor(MS_STATUS)
-
         with tab4:
             st.markdown("**Pharmacies**")
             ph_df = pharm_master()
@@ -937,8 +986,8 @@ else:
 
             mc1, mc2, mc3 = st.columns(3)
             with mc1:
-                new_mod = st.text_input("Module name", placeholder="e.g., PriorAuth")
-                new_sheet = st.text_input("Sheet name (optional)", placeholder="Data_PriorAuth")
+                new_mod = st.text_input("Module name", placeholder="e.g., Radiology")
+                new_sheet = st.text_input("Sheet name (optional)", placeholder="Data_Radiology")
             with mc2:
                 def_enabled = st.checkbox("Default Enabled", value=True)
                 dup_keys = st.text_input("Duplicate keys (pipe-separated)", placeholder="ClaimID|NetAmount|SubmissionDate")
@@ -956,10 +1005,29 @@ else:
                             numeric_json.strip() or "[]"
                         ]
                         retry(lambda: ws(MS_MODULES).append_row(row, value_input_option="USER_ENTERED"))
-                        modules_catalog_df.clear(); _ensure_module_sheets_exist(); st.success("Module added ✅")
+                        # Create/repair the data sheet
+                        _ensure_module_sheets_exist()
+                        # Auto-seed DEFAULT FormSchema for this module
+                        try:
+                            seed_form_schema_for_module(new_mod.strip(), client_id="DEFAULT")
+                        except Exception as e:
+                            st.warning(f"FormSchema auto-seed skipped: {e}")
+                        # Auto-enable for current client (if Admin/Super Admin)
+                        try:
+                            if ROLE in ("Super Admin","Admin"):
+                                retry(lambda: ws(MS_CLIENT_MODULES).append_row(
+                                    [CLIENT_ID, new_mod.strip(), "TRUE"], value_input_option="USER_ENTERED"))
+                                client_modules_df.clear()
+                        except Exception as e:
+                            st.warning(f"Auto-enable for client skipped: {e}")
+                        modules_catalog_df.clear()
+                        st.success("Module added and initialized ✅")
 
             st.divider()
-            sel_mod_to_create = st.selectbox("Create/repair data sheet for module", [""] + (mdf["Module"].tolist() if not mdf.empty else []))
+            sel_mod_to_create = st.selectbox(
+                "Create/repair data sheet for module",
+                [""] + (mdf["Module"].tolist() if not mdf.empty else [])
+            )
             if st.button("Create/Repair Sheet", disabled=(not sel_mod_to_create)):
                 _ensure_module_sheets_exist(); st.success("Ensured data sheet exists with meta headers ✅")
 
@@ -984,7 +1052,9 @@ else:
                     if not cm_client.strip() or not cm_mod.strip():
                         st.error("ClientID and Module are required.")
                     else:
-                        retry(lambda: ws(MS_CLIENT_MODULES).append_row([cm_client.strip(), cm_mod.strip(), "TRUE" if cm_enabled else "FALSE"]))
+                        retry(lambda: ws(MS_CLIENT_MODULES).append_row(
+                            [cm_client.strip(), cm_mod.strip(), "TRUE" if cm_enabled else "FALSE"],
+                            value_input_option="USER_ENTERED"))
                         client_modules_df.clear(); st.success("Client module updated ✅")
 
         with tab7:
@@ -1064,8 +1134,11 @@ else:
                 else:
                     st.dataframe(idf, use_container_width=True, hide_index=True)
                     if st.button("Replace Insurance master", type="primary"):
-                        wsx = ws(MS_INSURANCE); retry(lambda: wsx.clear()); retry(lambda: wsx.update("A1", [["Code","Name"]]))
-                        if not idf.empty: retry(lambda: wsx.update("A2", idf[["Code","Name"]].astype(str).values.tolist()))
+                        wsx = ws(MS_INSURANCE)
+                        retry(lambda: wsx.clear())
+                        retry(lambda: wsx.update("A1", [["Code","Name"]]))
+                        if not idf.empty:
+                            retry(lambda: wsx.update("A2", idf[["Code","Name"]].astype(str).values.tolist()))
                         insurance_master.clear(); st.success("Insurance master updated ✅")
             except Exception as e:
                 st.error(f"Import error: {e}")
