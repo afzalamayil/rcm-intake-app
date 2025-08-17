@@ -1293,11 +1293,25 @@ if page != "—":
                     st.success("Client module updated ✅")
 
         with tab7:
-            st.markdown("**Form Schema (Per Client + Module)**")
-            sdf = schema_df()
-            cat = modules_catalog_df()
-            mod_sel = st.selectbox("Module", cat["Module"].tolist() if not cat.empty else [], key="fs_mod_sel")
-cid_sel = st.selectbox("ClientID", cids, index=(cids.index(CLIENT_ID) if CLIENT_ID in cids else 0), key="fs_client_sel")
+    st.markdown("**Form Schema (Per Client + Module)**")
+    sdf = schema_df()
+    cat = modules_catalog_df()
+
+    mod_sel = st.selectbox(
+        "Module",
+        cat["Module"].tolist() if not cat.empty else [],
+        key="fs_mod_sel",
+    )
+
+    cids = sorted(set(["DEFAULT"] + sdf["ClientID"].dropna().astype(str).tolist()))
+    default_idx = cids.index(CLIENT_ID) if CLIENT_ID in cids else 0
+    cid_sel = st.selectbox(
+        "ClientID",
+        cids,
+        index=default_idx,
+        key="fs_client_sel",
+    )
+
             cid_sel = st.selectbox("ClientID", cids, index=(cids.index(CLIENT_ID) if CLIENT_ID in cids else 0))
             view = sdf[(sdf["Module"]==mod_sel) & (sdf["ClientID"]==cid_sel)]
             if view.empty:
