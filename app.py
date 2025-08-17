@@ -847,40 +847,41 @@ def nav_pages_for(role: str):
 
 module_pairs, static_pages = nav_pages_for(ROLE)
 
+# Navigation (dynamic modules + static pages) — exclusive router
+# ─────────────────────────────────────────────────────────────────────────────
 st.sidebar.markdown("### Modules")
-module_choice = None
-if module_pairs:
-    module_choice = st.sidebar.radio("Dynamic Modules", [m for (m, _) in module_pairs], index=0)
+module_choice = (
+    st.sidebar.radio(
+        "Dynamic Modules",
+        [m for (m, _) in module_pairs],
+        index=0,
+        key="nav_mod",
+    )
+    if module_pairs else None
+)
 
 st.sidebar.markdown("---")
-static_choice = st.sidebar.radio("Other Pages", static_pages, index=0 if not module_pairs else None)
+# Add a sentinel so "pages" aren't selected by default
+static_choice = st.sidebar.radio(
+    "Other Pages",
+    ["—"] + static_pages,   # sentinel at index 0
+    index=0,
+    key="nav_page",
+)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared helpers for data loading by module sheet
-# ─────────────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=45, show_spinner=False)
-def load_module_df(sheet_name: str) -> pd.DataFrame:
-    df = read_sheet_df(sheet_name).copy()
-    return df
-
-def _apply_common_filters(df: pd.DataFrame):
-    if df.empty: return df
-    if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"] and "PharmacyID" in df.columns:
-        df = df[df['PharmacyID'].astype(str).str.strip().isin(ALLOWED_PHARM_IDS)]
-    return df
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Render dynamic module OR static pages
-# ─────────────────────────────────────────────────────────────────────────────
-if module_choice:
-    sheet_name = dict(module_pairs).get(module_choice)
-    st.subheader(f"{module_choice} — Dynamic Intake")
-    _render_dynamic_form(module_choice, sheet_name, CLIENT_ID, ROLE)
-
+# Router: if a real static page is chosen, show it; otherwise show the module UI
+if static_choice != "—":
+    page = static_choice
 else:
-    page = static_choice or "Summary"
+    # ===================== Dynamic Module =====================
+    if module_choice:
+        sheet_name = dict(module_pairs).get(module_choice)
+        st.subheader(f"{module_choice} — Dynamic Intake")
+        _render_dynamic_form(module_choice, sheet_name, CLIENT_ID, ROLE)
+    else:
+        st.info("No modules enabled. Pick a page on the left.")
 
-    # View / Export
+    # ===================== Other Pages =====================
     if page == "View / Export":
         if ROLE not in ("Super Admin","Admin"): st.stop()
         st.subheader("Search, Filter & Export")
@@ -929,7 +930,6 @@ else:
             file_name=f"{sel_mod}_Export_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    # Email / WhatsApp
     elif page == "Email / WhatsApp":
         if ROLE not in ("Super Admin","Admin"): st.stop()
         st.subheader("Send Report")
@@ -1044,7 +1044,7 @@ else:
 
     # Masters Admin
     elif page == "Masters Admin":
-        if ROLE not in ("Super Admin","Admin"):
+        if ROLE not in ("Super Admin","Admin"): st.stop()
             st.stop()
         st.subheader("Masters & Configuration")
 
@@ -1347,7 +1347,7 @@ else:
 
     # Bulk Import Insurance
     elif page == "Bulk Import Insurance":
-        if ROLE not in ("Super Admin","Admin"):
+        if ROLE not in ("Super Admin","Admin"): st.stop()
             st.stop()
         st.subheader("Bulk Import Insurance (CSV/XLSX with columns: Code, Name)")
         uploaded = st.file_uploader("Upload file", type=["csv","xlsx"])
