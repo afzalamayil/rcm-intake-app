@@ -461,12 +461,11 @@ def _options_from_token(token: str) -> list[str]:
     if not token:
         return []
 
-    # Masters-backed options
     if token.startswith("MS:"):
         key_raw = token.split(":", 1)[1].strip()
         key = key_raw.lower()
 
-        # Doctors (client-scoped). Use MS:DoctorsAll to show all for Super Admin.
+        # Doctors (client-scoped). Use MS:DoctorsAll for Super Admin to see all.
         if key in ("doctors", "doctorsall"):
             try:
                 if key == "doctorsall" and str(ROLE).strip().lower() in ("super admin", "superadmin"):
@@ -488,7 +487,6 @@ def _options_from_token(token: str) -> list[str]:
             return safe_list(MS_SUBMISSION_MODE, [])
         return []
 
-    # Literal list (L:Opt1|Opt2) or JSON list
     if token.startswith("L:"):
         return [x.strip() for x in token[2:].split("|") if x.strip()]
     try:
