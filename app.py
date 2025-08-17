@@ -161,6 +161,7 @@ def read_sheet_df(title: str, required_headers: list[str] | None = None) -> pd.D
 DATA_TAB = "Data"                   # legacy (optional)
 USERS_TAB = "Users"
 MS_PHARM = "Pharmacies"
+MS_DOCTORS = "Doctors"
 MS_INSURANCE = "Insurance"
 MS_SUBMISSION_MODE = "SubmissionMode"
 MS_PORTAL = "Portal"
@@ -174,7 +175,7 @@ MS_CLIENT_MODULES = "ClientModules" # per-client enable map
 MS_FORM_SCHEMA = "FormSchema"       # per-client+module field schema
 
 DEFAULT_TABS = [
-    DATA_TAB, USERS_TAB, MS_PHARM, MS_INSURANCE,
+    DATA_TAB, USERS_TAB, MS_PHARM, MS_INSURANCE, MS_DOCTORS,
     MS_SUBMISSION_MODE, MS_PORTAL, MS_STATUS,
     CLIENTS_TAB, CLIENT_CONTACTS_TAB,
     MS_MODULES, MS_CLIENT_MODULES, MS_FORM_SCHEMA
@@ -195,6 +196,7 @@ REQUIRED_HEADERS = {
     MS_STATUS: ["Value"],
     MS_PHARM: ["ID","Name"],
     MS_INSURANCE: ["Code","Name"],
+    MS_DOCTORS: ["DoctorID","DoctorName","Specialty","ClientID"],
     CLIENTS_TAB: ["ClientID","Name"],
     CLIENT_CONTACTS_TAB: ["ClientID","To","CC","WhatsApp"],
     MS_MODULES: ["Module","SheetName","DefaultEnabled","DupKeys","NumericFieldsJSON"],
@@ -279,6 +281,23 @@ def insurance_master() -> pd.DataFrame:
     if df.empty: return pd.DataFrame(columns=["Code","Name","Display"])
     df["Display"] = (df.get("Code","").astype(str).str.strip()+" - "+df.get("Name","").astype(str).str.strip()).str.strip(" -")
     return df[["Code","Name","Display"]]
+@st.cache_data(ttl=60, show_spinner=False)
+def doctors_master(client_id: str | None = None) -> pd.DataFrame:
+    """
+    Returns Doctors for the given client_id (or all if super admin passes None).
+    Columns guaranteed: DoctorID, DoctorName, Specialty, ClientID, Display
+    """
+    df = read_sheet_df(MS_DOCTORS, REQUIRED_HEADERS[MS_DOCTORS]).fillna("")
+    if df.empty:
+        return pd.DataFrame(columns=["DoctorID","DoctorName","Specialty","ClientID","Display"])
+    for c in ["DoctorID","DoctorName","Specialty","ClientID"]:
+        if c not in df.columns: df[c] = ""
+        df[c] = df[c].astype(str).str.strip()
+    # Scope to client unless None is passed (super admin explicit “all”)
+    if client_id:
+        df = df[df["ClientID"].astype(str).str.upper() == str(client_id).strip().upper()]
+    df["Display"] = df["DoctorName"] + " (" + df["Specialty"].replace("", "—") + ")"
+    return df[["DoctorID","DoctorName","Specialty","ClientID","Display"]]
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _list_from_sheet(title, col_candidates=("Value","Name","Mode","Portal","Status")):
@@ -442,8 +461,17 @@ def _options_from_token(token: str) -> list[str]:
     if not token: return []
     if token.startswith("MS:"):
         key = token.split(":",1)[1].strip().lower()
-        if key == "doctors":
-            return safe_list("Doctors", [])
+    if key == "doctors":
+    # Client-scoped list of doctor display names
+    try:
+        # Super Admin can see ALL if schema wants it: use MS:DoctorsAll
+        if str(ROLE).strip().lower() in ("super admin","superadmin") and token.strip().lower() == "ms:doctorsall":
+            df = doctors_master(client_id=None)
+        else:
+            df = doctors_master(client_id=CLIENT_ID)
+        return df["Display"].tolist() if not df.empty else []
+        except Exception:
+        return []
         if key == "insurance":
             df = insurance_master()
             return df["Display"].tolist() if not df.empty else []
@@ -708,6 +736,25 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
         merged = list(dict.fromkeys((existing or []) + target_headers))
         retry(lambda: wsx.update("A1", [merged]))
         target_headers = merged
+# Resolve DoctorID from selected DoctorName if such fields exist
+try:
+    # Find the fieldkeys/labels that were used
+    chosen_doc_name = None
+    chosen_doc_fk = None
+    for _, r in rows.iterrows():
+        if r["Type"] == "select" and r["Options"].strip().lower() in ("ms:doctors","ms:doctorsall"):
+            chosen_doc_fk = r["FieldKey"]
+            chosen_doc_name = values.get(chosen_doc_fk)
+            break
+    if chosen_doc_name:
+        ddf = doctors_master(client_id=CLIENT_ID if str(ROLE).strip().lower() not in ("super admin","superadmin") else None)
+        hit = ddf[ddf["Display"] == chosen_doc_name]
+        if not hit.empty:
+            # inject DoctorID into values for saving if schema has a DoctorID field mapped
+            if "doctor_id" in [x for x in rows["FieldKey"].tolist()]:
+                values["doctor_id"] = hit.iloc[0]["DoctorID"]
+except Exception:
+    pass
 
     # Build row map
     data_map = {
@@ -962,10 +1009,10 @@ else:
         if ROLE not in ("Super Admin","Admin"): st.stop()
         st.subheader("Masters & Configuration")
 
-        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-            "Submission Modes","Portals","Status","Pharmacies",
-            "Modules","Client Modules","Form Schema"
-        ])
+tab1, tab2, tab3, tab4, tabD, tab5, tab6, tab7 = st.tabs([
+    "Submission Modes","Portals","Status","Pharmacies","Doctors",
+    "Modules","Client Modules","Form Schema"
+])
 
         def simple_list_editor(title):
             st.markdown(f"**{title}**")
@@ -991,6 +1038,26 @@ else:
                 if pid.strip() and pname.strip():
                     retry(lambda: ws(MS_PHARM).append_row([pid.strip(), pname.strip()], value_input_option="USER_ENTERED"))
                     pharm_master.clear(); st.success("Pharmacy added ✅")
+with tabD:
+    st.markdown("**Doctors (Client-Scoped)**")
+    ddf_all = doctors_master(client_id=None)
+    st.dataframe(ddf_all, use_container_width=True, hide_index=True)
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: did = st.text_input("DoctorID", placeholder="e.g., D001")
+    with c2: dname = st.text_input("Doctor Name", placeholder="Dr. Ahmed Ali")
+    with c3: dspec = st.text_input("Specialty", placeholder="Pediatrics")
+    with c4: dclient = st.text_input("ClientID", value=CLIENT_ID)
+    if st.button("Add Doctor", key="doc_add"):
+        if did.strip() and dname.strip() and dclient.strip():
+            retry(lambda: ws(MS_DOCTORS).append_row(
+                [did.strip(), dname.strip(), dspec.strip(), dclient.strip()],
+                value_input_option="USER_ENTERED"
+            ))
+            doctors_master.clear()
+            st.success("Doctor added ✅")
+        else:
+            st.error("DoctorID, Doctor Name and ClientID are required.")
+
 
         with tab5:
             st.markdown("**Modules Catalog**")
