@@ -164,6 +164,7 @@ MS_PHARM = "Pharmacies"
 MS_DOCTORS = "Doctors"
 MS_INSURANCE = "Insurance"
 MS_SUBMISSION_MODE = "SubmissionMode"
+MS_USER_MODULES = "UserModules"
 MS_PORTAL = "Portal"
 MS_STATUS = "Status"
 CLIENTS_TAB = "Clients"
@@ -175,7 +176,7 @@ MS_CLIENT_MODULES = "ClientModules" # per-client enable map
 MS_FORM_SCHEMA = "FormSchema"       # per-client+module field schema
 
 DEFAULT_TABS = [
-    DATA_TAB, USERS_TAB, MS_PHARM, MS_INSURANCE, MS_DOCTORS,
+    DATA_TAB, USERS_TAB, MS_PHARM, MS_INSURANCE, MS_DOCTORS, MS_USER_MODULES,
     MS_SUBMISSION_MODE, MS_PORTAL, MS_STATUS,
     CLIENTS_TAB, CLIENT_CONTACTS_TAB,
     MS_MODULES, MS_CLIENT_MODULES, MS_FORM_SCHEMA
@@ -196,6 +197,7 @@ REQUIRED_HEADERS = {
     MS_STATUS: ["Value"],
     MS_PHARM: ["ID","Name"],
     MS_INSURANCE: ["Code","Name"],
+    MS_USER_MODULES: ["Username","Module","Enabled"],
     MS_DOCTORS: ["DoctorID","DoctorName","Specialty","ClientID"],
     CLIENTS_TAB: ["ClientID","Name"],
     CLIENT_CONTACTS_TAB: ["ClientID","To","CC","WhatsApp"],
@@ -417,19 +419,42 @@ def client_modules_df() -> pd.DataFrame:
         df["Module"] = df["Module"].astype(str).str.strip()
         df["Enabled"] = df["Enabled"].astype(str).str.upper().isin(["TRUE","1","YES"])
     return df
+@st.cache_data(ttl=60)
+def user_modules_df() -> pd.DataFrame:
+    df = read_sheet_df(MS_USER_MODULES, REQUIRED_HEADERS[MS_USER_MODULES]).fillna("")
+    if not df.empty:
+        df["Username"] = df["Username"].astype(str).str.strip()
+        df["Module"]   = df["Module"].astype(str).str.strip()
+        df["Enabled"]  = df["Enabled"].astype(str).str.upper().isin(["TRUE","1","YES"])
+    return df
 
 def modules_enabled_for(client_id: str, role: str) -> list[tuple[str,str]]:
     cat = modules_catalog_df()
-    if cat.empty: return []
-    if str(role).strip().lower() in ("super admin","superadmin"):
-        return [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") for _, r in cat.iterrows()]
-    cm = client_modules_df()
-    if cm.empty:
-        return [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") 
-                for _, r in cat[cat["DefaultEnabled"]].iterrows()]
-    allowed = set(cm[(cm["ClientID"]==client_id) & (cm["Enabled"])]["Module"].tolist())
-    df = cat[cat["Module"].isin(allowed)]
-    return [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") for _, r in df.iterrows()]
+    if cat.empty: 
+        return []
+
+    r = str(role).strip().lower()
+    # Base set: by client (or all for superadmin)
+    if r in ("super admin","superadmin"):
+        base = cat.copy()
+    else:
+        cm = client_modules_df()
+        if cm.empty:
+            base = cat[cat["DefaultEnabled"]]
+        else:
+            allowed_client = set(cm[(cm["ClientID"]==client_id) & (cm["Enabled"])]["Module"].tolist())
+            base = cat[cat["Module"].isin(allowed_client)]
+
+    # Optional per-user override: if there are rows for this user in UserModules,
+    # show only modules explicitly Enabled for them. If no rows for the user, keep base.
+    um = user_modules_df()
+    if not um.empty:
+        mine = um[um["Username"].str.lower() == str(username).lower()]
+        if not mine.empty:
+            allowed_user = set(mine[mine["Enabled"]]["Module"].tolist())
+            base = base[base["Module"].isin(allowed_user)]
+
+    return [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") for _, r in base.iterrows()]
 
 @st.cache_data(ttl=60)
 def schema_df() -> pd.DataFrame:
@@ -1019,9 +1044,9 @@ else:
         if ROLE not in ("Super Admin","Admin"): st.stop()
         st.subheader("Masters & Configuration")
 
-        tab1, tab2, tab3, tab4, tabD, tab5, tab6, tab7 = st.tabs([
+        tab1, tab2, tab3, tab4, tabD, tabU, tabUM tab5, tab6, tab7 = st.tabs([
             "Submission Modes","Portals","Status","Pharmacies","Doctors",
-            "Modules","Client Modules","Form Schema"
+            "Modules","Client Modules","Form Schema","Users", "User Modules"
         ])
 
         def simple_list_editor(title):
@@ -1070,6 +1095,86 @@ else:
                 else:
                     st.error("DoctorID, Doctor Name and ClientID are required.")
 
+        with tabU:
+    st.markdown("**Users**")
+    udf = load_users_df() or pd.DataFrame(columns=REQUIRED_HEADERS[USERS_TAB])
+    st.dataframe(udf, use_container_width=True, hide_index=True)
+
+    c1, c2, c3 = st.columns(3)
+    with c1: u_username = st.text_input("Username (email)")
+    with c2: u_name     = st.text_input("Display Name")
+    with c3: u_role     = st.selectbox("Role", ["User","Admin","Super Admin"])
+
+    c4, c5, c6 = st.columns(3)
+    with c4: u_client   = st.text_input("ClientID", value=CLIENT_ID)
+    with c5: u_pharms   = st.text_input("Pharmacy IDs (comma-separated)", placeholder="ALL or e.g. P001,P002")
+    with c6: u_pwd      = st.text_input("Password (plain)", type="password")
+
+    if st.button("Add / Update User", type="primary"):
+        if not (u_username.strip() and u_name.strip() and u_role.strip()):
+            st.error("Username, Name, Role are required.")
+        else:
+            hashed = stauth.Hasher([u_pwd]).generate()[0] if u_pwd else ""
+            vals   = retry(lambda: ws(USERS_TAB).get_all_values()) or [REQUIRED_HEADERS[USERS_TAB]]
+            header = vals[0]; rows = vals[1:]
+            dfu = pd.DataFrame(rows, columns=header) if rows else pd.DataFrame(columns=header)
+            mask = dfu["username"].astype(str).str.lower() == u_username.strip().lower()
+            if mask.any():
+                # update row
+                idx = dfu.index[mask][0]
+                if hashed: dfu.at[idx,"password"] = hashed
+                dfu.at[idx,"name"]       = u_name.strip()
+                dfu.at[idx,"role"]       = u_role.strip()
+                dfu.at[idx,"pharmacies"] = (u_pharms.strip() or "ALL")
+                dfu.at[idx,"client_id"]  = (u_client.strip() or "DEFAULT")
+            else:
+                dfu.loc[len(dfu)] = {
+                    "username": u_username.strip(),
+                    "name": u_name.strip(),
+                    "password": hashed or "",
+                    "role": u_role.strip(),
+                    "pharmacies": (u_pharms.strip() or "ALL"),
+                    "client_id": (u_client.strip() or "DEFAULT"),
+                }
+            w = ws(USERS_TAB)
+            retry(lambda: w.clear())
+            retry(lambda: w.update("A1", [REQUIRED_HEADERS[USERS_TAB]]))
+            if not dfu.empty:
+                retry(lambda: w.update("A2", dfu[REQUIRED_HEADERS[USERS_TAB]].astype(str).values.tolist()))
+            # refresh cache
+            global USERS_DF
+            USERS_DF = load_users_df()
+            st.success("User saved ✅")
+with tabUM:
+    st.markdown("**User Modules (Per-User Visibility Override)**")
+    all_mods = modules_catalog_df()["Module"].tolist()
+    udf = load_users_df() or pd.DataFrame(columns=REQUIRED_HEADERS[USERS_TAB])
+    user_choices = udf["username"].tolist() if not udf.empty else []
+    sel_user = st.selectbox("Username", user_choices)
+
+    if sel_user:
+        um = user_modules_df()
+        current = sorted(um[(um["Username"].str.lower()==sel_user.lower()) & (um["Enabled"])]["Module"].tolist())
+        pick = st.multiselect("Modules visible to this user", options=all_mods, default=current)
+
+        st.caption("Tip: leaving this user with **no rows** here means they inherit the Client Modules setting.")
+        if st.button("Save User Modules", type="primary"):
+            # wipe existing rows for this user, then add selected
+            vals = retry(lambda: ws(MS_USER_MODULES).get_all_values()) or [REQUIRED_HEADERS[MS_USER_MODULES]]
+            header = vals[0]; rows = vals[1:]
+            dfum = pd.DataFrame(rows, columns=header) if rows else pd.DataFrame(columns=header)
+            dfum = dfum[dfum["Username"].str.lower() != sel_user.lower()]
+            for m in pick:
+                dfum.loc[len(dfum)] = {"Username": sel_user, "Module": m, "Enabled": "TRUE"}
+            w = ws(MS_USER_MODULES)
+            retry(lambda: w.clear())
+            retry(lambda: w.update("A1", [REQUIRED_HEADERS[MS_USER_MODULES]]))
+            if not dfum.empty:
+                retry(lambda: w.update("A2", dfum[REQUIRED_HEADERS[MS_USER_MODULES]].astype(str).values.tolist()))
+            user_modules_df.clear()
+            st.success("User Modules saved ✅")
+
+        
         with tab5:
             st.markdown("**Modules Catalog**")
             mdf = modules_catalog_df()
