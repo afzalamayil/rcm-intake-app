@@ -1542,7 +1542,7 @@ with tab7:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
         # --- END Summary page block ---
-    elif page == "Update Record":
+elif page == "Update Record":
     st.subheader("Update Record")
 
     # pick module/sheet first (so it works across modules)
