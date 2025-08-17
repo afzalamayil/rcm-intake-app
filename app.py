@@ -1292,89 +1292,83 @@ if page != "—":
                     client_modules_df.clear()
                     st.success("Client module updated ✅")
 
-with tab7:
-    st.markdown("**Form Schema (Per Client + Module)**")
-    sdf = schema_df()
-    cat = modules_catalog_df()
+        with tab7:
+            st.markdown("**Form Schema (Per Client + Module)**")
+            sdf = schema_df()
+            cat = modules_catalog_df()
 
-    # unique keys to avoid duplicate-ID errors
-    mod_sel = st.selectbox(
-        "Module",
-        cat["Module"].tolist() if not cat.empty else [],
-        key="fs_mod_sel",
-    )
+            mod_sel = st.selectbox(
+                "Module",
+                cat["Module"].tolist() if not cat.empty else [],
+                key="fs_mod_sel",
+            )
 
-    cids = sorted(set(["DEFAULT"] + sdf["ClientID"].dropna().astype(str).unique().tolist()))
-    default_idx = cids.index(CLIENT_ID) if CLIENT_ID in cids else 0
-    cid_sel = st.selectbox(
-        "ClientID",
-        cids,
-        index=default_idx,
-        key="fs_client_sel",
-    )
+            cids = sorted(set(["DEFAULT"] + sdf["ClientID"].dropna().astype(str).tolist()))
+            cid_sel = st.selectbox(
+                "ClientID",
+                cids,
+                index=(cids.index(CLIENT_ID) if CLIENT_ID in cids else 0),
+                key="fs_client_sel",
+            )
 
-    view = sdf[(sdf["Module"] == mod_sel) & (sdf["ClientID"] == cid_sel)]
-    if view.empty:
-        st.info("No schema rows yet for this selection (runtime falls back to DEFAULT).")
-    else:
-        st.dataframe(view.sort_values("Order"), use_container_width=True, hide_index=True)
-
-    st.divider()
-    st.markdown("**Add Schema Row**")
-    sc1, sc2, sc3 = st.columns(3)
-    with sc1:
-        fk = st.text_input("FieldKey", placeholder="e.g., erx_number")
-        lbl = st.text_input("Label", placeholder="ERX Number")
-        typ = st.selectbox("Type", ["text","textarea","number","date","select","multiselect","checkbox"], key="fs_type_sel")
-    with sc2:
-        req = st.checkbox("Required", value=True, key="fs_req_ck")
-        opts = st.text_input("Options", placeholder="MS:Insurance or L:Opt1|Opt2 or JSON []", key="fs_opts")
-        default = st.text_input("Default", placeholder="", key="fs_default")
-    with sc3:
-        vis = st.text_input("RoleVisibility", value="All", help="All or pipe: User|Admin|Super Admin", key="fs_vis")
-        order = st.number_input("Order", value=100, min_value=1, step=1, key="fs_order")
-        saveto = st.text_input("SaveTo", placeholder="Column header to save as", key="fs_saveto")
-        ro = st.text_input("ReadOnlyRoles", value="", help="e.g., User or User|Admin", key="fs_ro")
-
-        if st.button("Add Row", type="primary", key="fs_add_row"):
-            if not (fk.strip() and lbl.strip() and mod_sel.strip() and cid_sel.strip()):
-                st.error("ClientID, Module, FieldKey, Label are required.")
+            view = sdf[(sdf["Module"] == mod_sel) & (sdf["ClientID"] == cid_sel)]
+            if view.empty:
+                st.info("No schema rows yet for this selection (runtime falls back to DEFAULT).")
             else:
-                row = [
-                    cid_sel.strip(), mod_sel.strip(), fk.strip(), lbl.strip(), typ.strip(),
-                    "TRUE" if req else "FALSE", opts.strip(), default.strip(), vis.strip(), int(order),
-                    saveto.strip() or fk.strip(), ro.strip()
-                ]
-                retry(lambda: ws(MS_FORM_SCHEMA).append_row(row, value_input_option="USER_ENTERED"))
-                schema_df.clear()
-                st.success("Schema row added ✅")
+                st.dataframe(view.sort_values("Order"), use_container_width=True, hide_index=True)
 
-    st.divider()
-    st.markdown("**Delete Schema Row (by FieldKey)**")
-    del_fk = st.text_input("FieldKey to delete", key="fs_del_fk")
-    if st.button("Delete Rows for selection", key="fs_delete_btn"):
-        if not (del_fk.strip() and mod_sel.strip() and cid_sel.strip()):
-            st.error("Provide FieldKey, Module, ClientID.")
-        else:
-            vals = retry(lambda: ws(MS_FORM_SCHEMA).get_all_values())
-            if not vals:
-                st.warning("FormSchema sheet is empty.")
-            else:
-                header = vals[0]; rows = vals[1:]
-                df_all = pd.DataFrame(rows, columns=header)
-                mask = ~(
-                    (df_all["ClientID"].astype(str) == cid_sel) &
-                    (df_all["Module"].astype(str) == mod_sel) &
-                    (df_all["FieldKey"].astype(str) == del_fk)
-                )
-                new_df = df_all[mask]
-                w = ws(MS_FORM_SCHEMA)
-                retry(lambda: w.clear())
-                retry(lambda: w.update("A1", [header]))
-                if not new_df.empty:
-                    retry(lambda: w.update("A2", new_df.values.tolist()))
-                schema_df.clear()
-                st.success("Deleted (if existed) ✅")
+            st.divider()
+            st.markdown("**Add Schema Row**")
+            sc1, sc2, sc3 = st.columns(3)
+            with sc1:
+                fk = st.text_input("FieldKey", placeholder="e.g., erx_number")
+                lbl = st.text_input("Label", placeholder="ERX Number")
+                typ = st.selectbox("Type", ["text","textarea","number","date","select","multiselect","checkbox"])
+            with sc2:
+                req = st.checkbox("Required", value=True)
+                opts = st.text_input("Options", placeholder="MS:Insurance or L:Opt1|Opt2 or JSON []")
+                default = st.text_input("Default", placeholder="")
+            with sc3:
+                vis = st.text_input("RoleVisibility", value="All", help="All or pipe: User|Admin|Super Admin")
+                order = st.number_input("Order", value=100, min_value=1, step=1)
+                saveto = st.text_input("SaveTo", placeholder="Column header to save as")
+                ro = st.text_input("ReadOnlyRoles", value="", help="e.g., User or User|Admin")
+                if st.button("Add Row", type="primary"):
+                    if not (fk.strip() and lbl.strip() and mod_sel.strip() and cid_sel.strip()):
+                        st.error("ClientID, Module, FieldKey, Label are required.")
+                    else:
+                        row = [cid_sel.strip(), mod_sel.strip(), fk.strip(), lbl.strip(), typ.strip(),
+                               "TRUE" if req else "FALSE", opts.strip(), default.strip(), vis.strip(), int(order),
+                               saveto.strip() or fk.strip(), ro.strip()]
+                        retry(lambda: ws(MS_FORM_SCHEMA).append_row(row, value_input_option="USER_ENTERED"))
+                        schema_df.clear()
+                        st.success("Schema row added ✅")
+
+            st.divider()
+            st.markdown("**Delete Schema Row (by FieldKey)**")
+            del_fk = st.text_input("FieldKey to delete")
+            if st.button("Delete Rows for selection"):
+                if not (del_fk.strip() and mod_sel.strip() and cid_sel.strip()):
+                    st.error("Provide FieldKey, Module, ClientID.")
+                else:
+                    vals = retry(lambda: ws(MS_FORM_SCHEMA).get_all_values())
+                    if not vals:
+                        st.warning("FormSchema sheet is empty.")
+                    else:
+                        header = vals[0]; rows = vals[1:]
+                        df_all = pd.DataFrame(rows, columns=header)
+                        mask = ~((df_all["ClientID"].astype(str) == cid_sel) &
+                                 (df_all["Module"].astype(str) == mod_sel) &
+                                 (df_all["FieldKey"].astype(str) == del_fk))
+                        new_df = df_all[mask]
+                        w = ws(MS_FORM_SCHEMA)
+                        retry(lambda: w.clear())
+                        retry(lambda: w.update("A1", [header]))
+                        if not new_df.empty:
+                            retry(lambda: w.update("A2", new_df.values.tolist()))
+                        schema_df.clear()
+                        st.success("Deleted (if existed) ✅")
+
     # Bulk Import Insurance
     elif page == "Bulk Import Insurance":
         if ROLE not in ("Super Admin","Admin"): st.stop()
@@ -1685,12 +1679,14 @@ with tab7:
             st.success("Record updated ✔️")
         except Exception as e:
             st.error(f"Update failed: {e}")
+        # end of "Update Record" branch
 
-else:
-    # ===================== Dynamic Module =====================
-    if module_choice:
-        sheet_name = dict(module_pairs).get(module_choice)
-        st.subheader(f"{module_choice} — Dynamic Intake")
-        _render_dynamic_form(module_choice, sheet_name, CLIENT_ID, ROLE)
-    else:
-        st.info("No modules enabled. Pick a page on the left.")
+
+        # ===================== Dynamic Module =====================
+        else:   # ← align this with "if page ==" and "elif page =="
+            if module_choice:
+                sheet_name = dict(module_pairs).get(module_choice)
+                st.subheader(f"{module_choice} — Dynamic Intake")
+                _render_dynamic_form(module_choice, sheet_name, CLIENT_ID, ROLE)
+            else:
+                st.info("No modules enabled. Pick a page on the left.")
