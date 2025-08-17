@@ -870,17 +870,9 @@ static_choice = st.sidebar.radio(
 )
 
 # Router: if a real static page is chosen, show it; otherwise show the module UI
-if static_choice != "—":
-    page = static_choice
-else:
-    # ===================== Dynamic Module =====================
-    if module_choice:
-        sheet_name = dict(module_pairs).get(module_choice)
-        st.subheader(f"{module_choice} — Dynamic Intake")
-        _render_dynamic_form(module_choice, sheet_name, CLIENT_ID, ROLE)
-    else:
-        st.info("No modules enabled. Pick a page on the left.")
+page = static_choice  # <-- define unconditionally
 
+if page != "—":
     # ===================== Other Pages =====================
     if page == "View / Export":
         if ROLE not in ("Super Admin","Admin"): st.stop()
@@ -1510,3 +1502,13 @@ else:
             file_name=f"{sel_mod}_Summary_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+# --- END Summary page block ---
+
+else:
+    # ===================== Dynamic Module =====================
+    if module_choice:
+        sheet_name = dict(module_pairs).get(module_choice)
+        st.subheader(f"{module_choice} — Dynamic Intake")
+        _render_dynamic_form(module_choice, sheet_name, CLIENT_ID, ROLE)
+    else:
+        st.info("No modules enabled. Pick a page on the left.")
