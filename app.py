@@ -731,52 +731,57 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
     if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"] and ph_id not in ALLOWED_PHARM_IDS:
         st.error("You are not allowed to submit for this pharmacy."); return
 
-# Ensure headers (meta + SaveTo)
-meta = ["Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module"]
-save_map = {r["FieldKey"]: (r["SaveTo"] or r["FieldKey"]) for _, r in rows.iterrows() if _role_visible(r["RoleVisibility"], role)}
-target_headers = meta + list(dict.fromkeys(save_map.values()))
-wsx = ws(sheet_name)
-head = retry(lambda: wsx.row_values(1))
-if [h.lower() for h in head] != [h.lower() for h in target_headers]:
-    existing = [h for h in head if h]
-    merged = list(dict.fromkeys((existing or []) + target_headers))
-    retry(lambda: wsx.update("A1", [merged]))
-    target_headers = merged
+    # Ensure headers (meta + SaveTo)
+    meta = ["Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module"]
+    save_map = {r["FieldKey"]: (r["SaveTo"] or r["FieldKey"]) for _, r in rows.iterrows()
+                if _role_visible(r["RoleVisibility"], role)}
+    target_headers = meta + list(dict.fromkeys(save_map.values()))
+    wsx = ws(sheet_name)
+    head = retry(lambda: wsx.row_values(1))
+    if [h.lower() for h in head] != [h.lower() for h in target_headers]:
+        existing = [h for h in head if h]
+        merged = list(dict.fromkeys((existing or []) + target_headers))
+        retry(lambda: wsx.update("A1", [merged]))
+        target_headers = merged
 
-# Resolve DoctorID from selected DoctorName if such fields exist (safe no-op on error)
-try:
-    chosen_doc_name = None
-    for _, r in rows.iterrows():
-        if r["Type"] == "select" and str(r["Options"]).strip().lower() in ("ms:doctors", "ms:doctorsall"):
-            chosen_doc_name = values.get(r["FieldKey"])
-            break
-    if chosen_doc_name:
-        scope_client = None if str(ROLE).strip().lower() in ("super admin", "superadmin") else CLIENT_ID
-        ddf = doctors_master(client_id=scope_client)
-        hit = ddf.loc[ddf["Display"] == chosen_doc_name]
-        if not hit.empty and "doctor_id" in rows["FieldKey"].tolist():
-            values["doctor_id"] = hit.iloc[0]["DoctorID"]
-except Exception:
-    pass
+    # Resolve DoctorID from selected DoctorName if such fields exist (safe no-op on error)
+    try:
+        chosen_doc_name = None
+        for _, r in rows.iterrows():
+            if r["Type"] == "select" and str(r["Options"]).strip().lower() in ("ms:doctors", "ms:doctorsall"):
+                chosen_doc_name = values.get(r["FieldKey"])
+                break
+        if chosen_doc_name:
+            scope_client = None if str(ROLE).strip().lower() in ("super admin", "superadmin") else CLIENT_ID
+            ddf = doctors_master(client_id=scope_client)
+            hit = ddf.loc[ddf["Display"] == chosen_doc_name]
+            if not hit.empty and "doctor_id" in rows["FieldKey"].tolist():
+                values["doctor_id"] = hit.iloc[0]["DoctorID"]
+    except Exception:
+        pass
 
-# Build row map
-data_map = {
-    "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    "SubmittedBy": username or name,
-    "Role": ROLE,
-    "ClientID": CLIENT_ID,
-    "PharmacyID": ph_id,
-    "PharmacyName": ph_name,
-    "Module": module_name,
-}
-for fk, col in save_map.items():
-    val = values.get(fk)
-    if isinstance(val, (date, datetime)): val = pd.to_datetime(val).strftime("%Y-%m-%d")
-    if isinstance(val, list): val = ", ".join([str(x) for x in val])
-    if isinstance(val, float):
-        try: val = f"{float(val):.2f}"
-        except: pass
-    data_map[col] = "" if val is None else str(val)
+    # Build row map
+    data_map = {
+        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "SubmittedBy": username or name,
+        "Role": ROLE,
+        "ClientID": CLIENT_ID,
+        "PharmacyID": ph_id,
+        "PharmacyName": ph_name,
+        "Module": module_name,
+    }
+    for fk, col in save_map.items():
+        val = values.get(fk)
+        if isinstance(val, (date, datetime)):
+            val = pd.to_datetime(val).strftime("%Y-%m-%d")
+        if isinstance(val, list):
+            val = ", ".join([str(x) for x in val])
+        if isinstance(val, float):
+            try:
+                val = f"{float(val):.2f}"
+            except Exception:
+                pass
+        data_map[col] = "" if val is None else str(val)
 
     # Duplicate check
     try:
@@ -784,11 +789,13 @@ for fk, col in save_map.items():
             allow_override = st.session_state.get(dup_override_key, False)
             is_superadmin = str(role).strip().lower() in ("super admin","superadmin")
             if not (allow_override or is_superadmin):
-                st.warning("Possible duplicate detected (based on configured duplicate keys). Tick 'Allow duplicate override' or ask Super Admin.")
+                st.warning("Possible duplicate detected (based on configured duplicate keys). "
+                           "Tick 'Allow duplicate override' or ask Super Admin.")
                 return
     except Exception as e:
         st.info(f"Duplicate check skipped: {e}")
 
+    # Save
     row = [data_map.get(h, "") for h in target_headers]
     try:
         retry(lambda: wsx.append_row(row, value_input_option="USER_ENTERED"))
