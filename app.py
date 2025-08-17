@@ -458,20 +458,25 @@ if str(ROLE).strip().lower() in ("super admin", "superadmin"):
 
 def _options_from_token(token: str) -> list[str]:
     token = (token or "").strip()
-    if not token: return []
-    if token.startswith("MS:"):
-        key = token.split(":",1)[1].strip().lower()
-    if key == "doctors":
-    # Client-scoped list of doctor display names
-    try:
-        # Super Admin can see ALL if schema wants it: use MS:DoctorsAll
-        if str(ROLE).strip().lower() in ("super admin","superadmin") and token.strip().lower() == "ms:doctorsall":
-            df = doctors_master(client_id=None)
-        else:
-            df = doctors_master(client_id=CLIENT_ID)
-        return df["Display"].tolist() if not df.empty else []
-        except Exception:
+    if not token:
         return []
+
+    # Masters-backed options
+    if token.startswith("MS:"):
+        key_raw = token.split(":", 1)[1].strip()
+        key = key_raw.lower()
+
+        # Doctors (client-scoped). Use MS:DoctorsAll to show all for Super Admin.
+        if key in ("doctors", "doctorsall"):
+            try:
+                if key == "doctorsall" and str(ROLE).strip().lower() in ("super admin", "superadmin"):
+                    df = doctors_master(client_id=None)
+                else:
+                    df = doctors_master(client_id=CLIENT_ID)
+                return df["Display"].tolist() if not df.empty else []
+            except Exception:
+                return []
+
         if key == "insurance":
             df = insurance_master()
             return df["Display"].tolist() if not df.empty else []
@@ -482,11 +487,14 @@ def _options_from_token(token: str) -> list[str]:
         if key == "submissionmode":
             return safe_list(MS_SUBMISSION_MODE, [])
         return []
+
+    # Literal list (L:Opt1|Opt2) or JSON list
     if token.startswith("L:"):
         return [x.strip() for x in token[2:].split("|") if x.strip()]
     try:
         arr = json.loads(token)
-        if isinstance(arr, list): return [str(x) for x in arr]
+        if isinstance(arr, list):
+            return [str(x) for x in arr]
     except Exception:
         pass
     return []
@@ -725,55 +733,52 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
     if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"] and ph_id not in ALLOWED_PHARM_IDS:
         st.error("You are not allowed to submit for this pharmacy."); return
 
-    # Ensure headers (meta + SaveTo)
-    meta = ["Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module"]
-    save_map = {r["FieldKey"]: (r["SaveTo"] or r["FieldKey"]) for _, r in rows.iterrows() if _role_visible(r["RoleVisibility"], role)}
-    target_headers = meta + list(dict.fromkeys(save_map.values()))
-    wsx = ws(sheet_name)
-    head = retry(lambda: wsx.row_values(1))
-    if [h.lower() for h in head] != [h.lower() for h in target_headers]:
-        existing = [h for h in head if h]
-        merged = list(dict.fromkeys((existing or []) + target_headers))
-        retry(lambda: wsx.update("A1", [merged]))
-        target_headers = merged
-# Resolve DoctorID from selected DoctorName if such fields exist
+# Ensure headers (meta + SaveTo)
+meta = ["Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module"]
+save_map = {r["FieldKey"]: (r["SaveTo"] or r["FieldKey"]) for _, r in rows.iterrows() if _role_visible(r["RoleVisibility"], role)}
+target_headers = meta + list(dict.fromkeys(save_map.values()))
+wsx = ws(sheet_name)
+head = retry(lambda: wsx.row_values(1))
+if [h.lower() for h in head] != [h.lower() for h in target_headers]:
+    existing = [h for h in head if h]
+    merged = list(dict.fromkeys((existing or []) + target_headers))
+    retry(lambda: wsx.update("A1", [merged]))
+    target_headers = merged
+
+# Resolve DoctorID from selected DoctorName if such fields exist (safe no-op on error)
 try:
-    # Find the fieldkeys/labels that were used
     chosen_doc_name = None
-    chosen_doc_fk = None
     for _, r in rows.iterrows():
-        if r["Type"] == "select" and r["Options"].strip().lower() in ("ms:doctors","ms:doctorsall"):
-            chosen_doc_fk = r["FieldKey"]
-            chosen_doc_name = values.get(chosen_doc_fk)
+        if r["Type"] == "select" and str(r["Options"]).strip().lower() in ("ms:doctors", "ms:doctorsall"):
+            chosen_doc_name = values.get(r["FieldKey"])
             break
     if chosen_doc_name:
-        ddf = doctors_master(client_id=CLIENT_ID if str(ROLE).strip().lower() not in ("super admin","superadmin") else None)
-        hit = ddf[ddf["Display"] == chosen_doc_name]
-        if not hit.empty:
-            # inject DoctorID into values for saving if schema has a DoctorID field mapped
-            if "doctor_id" in [x for x in rows["FieldKey"].tolist()]:
-                values["doctor_id"] = hit.iloc[0]["DoctorID"]
+        scope_client = None if str(ROLE).strip().lower() in ("super admin", "superadmin") else CLIENT_ID
+        ddf = doctors_master(client_id=scope_client)
+        hit = ddf.loc[ddf["Display"] == chosen_doc_name]
+        if not hit.empty and "doctor_id" in rows["FieldKey"].tolist():
+            values["doctor_id"] = hit.iloc[0]["DoctorID"]
 except Exception:
     pass
 
-    # Build row map
-    data_map = {
-        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "SubmittedBy": username or name,
-        "Role": ROLE,
-        "ClientID": CLIENT_ID,
-        "PharmacyID": ph_id,
-        "PharmacyName": ph_name,
-        "Module": module_name,
-    }
-    for fk, col in save_map.items():
-        val = values.get(fk)
-        if isinstance(val, (date, datetime)): val = pd.to_datetime(val).strftime("%Y-%m-%d")
-        if isinstance(val, list): val = ", ".join([str(x) for x in val])
-        if isinstance(val, float):
-            try: val = f"{float(val):.2f}"
-            except: pass
-        data_map[col] = "" if val is None else str(val)
+# Build row map
+data_map = {
+    "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "SubmittedBy": username or name,
+    "Role": ROLE,
+    "ClientID": CLIENT_ID,
+    "PharmacyID": ph_id,
+    "PharmacyName": ph_name,
+    "Module": module_name,
+}
+for fk, col in save_map.items():
+    val = values.get(fk)
+    if isinstance(val, (date, datetime)): val = pd.to_datetime(val).strftime("%Y-%m-%d")
+    if isinstance(val, list): val = ", ".join([str(x) for x in val])
+    if isinstance(val, float):
+        try: val = f"{float(val):.2f}"
+        except: pass
+    data_map[col] = "" if val is None else str(val)
 
     # Duplicate check
     try:
@@ -1009,10 +1014,10 @@ else:
         if ROLE not in ("Super Admin","Admin"): st.stop()
         st.subheader("Masters & Configuration")
 
-tab1, tab2, tab3, tab4, tabD, tab5, tab6, tab7 = st.tabs([
-    "Submission Modes","Portals","Status","Pharmacies","Doctors",
-    "Modules","Client Modules","Form Schema"
-])
+        tab1, tab2, tab3, tab4, tabD, tab5, tab6, tab7 = st.tabs([
+            "Submission Modes","Portals","Status","Pharmacies","Doctors",
+            "Modules","Client Modules","Form Schema"
+        ])
 
         def simple_list_editor(title):
             st.markdown(f"**{title}**")
@@ -1027,6 +1032,7 @@ tab1, tab2, tab3, tab4, tabD, tab5, tab6, tab7 = st.tabs([
         with tab1: simple_list_editor(MS_SUBMISSION_MODE)
         with tab2: simple_list_editor(MS_PORTAL)
         with tab3: simple_list_editor(MS_STATUS)
+
         with tab4:
             st.markdown("**Pharmacies**")
             ph_df = pharm_master()
@@ -1038,26 +1044,26 @@ tab1, tab2, tab3, tab4, tabD, tab5, tab6, tab7 = st.tabs([
                 if pid.strip() and pname.strip():
                     retry(lambda: ws(MS_PHARM).append_row([pid.strip(), pname.strip()], value_input_option="USER_ENTERED"))
                     pharm_master.clear(); st.success("Pharmacy added ✅")
-with tabD:
-    st.markdown("**Doctors (Client-Scoped)**")
-    ddf_all = doctors_master(client_id=None)
-    st.dataframe(ddf_all, use_container_width=True, hide_index=True)
-    c1, c2, c3, c4 = st.columns(4)
-    with c1: did = st.text_input("DoctorID", placeholder="e.g., D001")
-    with c2: dname = st.text_input("Doctor Name", placeholder="Dr. Ahmed Ali")
-    with c3: dspec = st.text_input("Specialty", placeholder="Pediatrics")
-    with c4: dclient = st.text_input("ClientID", value=CLIENT_ID)
-    if st.button("Add Doctor", key="doc_add"):
-        if did.strip() and dname.strip() and dclient.strip():
-            retry(lambda: ws(MS_DOCTORS).append_row(
-                [did.strip(), dname.strip(), dspec.strip(), dclient.strip()],
-                value_input_option="USER_ENTERED"
-            ))
-            doctors_master.clear()
-            st.success("Doctor added ✅")
-        else:
-            st.error("DoctorID, Doctor Name and ClientID are required.")
 
+        with tabD:
+            st.markdown("**Doctors (Client-Scoped)**")
+            ddf_all = doctors_master(client_id=None)
+            st.dataframe(ddf_all, use_container_width=True, hide_index=True)
+            c1, c2, c3, c4 = st.columns(4)
+            with c1: did = st.text_input("DoctorID", placeholder="e.g., D001")
+            with c2: dname = st.text_input("Doctor Name", placeholder="Dr. Ahmed Ali")
+            with c3: dspec = st.text_input("Specialty", placeholder="Pediatrics")
+            with c4: dclient = st.text_input("ClientID", value=CLIENT_ID)
+            if st.button("Add Doctor", key="doc_add"):
+                if did.strip() and dname.strip() and dclient.strip():
+                    retry(lambda: ws(MS_DOCTORS).append_row(
+                        [did.strip(), dname.strip(), dspec.strip(), dclient.strip()],
+                        value_input_option="USER_ENTERED"
+                    ))
+                    doctors_master.clear()
+                    st.success("Doctor added ✅")
+                else:
+                    st.error("DoctorID, Doctor Name and ClientID are required.")
 
         with tab5:
             st.markdown("**Modules Catalog**")
@@ -1085,14 +1091,11 @@ with tabD:
                             numeric_json.strip() or "[]"
                         ]
                         retry(lambda: ws(MS_MODULES).append_row(row, value_input_option="USER_ENTERED"))
-                        # Create/repair the data sheet
                         _ensure_module_sheets_exist()
-                        # Auto-seed DEFAULT FormSchema for this module
                         try:
                             seed_form_schema_for_module(new_mod.strip(), client_id="DEFAULT")
                         except Exception as e:
                             st.warning(f"FormSchema auto-seed skipped: {e}")
-                        # Auto-enable for current client (if Admin/Super Admin)
                         try:
                             if ROLE in ("Super Admin","Admin"):
                                 retry(lambda: ws(MS_CLIENT_MODULES).append_row(
