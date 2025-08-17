@@ -442,6 +442,8 @@ def _options_from_token(token: str) -> list[str]:
     if not token: return []
     if token.startswith("MS:"):
         key = token.split(":",1)[1].strip().lower()
+        if key == "doctors":
+            return safe_list("Doctors", [])
         if key == "insurance":
             df = insurance_master()
             return df["Display"].tolist() if not df.empty else []
