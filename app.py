@@ -1548,8 +1548,8 @@ with tab7:
         # pick module/sheet first (so it works across modules)
         cat = modules_catalog_df()
         if cat.empty:
-        st.info("No modules defined yet.")
-        st.stop()
+            st.info("No modules defined yet.")
+            st.stop()
 
     choices = [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") for _, r in cat.iterrows()]
     mod_names = [m for m,_ in choices]
