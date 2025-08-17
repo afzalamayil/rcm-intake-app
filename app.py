@@ -154,6 +154,28 @@ def read_sheet_df(title: str, required_headers: list[str] | None = None) -> pd.D
     rows = [r + [""]*(len(header)-len(r)) for r in rows]
     df = pd.DataFrame(rows, columns=header)
     return df.fillna("")
+# Wrapper: unified loader for module data sheets (robust, cached)
+@st.cache_data(ttl=300)
+def load_module_df(sheet_name: str) -> pd.DataFrame:
+    """
+    Returns a DataFrame for the given module's sheet.
+    Falls back gracefully if the sheet is missing or empty.
+    """
+    try:
+        rows = retry(lambda: ws(sheet_name).get_all_values()) or []
+        if not rows:
+            return pd.DataFrame()
+
+        header = [h.strip() for h in rows[0]] if rows else []
+        data = rows[1:] if len(rows) > 1 else []
+        df = pd.DataFrame(data, columns=header) if header else pd.DataFrame()
+
+        # clean headers
+        df.columns = [c.strip() for c in df.columns]
+        return df.fillna("")
+    except Exception as e:
+        st.warning(f"Could not load data for '{sheet_name}': {e}")
+        return pd.DataFrame()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Masters & Config sheets
@@ -834,7 +856,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
 # ─────────────────────────────────────────────────────────────────────────────
 # Navigation (dynamic modules + static pages)
 # ─────────────────────────────────────────────────────────────────────────────
-STATIC_PAGES = ["View / Export", "Email / WhatsApp", "Masters Admin", "Bulk Import Insurance", "Summary"]
+STATIC_PAGES = ["View / Export", "Email / WhatsApp", "Masters Admin", "Bulk Import Insurance", "Summary", "Update Record"]
 
 def nav_pages_for(role: str):
     module_pairs = modules_enabled_for(CLIENT_ID, role)  # [(Module, SheetName)]
@@ -880,7 +902,7 @@ if page != "—":
         cat = modules_catalog_df()
         choices = [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") for _, r in cat.iterrows()]
         mod_names = [m for m,_ in choices]
-        sel_mod = st.selectbox("Module", mod_names)
+        sel_mod = st.selectbox("Module", mod_names, key="export_mod_sel")
         sheet_name = dict(choices)[sel_mod]
 
         if st.button("🔄 Refresh"):
@@ -929,7 +951,7 @@ if page != "—":
         cat = modules_catalog_df()
         choices = [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") for _, r in cat.iterrows()]
         mod_names = [m for m,_ in choices]
-        sel_mod = st.selectbox("Module", mod_names)
+        sel_mod = st.selectbox("Module", mod_names, key="email_mod_sel")
         sheet_name = dict(choices)[sel_mod]
 
         df_all = load_module_df(sheet_name)
@@ -1114,8 +1136,7 @@ if page != "—":
             with c2:
                 u_name = st.text_input("Display Name")
             with c3:
-                u_role = st.selectbox("Role", ["User","Admin","Super Admin"])
-
+                u_role = st.selectbox("Role", ["User","Admin","Super Admin"], key="users_role_sel")
             c4, c5, c6 = st.columns(3)
             with c4:
                 u_client = st.text_input("ClientID", value=CLIENT_ID, key="users_client_id")
@@ -1257,7 +1278,7 @@ if page != "—":
                 )
             with c2:
                 cat = modules_catalog_df()
-                cm_mod = st.selectbox("Module", cat["Module"].tolist() if not cat.empty else [])
+                cm_mod = st.selectbox("Module", cat["Module"].tolist() if not cat.empty else [], key="cm_mod_sel")
             with c3:
                 cm_enabled = st.checkbox("Enabled", value=True)
 
@@ -1275,8 +1296,8 @@ if page != "—":
             st.markdown("**Form Schema (Per Client + Module)**")
             sdf = schema_df()
             cat = modules_catalog_df()
-            mod_sel = st.selectbox("Module", cat["Module"].tolist() if not cat.empty else [])
-            cids = sorted(set(["DEFAULT"] + sdf["ClientID"].dropna().astype(str).unique().tolist()))
+            mod_sel = st.selectbox("Module", cat["Module"].tolist() if not cat.empty else [], key="fs_mod_sel")
+cid_sel = st.selectbox("ClientID", cids, index=(cids.index(CLIENT_ID) if CLIENT_ID in cids else 0), key="fs_client_sel")
             cid_sel = st.selectbox("ClientID", cids, index=(cids.index(CLIENT_ID) if CLIENT_ID in cids else 0))
             view = sdf[(sdf["Module"]==mod_sel) & (sdf["ClientID"]==cid_sel)]
             if view.empty:
@@ -1371,7 +1392,7 @@ if page != "—":
 
         choices = [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") for _, r in cat.iterrows()]
         mod_names = [m for m,_ in choices]
-        sel_mod = st.selectbox("Module", mod_names)
+        sel_mod = st.selectbox("Module", mod_names, key="summary_mod_sel")
         sheet_name = dict(choices)[sel_mod]
 
         raw = load_module_df(sheet_name)
@@ -1503,6 +1524,149 @@ if page != "—":
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 # --- END Summary page block ---
+elif page == "Update Record":
+    st.subheader("Update Record")
+
+    # pick module/sheet first (so it works across modules)
+    cat = modules_catalog_df()
+    if cat.empty:
+        st.info("No modules defined yet.")
+        st.stop()
+
+    choices = [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") for _, r in cat.iterrows()]
+    mod_names = [m for m,_ in choices]
+    sel_mod = st.selectbox("Module", mod_names, key="update_mod_sel")
+    sheet_name = dict(choices)[sel_mod]
+
+    wsx = ws(sheet_name)
+
+    # load current sheet to a dataframe (robust to empty)
+    vals = retry(lambda: wsx.get_all_values()) or []
+    if not vals:
+        st.info("No data in this module yet.")
+        st.stop()
+    header = [h.strip() for h in (vals[0] or [])]
+    rows = vals[1:]
+    df = pd.DataFrame(rows, columns=header) if rows else pd.DataFrame(columns=header)
+
+    if df.empty:
+        st.info("No data in this module yet.")
+        st.stop()
+
+    # ---- search area ----
+    st.markdown("**Search by any of:** ClaimID, EID, MemberID, ApprovalCode, ERXNumber")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1: q_claim = st.text_input("ClaimID")
+    with c2: q_eid   = st.text_input("EID")
+    with c3: q_mem   = st.text_input("MemberID")
+    with c4: q_appr  = st.text_input("ApprovalCode")
+    with c5: q_erx   = st.text_input("ERXNumber")
+
+    # apply AND filter over provided fields (exact match, case-insensitive)
+    def _apply_text_eq(col, val, _df):
+        if not val or col not in _df.columns: return _df
+        v = str(val).strip().lower()
+        return _df[_df[col].astype(str).str.strip().str.lower() == v]
+
+    hits = df.copy()
+    hits = _apply_text_eq("ClaimID",      q_claim, hits)
+    hits = _apply_text_eq("EID",          q_eid,   hits)
+    hits = _apply_text_eq("MemberID",     q_mem,   hits)
+    hits = _apply_text_eq("ApprovalCode", q_appr,  hits)
+    hits = _apply_text_eq("ERXNumber",    q_erx,   hits)
+
+    if hits.empty:
+        st.warning("No matching records found. Refine your search.")
+        st.stop()
+
+    # show matches and let the user pick one record to update
+    st.caption(f"Matches: {len(hits)} (showing first 200)")
+    show = hits.head(200).copy()
+    show.reset_index(inplace=True)  # preserve original row index from df
+    show.rename(columns={"index": "__row_index__"}, inplace=True)
+    st.dataframe(show, use_container_width=True, hide_index=True)
+
+    # choose which matching row to edit
+    sel_idx = st.number_input(
+        "Enter the __row_index__ of the record to edit",
+        min_value=int(show["__row_index__"].min()), 
+        max_value=int(show["__row_index__"].max()),
+        value=int(show["__row_index__"].min()),
+        step=1
+    )
+
+    if st.button("Load Selected Record"):
+        st.session_state["_edit_row_index"] = int(sel_idx)
+
+    if "_edit_row_index" not in st.session_state:
+        st.stop()
+
+    row_idx_df = int(st.session_state["_edit_row_index"])            # index into df (0-based for data rows)
+    a1_row = row_idx_df + 2                                          # +1 for header, +1 to convert to 1-based
+
+    record = df.iloc[row_idx_df].to_dict()
+
+    # role-based editable columns
+    meta_cols = {"Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module"}
+    user_allowed = {"Status","FinalStatus","Remark","Remarks","Comment","Comments"}
+
+    if ROLE in ("Super Admin","Admin"):
+        editable_cols = [c for c in header if c]                     # allow everything (including meta, if you truly want)
+        # If you prefer to keep meta locked even for admins, use:
+        # editable_cols = [c for c in header if c and c not in meta_cols]
+    else:
+        editable_cols = [c for c in header if c in user_allowed]
+
+    if not editable_cols:
+        st.info("No editable columns for your role on this sheet.")
+        st.stop()
+
+    # helper: dropdown for Status / FinalStatus if present, else text inputs
+    opt_status = safe_list(MS_STATUS, [])
+    def _edit_widget(colname, current):
+        label = f"{colname}"
+        if colname in ("Status","FinalStatus") and opt_status:
+            return st.selectbox(label, options=opt_status, index=(opt_status.index(current) if current in opt_status else 0))
+        elif colname.lower() in ("remark","remarks","comment","comments"):
+            return st.text_area(label, value=str(current or ""))
+        else:
+            return st.text_input(label, value=str(current or ""))
+
+    st.markdown("### Edit fields")
+    with st.form("edit_form", clear_on_submit=False):
+        new_values = {}
+        for col in editable_cols:
+            new_values[col] = _edit_widget(col, record.get(col, ""))
+
+        submitted = st.form_submit_button("Save Changes", type="primary", use_container_width=True)
+
+    if submitted:
+        # build the final row values (preserve non-editable cells)
+        updated = []
+        for col in header:
+            if not col:
+                updated.append("")
+            elif col in new_values:
+                updated.append(new_values[col])
+            else:
+                updated.append(record.get(col, ""))
+
+        # robust A1 range for any number of columns
+        def _col_label(n: int) -> str:
+            s = ""
+            while n:
+                n, r = divmod(n-1, 26)
+                s = chr(65+r) + s
+            return s
+
+        end_col = _col_label(len(header))
+        rng = f"A{a1_row}:{end_col}{a1_row}"
+
+        try:
+            retry(lambda: wsx.update(rng, [updated]))
+            st.success("Record updated ✔️")
+        except Exception as e:
+            st.error(f"Update failed: {e}")
 
 else:
     # ===================== Dynamic Module =====================
