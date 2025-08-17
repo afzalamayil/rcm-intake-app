@@ -418,7 +418,7 @@ def schema_df() -> pd.DataFrame:
     for col in REQUIRED_HEADERS[MS_FORM_SCHEMA]:
         if col not in df.columns:
             df[col] = ""
-    df["ClientID"]       = df["ClientID"].astype(str).str.strip()
+    df["ClientID"] = df["ClientID"].astype(str).str.strip().str.upper()
     df["Module"]         = df["Module"].astype(str).str.strip()
     df["FieldKey"]       = df["FieldKey"].astype(str).str.strip()
     df["Label"]          = df["Label"].astype(str)
@@ -579,14 +579,25 @@ def seed_form_schema_for_module(module: str, client_id: str = "DEFAULT"):
 # ─────────────────────────────────────────────────────────────────────────────
 def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role: str):
     sdf = schema_df()
-    rows = sdf[(sdf["Module"]==module_name) & (sdf["ClientID"]==client_id)]
+
+    # accept current client, DEFAULT, or ALL as wildcards
+    rows = sdf[(sdf["Module"] == module_name) & (sdf["ClientID"].isin([client_id, "DEFAULT", "ALL"]))]
+
+    # if nothing yet, try a last fallback to DEFAULT (kept for safety)
     if rows.empty:
-        rows = sdf[(sdf["Module"]==module_name) & (sdf["ClientID"]=="DEFAULT")]
+        rows = sdf[(sdf["Module"] == module_name) & (sdf["ClientID"] == "DEFAULT")]
+
     rows = rows.sort_values("Order")
 
     if rows.empty:
-        st.info("No schema configured for this module (add rows in FormSchema).")
-        return
+        # Auto-create a sensible default schema for this module, then reload
+        seed_form_schema_for_module(module_name, client_id if client_id else "DEFAULT")
+        schema_df.clear()
+        sdf = schema_df()
+        rows = sdf[(sdf["Module"] == module_name) & (sdf["ClientID"].isin([client_id, "DEFAULT", "ALL"]))].sort_values("Order")
+        if rows.empty:
+            st.info("No schema configured for this module (add rows in FormSchema).")
+            return
 
     with st.form(f"dyn_form_{module_name}", clear_on_submit=False):
         pharm_df = pharm_master()
