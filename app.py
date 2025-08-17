@@ -331,6 +331,9 @@ def load_users_df():
         return None if df.empty else df
     except Exception:
         return None
+def _safe_users_df():
+    df = load_users_df()
+    return df if (df is not None and not df.empty) else pd.DataFrame(columns=REQUIRED_HEADERS[USERS_TAB])
 
 USERS_DF = load_users_df()
 
@@ -1097,7 +1100,7 @@ with tabD:
 
 with tabU:
     st.markdown("**Users**")
-    udf = load_users_df() or pd.DataFrame(columns=REQUIRED_HEADERS[USERS_TAB])
+    udf = _safe_users_df()
     st.dataframe(udf, use_container_width=True, hide_index=True)
 
     c1, c2, c3 = st.columns(3)
@@ -1147,7 +1150,7 @@ with tabU:
 with tabUM:
     st.markdown("**User Modules (Per-User Visibility Override)**")
     all_mods = modules_catalog_df()["Module"].tolist()
-    udf = load_users_df() or pd.DataFrame(columns=REQUIRED_HEADERS[USERS_TAB])
+    udf = _safe_users_df()
     user_choices = udf["username"].tolist() if not udf.empty else []
     sel_user = st.selectbox("Username", user_choices)
 
