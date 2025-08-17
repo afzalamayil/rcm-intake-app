@@ -1044,28 +1044,27 @@ else:
 
     # Masters Admin
     elif page == "Masters Admin":
-        if ROLE not in ("Super Admin","Admin"): st.stop()
-        st.subheader("Masters & Configuration")
+    if ROLE not in ("Super Admin","Admin"): st.stop()
+    st.subheader("Masters & Configuration")
 
-tab1, tab2, tab3, tab4, tabD, tab5, tab6, tab7, tabU, tabUM = st.tabs([
-    "Submission Modes","Portals","Status","Pharmacies","Doctors",
-    "Modules","Client Modules","Form Schema","Users","User Modules"
-])
+    tab1, tab2, tab3, tab4, tabD, tab5, tab6, tab7, tabU, tabUM = st.tabs([
+        "Submission Modes","Portals","Status","Pharmacies","Doctors",
+        "Modules","Client Modules","Form Schema","Users","User Modules"
+    ])
 
-def simple_list_editor(title):
-    st.markdown(f"**{title}**")
-    vals = _list_from_sheet(title) or []
-    st.write(f"Current: {', '.join(vals) if vals else '(empty)'}")
-    new_val = st.text_input(f"Add to {title}", key=f"add_{title}")
-    if st.button(f"Add", key=f"btn_{title}"):
-        if new_val.strip():
-            retry(lambda: ws(title).append_row([new_val.strip()]))
-            _list_from_sheet.clear(); st.success("Added ✅")
+    def simple_list_editor(title):
+        st.markdown(f"**{title}**")
+        vals = _list_from_sheet(title) or []
+        st.write(f"Current: {', '.join(vals) if vals else '(empty)'}")
+        new_val = st.text_input(f"Add to {title}", key=f"add_{title}")
+        if st.button(f"Add", key=f"btn_{title}"):
+            if new_val.strip():
+                retry(lambda: ws(title).append_row([new_val.strip()]))
+                _list_from_sheet.clear(); st.success("Added ✅")
 
-with tab1: simple_list_editor(MS_SUBMISSION_MODE)
-with tab2: simple_list_editor(MS_PORTAL)
-with tab3: simple_list_editor(MS_STATUS)
-
+    with tab1: simple_list_editor(MS_SUBMISSION_MODE)
+    with tab2: simple_list_editor(MS_PORTAL)
+    with tab3: simple_list_editor(MS_STATUS)
 with tab4:
     st.markdown("**Pharmacies**")
     ph_df = pharm_master()
@@ -1082,12 +1081,17 @@ with tabD:
     st.markdown("**Doctors (Client-Scoped)**")
     ddf_all = doctors_master(client_id=None)
     st.dataframe(ddf_all, use_container_width=True, hide_index=True)
+
     c1, c2, c3, c4 = st.columns(4)
-    with c1: did = st.text_input("DoctorID", placeholder="e.g., D001")
-    with c2: dname = st.text_input("Doctor Name", placeholder="Dr. Ahmed Ali")
-    with c3: dspec = st.text_input("Specialty", placeholder="Pediatrics")
+    with c1:
+        did = st.text_input("DoctorID", placeholder="e.g., D001")
+    with c2:
+        dname = st.text_input("Doctor Name", placeholder="Dr. Ahmed Ali")
+    with c3:
+        dspec = st.text_input("Specialty", placeholder="Pediatrics")
     with c4:
-    dclient = st.text_input("ClientID", value=CLIENT_ID, key="doc_client_id")
+        dclient = st.text_input("ClientID", value=CLIENT_ID, key="doc_client_id")
+
     if st.button("Add Doctor", key="doc_add"):
         if did.strip() and dname.strip() and dclient.strip():
             retry(lambda: ws(MS_DOCTORS).append_row(
@@ -1105,15 +1109,20 @@ with tabU:
     st.dataframe(udf, use_container_width=True, hide_index=True)
 
     c1, c2, c3 = st.columns(3)
-    with c1: u_username = st.text_input("Username (email)")
-    with c2: u_name     = st.text_input("Display Name")
-    with c3: u_role     = st.selectbox("Role", ["User","Admin","Super Admin"])
+    with c1:
+        u_username = st.text_input("Username (email)")
+    with c2:
+        u_name = st.text_input("Display Name")
+    with c3:
+        u_role = st.selectbox("Role", ["User","Admin","Super Admin"])
 
     c4, c5, c6 = st.columns(3)
     with c4:
-    u_client = st.text_input("ClientID", value=CLIENT_ID, key="users_client_id")
-    with c5: u_pharms   = st.text_input("Pharmacy IDs (comma-separated)", placeholder="ALL or e.g. P001,P002")
-    with c6: u_pwd      = st.text_input("Password (plain)", type="password")
+        u_client = st.text_input("ClientID", value=CLIENT_ID, key="users_client_id")
+    with c5:
+        u_pharms = st.text_input("Pharmacy IDs (comma-separated)", placeholder="ALL or e.g. P001,P002")
+    with c6:
+        u_pwd = st.text_input("Password (plain)", type="password")
 
     if st.button("Add / Update User", type="primary"):
         if not (u_username.strip() and u_name.strip() and u_role.strip()):
@@ -1236,19 +1245,21 @@ with tab6:
     st.markdown("**Client Modules**")
     cm = client_modules_df()
     st.dataframe(cm, use_container_width=True, hide_index=True)
+
     c1, c2, c3 = st.columns(3)
     with c1:
-    cm_client = st.text_input(
-        "ClientID",
-        value=CLIENT_ID if ROLE != "Super Admin" else "",
-        key="cm_client_id"
-    )
+        cm_client = st.text_input(
+            "ClientID",
+            value=CLIENT_ID if ROLE != "Super Admin" else "",
+            key="cm_client_id"
+        )
     with c2:
         cat = modules_catalog_df()
         cm_mod = st.selectbox("Module", cat["Module"].tolist() if not cat.empty else [])
     with c3:
         cm_enabled = st.checkbox("Enabled", value=True)
-        if st.button("Add/Enable for Client", type="primary"):
+
+    if st.button("Add/Enable for Client", type="primary"):
             if not cm_client.strip() or not cm_mod.strip():
                 st.error("ClientID and Module are required.")
             else:
