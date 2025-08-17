@@ -1045,7 +1045,6 @@ else:
     # Masters Admin
     elif page == "Masters Admin":
         if ROLE not in ("Super Admin","Admin"): st.stop()
-            st.stop()
         st.subheader("Masters & Configuration")
 
         tab1, tab2, tab3, tab4, tabD, tab5, tab6, tab7, tabU, tabUM = st.tabs([
@@ -1348,7 +1347,6 @@ else:
     # Bulk Import Insurance
     elif page == "Bulk Import Insurance":
         if ROLE not in ("Super Admin","Admin"): st.stop()
-            st.stop()
         st.subheader("Bulk Import Insurance (CSV/XLSX with columns: Code, Name)")
         uploaded = st.file_uploader("Upload file", type=["csv","xlsx"])
         if uploaded:
