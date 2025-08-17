@@ -1086,7 +1086,8 @@ with tabD:
     with c1: did = st.text_input("DoctorID", placeholder="e.g., D001")
     with c2: dname = st.text_input("Doctor Name", placeholder="Dr. Ahmed Ali")
     with c3: dspec = st.text_input("Specialty", placeholder="Pediatrics")
-    with c4: dclient = st.text_input("ClientID", value=CLIENT_ID)
+    with c4:
+    dclient = st.text_input("ClientID", value=CLIENT_ID, key="doc_client_id")
     if st.button("Add Doctor", key="doc_add"):
         if did.strip() and dname.strip() and dclient.strip():
             retry(lambda: ws(MS_DOCTORS).append_row(
@@ -1109,7 +1110,8 @@ with tabU:
     with c3: u_role     = st.selectbox("Role", ["User","Admin","Super Admin"])
 
     c4, c5, c6 = st.columns(3)
-    with c4: u_client   = st.text_input("ClientID", value=CLIENT_ID)
+    with c4:
+    u_client = st.text_input("ClientID", value=CLIENT_ID, key="users_client_id")
     with c5: u_pharms   = st.text_input("Pharmacy IDs (comma-separated)", placeholder="ALL or e.g. P001,P002")
     with c6: u_pwd      = st.text_input("Password (plain)", type="password")
 
@@ -1235,7 +1237,12 @@ with tab6:
     cm = client_modules_df()
     st.dataframe(cm, use_container_width=True, hide_index=True)
     c1, c2, c3 = st.columns(3)
-    with c1: cm_client = st.text_input("ClientID", value=CLIENT_ID if ROLE!="Super Admin" else "")
+    with c1:
+    cm_client = st.text_input(
+        "ClientID",
+        value=CLIENT_ID if ROLE != "Super Admin" else "",
+        key="cm_client_id"
+    )
     with c2:
         cat = modules_catalog_df()
         cm_mod = st.selectbox("Module", cat["Module"].tolist() if not cat.empty else [])
