@@ -1561,6 +1561,14 @@ if page != "—":
         combined = combined.reset_index()
         num_cols = [c for c in combined.columns if c not in ("SubmissionMode","SubmissionDate")]
         combined[num_cols] = combined[num_cols].round(2)
+        
+        # 🔧 Normalize index/display columns to strings so Arrow doesn't choke
+        for col in ("SubmissionMode", "SubmissionDate"):
+            if col in combined.columns:
+                combined[col] = combined[col].apply(
+                    lambda x: x.strftime("%Y-%m-%d") if isinstance(x, (pd.Timestamp, datetime, date))
+                    else ("" if x is None else str(x))
+                )
 
         st.caption("Rows: **Submission Mode → (— Total — then dates if available)**. Columns: **Pharmacy Name**. Values: **Sum of selected measure**. Grand Total at bottom.")
         st.dataframe(combined, use_container_width=True)
