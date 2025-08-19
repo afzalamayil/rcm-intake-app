@@ -477,23 +477,25 @@ def user_modules_df() -> pd.DataFrame:
 
 def modules_enabled_for(client_id: str, role: str) -> list[tuple[str,str]]:
     cat = modules_catalog_df()
-    if cat.empty: 
+    if cat.empty:
         return []
 
     r = str(role).strip().lower()
+
     # Base set: by client (or all for superadmin)
     if r in ("super admin","superadmin"):
         base = cat.copy()
     else:
         cm = client_modules_df()
-        if cm.empty:
+
+        # ✅ NEW: if there are no rows for this client, use DefaultEnabled
+        if cm.empty or cm[cm["ClientID"] == client_id].empty:
             base = cat[cat["DefaultEnabled"]]
         else:
-            allowed_client = set(cm[(cm["ClientID"]==client_id) & (cm["Enabled"])]["Module"].tolist())
+            allowed_client = set(cm[(cm["ClientID"] == client_id) & (cm["Enabled"])]["Module"].tolist())
             base = cat[cat["Module"].isin(allowed_client)]
 
-    # Optional per-user override: if there are rows for this user in UserModules,
-    # show only modules explicitly Enabled for them. If no rows for the user, keep base.
+    # Optional per-user override …
     um = user_modules_df()
     if not um.empty:
         mine = um[um["Username"].str.lower() == str(username).lower()]
@@ -994,7 +996,11 @@ if page != "—":
             if r_from: df = df[pd.to_datetime(df['SubmissionDate'], errors="coerce") >= pd.to_datetime(r_from)]
             if r_to:   df = df[pd.to_datetime(df['SubmissionDate'], errors="coerce") <= pd.to_datetime(r_to)]
 
-        st.success(f"Filtered rows: {len(df)}") if not df.empty else st.warning("No data for selected filters.")
+        if not df.empty:
+            st.success(f"Filtered rows: {len(df)}")
+        else:
+            st.warning("No data for selected filters.")
+
 
         xbytes = io.BytesIO()
         with pd.ExcelWriter(xbytes, engine="openpyxl") as w: df.to_excel(w, index=False, sheet_name=sel_mod or "Data")
@@ -1477,10 +1483,21 @@ if page != "—":
             df["SubmissionDate"] = pd.to_datetime(df["SubmissionDate"], errors="coerce").dt.date
         if measure in df:
             df[measure] = pd.to_numeric(df[measure], errors="coerce").fillna(0.0)
-        df["PharmacyName"]   = df.get("PharmacyName","").replace("", pd.NA).fillna("Unknown")
-        df["SubmissionMode"] = df.get("SubmissionMode","").replace("", pd.NA).fillna("Unknown")
-        df["InsuranceName"]  = df.get("InsuranceName","")
-        df["InsuranceCode"]  = df.get("InsuranceCode","")
+        # --- Safe normalization so missing columns never break the page ---
+        needed_defaults = {
+            "PharmacyName":   "Unknown",
+            "SubmissionMode": "Unknown",
+            "InsuranceName":  "",
+            "InsuranceCode":  "",
+        }
+        for col, default in needed_defaults.items():
+            if col not in df.columns:
+                # create the column with the right length
+                df[col] = pd.Series([default] * len(df), index=df.index, dtype="object")
+            # normalize empties
+            df[col] = df[col].replace("", pd.NA).fillna(default)
+# -----------------------------------------------------------------
+
 
         if date_from and "SubmissionDate" in df:
             df = df[df["SubmissionDate"] >= date_from]
@@ -1705,11 +1722,11 @@ if page != "—":
                 st.error(f"Update failed: {e}")
             # end of "Update Record" branch
 
-    # ===================== Dynamic Module =====================
-    else:   # ← align this with "if page ==" and "elif page =="
-        if module_choice:
-            sheet_name = dict(module_pairs).get(module_choice)
-            st.subheader(f"{module_choice} — Dynamic Intake")
-            _render_dynamic_form(module_choice, sheet_name, CLIENT_ID, ROLE)
-        else:
-            st.info("No modules enabled. Pick a page on the left.")
+# ===================== Dynamic Module =====================
+else:   # ← align this with "if page ==" and "elif page =="
+    if module_choice:
+        sheet_name = dict(module_pairs).get(module_choice)
+        st.subheader(f"{module_choice} — Dynamic Intake")
+        _render_dynamic_form(module_choice, sheet_name, CLIENT_ID, ROLE)
+    else:
+        st.info("No modules enabled. Pick a page on the left.")
