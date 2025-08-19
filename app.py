@@ -176,6 +176,28 @@ def load_module_df(sheet_name: str) -> pd.DataFrame:
     except Exception as e:
         st.warning(f"Could not load data for '{sheet_name}': {e}")
         return pd.DataFrame()
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers used by data pages (scope to client & pharmacy ACL)
+# ─────────────────────────────────────────────────────────────────────────────
+def _apply_common_filters(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Applies shared filters to a module dataframe:
+    - Restrict to current CLIENT_ID (if column exists)
+    - Restrict to allowed pharmacies list (if column exists)
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+
+    if "ClientID" in out.columns:
+        out = out[out["ClientID"].astype(str).str.upper() == str(CLIENT_ID).upper()]
+
+    if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"] and "PharmacyID" in out.columns:
+        out = out[out["PharmacyID"].astype(str).isin([str(x) for x in ALLOWED_PHARM_IDS])]
+
+    return out.fillna("")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Masters & Config sheets
@@ -1545,148 +1567,149 @@ if page != "—":
             st.info("No modules defined yet.")
             st.stop()
 
-    choices = [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") for _, r in cat.iterrows()]
-    mod_names = [m for m,_ in choices]
-    sel_mod = st.selectbox("Module", mod_names, key="update_mod_sel")
-    sheet_name = dict(choices)[sel_mod]
+        choices = [(r["Module"], r["SheetName"] or f"Data_{r['Module']}") for _, r in cat.iterrows()]
+        mod_names = [m for m,_ in choices]
+        sel_mod = st.selectbox("Module", mod_names, key="update_mod_sel")
+        sheet_name = dict(choices)[sel_mod]
 
-    wsx = ws(sheet_name)
+        wsx = ws(sheet_name)
 
-    # load current sheet to a dataframe (robust to empty)
-    vals = retry(lambda: wsx.get_all_values()) or []
-    if not vals:
-        st.info("No data in this module yet.")
-        st.stop()
-    header = [h.strip() for h in (vals[0] or [])]
-    rows = vals[1:]
-    df = pd.DataFrame(rows, columns=header) if rows else pd.DataFrame(columns=header)
+        # load current sheet to a dataframe (robust to empty)
+        vals = retry(lambda: wsx.get_all_values()) or []
+        if not vals:
+            st.info("No data in this module yet.")
+            st.stop()
+        header = [h.strip() for h in (vals[0] or [])]
+        rows = vals[1:]
+        df = pd.DataFrame(rows, columns=header) if rows else pd.DataFrame(columns=header)
 
-    if df.empty:
-        st.info("No data in this module yet.")
-        st.stop()
+        df = _apply_common_filters(df)
+        
+        if df.empty:
+            st.info("No data in this module yet.")
+            st.stop()
 
-    # ---- search area ----
-    st.markdown("**Search by any of:** ClaimID, EID, MemberID, ApprovalCode, ERXNumber")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1: q_claim = st.text_input("ClaimID")
-    with c2: q_eid   = st.text_input("EID")
-    with c3: q_mem   = st.text_input("MemberID")
-    with c4: q_appr  = st.text_input("ApprovalCode")
-    with c5: q_erx   = st.text_input("ERXNumber")
-
-    # apply AND filter over provided fields (exact match, case-insensitive)
-    def _apply_text_eq(col, val, _df):
-        if not val or col not in _df.columns: return _df
-        v = str(val).strip().lower()
-        return _df[_df[col].astype(str).str.strip().str.lower() == v]
-
-    hits = df.copy()
-    hits = _apply_text_eq("ClaimID",      q_claim, hits)
-    hits = _apply_text_eq("EID",          q_eid,   hits)
-    hits = _apply_text_eq("MemberID",     q_mem,   hits)
-    hits = _apply_text_eq("ApprovalCode", q_appr,  hits)
-    hits = _apply_text_eq("ERXNumber",    q_erx,   hits)
-
-    if hits.empty:
-        st.warning("No matching records found. Refine your search.")
-        st.stop()
-
-    # show matches and let the user pick one record to update
-    st.caption(f"Matches: {len(hits)} (showing first 200)")
-    show = hits.head(200).copy()
-    show.reset_index(inplace=True)  # preserve original row index from df
-    show.rename(columns={"index": "__row_index__"}, inplace=True)
-    st.dataframe(show, use_container_width=True, hide_index=True)
-
-    # choose which matching row to edit
-    sel_idx = st.number_input(
-        "Enter the __row_index__ of the record to edit",
-        min_value=int(show["__row_index__"].min()), 
-        max_value=int(show["__row_index__"].max()),
-        value=int(show["__row_index__"].min()),
-        step=1
-    )
-
-    if st.button("Load Selected Record"):
-        st.session_state["_edit_row_index"] = int(sel_idx)
-
-    if "_edit_row_index" not in st.session_state:
-        st.stop()
-
-    row_idx_df = int(st.session_state["_edit_row_index"])            # index into df (0-based for data rows)
-    a1_row = row_idx_df + 2                                          # +1 for header, +1 to convert to 1-based
-
-    record = df.iloc[row_idx_df].to_dict()
-
-    # role-based editable columns
-    meta_cols = {"Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module"}
-    user_allowed = {"Status","FinalStatus","Remark","Remarks","Comment","Comments"}
-
-    if ROLE in ("Super Admin","Admin"):
-        editable_cols = [c for c in header if c]                     # allow everything (including meta, if you truly want)
-        # If you prefer to keep meta locked even for admins, use:
-        # editable_cols = [c for c in header if c and c not in meta_cols]
-    else:
-        editable_cols = [c for c in header if c in user_allowed]
-
-    if not editable_cols:
-        st.info("No editable columns for your role on this sheet.")
-        st.stop()
-
-    # helper: dropdown for Status / FinalStatus if present, else text inputs
-    opt_status = safe_list(MS_STATUS, [])
-    def _edit_widget(colname, current):
-        label = f"{colname}"
-        if colname in ("Status","FinalStatus") and opt_status:
-            return st.selectbox(label, options=opt_status, index=(opt_status.index(current) if current in opt_status else 0))
-        elif colname.lower() in ("remark","remarks","comment","comments"):
-            return st.text_area(label, value=str(current or ""))
+        # ---- search area ----
+        st.markdown("**Search by any of:** ClaimID, EID, MemberID, ApprovalCode, ERXNumber")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        with c1: q_claim = st.text_input("ClaimID")
+        with c2: q_eid   = st.text_input("EID")
+        with c3: q_mem   = st.text_input("MemberID")
+        with c4: q_appr  = st.text_input("ApprovalCode")
+        with c5: q_erx   = st.text_input("ERXNumber")
+    
+        # apply AND filter over provided fields (exact match, case-insensitive)
+        def _apply_text_eq(col, val, _df):
+            if not val or col not in _df.columns: return _df
+            v = str(val).strip().lower()
+            return _df[_df[col].astype(str).str.strip().str.lower() == v]
+    
+        hits = df.copy()
+        hits = _apply_text_eq("ClaimID",      q_claim, hits)
+        hits = _apply_text_eq("EID",          q_eid,   hits)
+        hits = _apply_text_eq("MemberID",     q_mem,   hits)
+        hits = _apply_text_eq("ApprovalCode", q_appr,  hits)
+        hits = _apply_text_eq("ERXNumber",    q_erx,   hits)
+    
+        if hits.empty:
+            st.warning("No matching records found. Refine your search.")
+            st.stop()
+    
+        # show matches and let the user pick one record to update
+        st.caption(f"Matches: {len(hits)} (showing first 200)")
+        show = hits.head(200).copy()
+        show.reset_index(inplace=True)  # preserve original row index from df
+        show.rename(columns={"index": "__row_index__"}, inplace=True)
+        st.dataframe(show, use_container_width=True, hide_index=True)
+    
+        # choose which matching row to edit
+        sel_idx = st.number_input(
+            "Enter the __row_index__ of the record to edit",
+            min_value=int(show["__row_index__"].min()), 
+            max_value=int(show["__row_index__"].max()),
+            value=int(show["__row_index__"].min()),
+            step=1
+        )
+    
+        if st.button("Load Selected Record"):
+            st.session_state["_edit_row_index"] = int(sel_idx)
+    
+        if "_edit_row_index" not in st.session_state:
+            st.stop()
+    
+        row_idx_df = int(st.session_state["_edit_row_index"])            # index into df (0-based for data rows)
+        a1_row = row_idx_df + 2                                          # +1 for header, +1 to convert to 1-based
+    
+        record = df.iloc[row_idx_df].to_dict()
+    
+        # role-based editable columns
+        meta_cols = {"Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module"}
+        user_allowed = {"Status","FinalStatus","Remark","Remarks","Comment","Comments"}
+    
+        if ROLE in ("Super Admin","Admin"):
+            editable_cols = [c for c in header if c]                     # allow everything (including meta, if you truly want)
+            # If you prefer to keep meta locked even for admins, use:
+            # editable_cols = [c for c in header if c and c not in meta_cols]
         else:
-            return st.text_input(label, value=str(current or ""))
-
-    st.markdown("### Edit fields")
-    with st.form("edit_form", clear_on_submit=False):
-        new_values = {}
-        for col in editable_cols:
-            new_values[col] = _edit_widget(col, record.get(col, ""))
-
-        submitted = st.form_submit_button("Save Changes", type="primary", use_container_width=True)
-
-    if submitted:
-        # build the final row values (preserve non-editable cells)
-        updated = []
-        for col in header:
-            if not col:
-                updated.append("")
-            elif col in new_values:
-                updated.append(new_values[col])
+            editable_cols = [c for c in header if c in user_allowed]
+    
+        if not editable_cols:
+            st.info("No editable columns for your role on this sheet.")
+            st.stop()
+    
+        # helper: dropdown for Status / FinalStatus if present, else text inputs
+        opt_status = safe_list(MS_STATUS, [])
+        def _edit_widget(colname, current):
+            label = f"{colname}"
+            if colname in ("Status","FinalStatus") and opt_status:
+                return st.selectbox(label, options=opt_status, index=(opt_status.index(current) if current in opt_status else 0))
+            elif colname.lower() in ("remark","remarks","comment","comments"):
+                return st.text_area(label, value=str(current or ""))
             else:
-                updated.append(record.get(col, ""))
+                return st.text_input(label, value=str(current or ""))
+    
+        st.markdown("### Edit fields")
+        with st.form("edit_form", clear_on_submit=False):
+            new_values = {}
+            for col in editable_cols:
+                new_values[col] = _edit_widget(col, record.get(col, ""))
+    
+            submitted = st.form_submit_button("Save Changes", type="primary", use_container_width=True)
+    
+        if submitted:
+            # build the final row values (preserve non-editable cells)
+            updated = []
+            for col in header:
+                if not col:
+                    updated.append("")
+                elif col in new_values:
+                    updated.append(new_values[col])
+                else:
+                    updated.append(record.get(col, ""))
+    
+            # robust A1 range for any number of columns
+            def _col_label(n: int) -> str:
+                s = ""
+                while n:
+                    n, r = divmod(n-1, 26)
+                    s = chr(65+r) + s
+                return s
+    
+            end_col = _col_label(len(header))
+            rng = f"A{a1_row}:{end_col}{a1_row}"
+    
+            try:
+                retry(lambda: wsx.update(rng, [updated]))
+                st.success("Record updated ✔️")
+            except Exception as e:
+                st.error(f"Update failed: {e}")
+            # end of "Update Record" branch
 
-        # robust A1 range for any number of columns
-        def _col_label(n: int) -> str:
-            s = ""
-            while n:
-                n, r = divmod(n-1, 26)
-                s = chr(65+r) + s
-            return s
-
-        end_col = _col_label(len(header))
-        rng = f"A{a1_row}:{end_col}{a1_row}"
-
-        try:
-            retry(lambda: wsx.update(rng, [updated]))
-            st.success("Record updated ✔️")
-        except Exception as e:
-            st.error(f"Update failed: {e}")
-        # end of "Update Record" branch
-
-
-        # ===================== Dynamic Module =====================
-        else:   # ← align this with "if page ==" and "elif page =="
-            if module_choice:
-                sheet_name = dict(module_pairs).get(module_choice)
-                st.subheader(f"{module_choice} — Dynamic Intake")
-                _render_dynamic_form(module_choice, sheet_name, CLIENT_ID, ROLE)
-            else:
-                st.info("No modules enabled. Pick a page on the left.")
+    # ===================== Dynamic Module =====================
+    else:   # ← align this with "if page ==" and "elif page =="
+        if module_choice:
+            sheet_name = dict(module_pairs).get(module_choice)
+            st.subheader(f"{module_choice} — Dynamic Intake")
+            _render_dynamic_form(module_choice, sheet_name, CLIENT_ID, ROLE)
+        else:
+            st.info("No modules enabled. Pick a page on the left.")
