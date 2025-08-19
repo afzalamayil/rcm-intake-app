@@ -242,7 +242,7 @@ REQUIRED_HEADERS = {
     MS_PHARM: ["ID","Name"],
     MS_INSURANCE: ["Code","Name"],
     MS_USER_MODULES: ["Username","Module","Enabled"],
-    MS_DOCTORS: ["DoctorID","DoctorName","Specialty","ClientID"],
+    MS_DOCTORS: ["DoctorID","DoctorName","Specialty","ClientID","PharmacyID"],
     CLIENTS_TAB: ["ClientID","Name"],
     CLIENT_CONTACTS_TAB: ["ClientID","To","CC","WhatsApp"],
     MS_MODULES: ["Module","SheetName","DefaultEnabled","DupKeys","NumericFieldsJSON"],
@@ -328,22 +328,25 @@ def insurance_master() -> pd.DataFrame:
     df["Display"] = (df.get("Code","").astype(str).str.strip()+" - "+df.get("Name","").astype(str).str.strip()).str.strip(" -")
     return df[["Code","Name","Display"]]
 @st.cache_data(ttl=60, show_spinner=False)
-def doctors_master(client_id: str | None = None) -> pd.DataFrame:
-    """
-    Returns Doctors for the given client_id (or all if super admin passes None).
-    Columns guaranteed: DoctorID, DoctorName, Specialty, ClientID, Display
-    """
+def doctors_master(client_id: str | None = None, pharmacy_id: str | None = None) -> pd.DataFrame:
     df = read_sheet_df(MS_DOCTORS, REQUIRED_HEADERS[MS_DOCTORS]).fillna("")
     if df.empty:
-        return pd.DataFrame(columns=["DoctorID","DoctorName","Specialty","ClientID","Display"])
-    for c in ["DoctorID","DoctorName","Specialty","ClientID"]:
-        if c not in df.columns: df[c] = ""
+        return pd.DataFrame(columns=["DoctorID","DoctorName","Specialty","ClientID","PharmacyID","Display"])
+
+    # Ensure/normalize columns
+    for c in ["DoctorID","DoctorName","Specialty","ClientID","PharmacyID"]:
+        if c not in df.columns:
+            df[c] = ""
         df[c] = df[c].astype(str).str.strip()
-    # Scope to client unless None is passed (super admin explicit “all”)
-    if client_id:
-        df = df[df["ClientID"].astype(str).str.upper() == str(client_id).strip().upper()]
+
+    # Prefer pharmacy filter; fall back to client filter
+    if pharmacy_id:
+        df = df[df["PharmacyID"] == str(pharmacy_id).strip()]
+    elif client_id:
+        df = df[df["ClientID"].str.upper() == str(client_id).strip().upper()]
+
     df["Display"] = df["DoctorName"] + " (" + df["Specialty"].replace("", "—") + ")"
-    return df[["DoctorID","DoctorName","Specialty","ClientID","Display"]]
+    return df[["DoctorID","DoctorName","Specialty","ClientID","PharmacyID","Display"]]
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _list_from_sheet(title, col_candidates=("Value","Name","Mode","Portal","Status")):
@@ -536,16 +539,22 @@ def _options_from_token(token: str) -> list[str]:
         return []
 
     if token.startswith("MS:"):
-        key_raw = token.split(":", 1)[1].strip()
-        key = key_raw.lower()
+        key = token.split(":", 1)[1].strip().lower()
 
-        # Doctors (client-scoped). Use MS:DoctorsAll for Super Admin to see all.
         if key in ("doctors", "doctorsall"):
+            # get the Pharmacy ID from the visible selectbox (e.g., "345 - Al Iman ...")
+            ph_disp = st.session_state.get(f"{st.session_state.get('nav_mod','')}_pharmacy_display", "")
+            ph_id = ph_disp.split(" - ", 1)[0].strip() if " - " in ph_disp else ""
+
             try:
-                if key == "doctorsall" and str(ROLE).strip().lower() in ("super admin", "superadmin"):
-                    df = doctors_master(client_id=None)
+                if key == "doctorsall" and str(ROLE).strip().lower() in ("super admin","superadmin"):
+                    df = doctors_master(client_id=None, pharmacy_id=None)  # no filters
                 else:
-                    df = doctors_master(client_id=CLIENT_ID)
+                    # Prefer pharmacy filter; if no pharmacy chosen yet, fall back to client filter
+                    df = doctors_master(
+                        client_id=(None if not CLIENT_ID else CLIENT_ID),
+                        pharmacy_id=(ph_id or None)
+                    )
                 return df["Display"].tolist() if not df.empty else []
             except Exception:
                 return []
@@ -732,9 +741,22 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                 if typ == "textarea":
                     st.text_area(label_req, value=str(default), key=k+"_ro", disabled=True)
                 elif typ == "number":
-                    try: dv = float(default) if default not in ("", None) else 0.0
-                    except Exception: dv = 0.0
-                    st.number_input(label_req, value=float(dv), step=0.01, format="%.2f", key=k+"_ro", disabled=True)
+                    INT_KEYS = {"age", "mobile_number", "mobile", "phone"}
+                    if fkey in INT_KEYS:
+                        # integer-only
+                        try:
+                            dv = int(float(default)) if str(default).strip() not in ("", "None") else 0
+                        except Exception:
+                            dv = 0
+                        values[fkey] = st.number_input(label_req, value=int(dv), step=1, format="%d", key=k)
+                    else:
+                        # decimals for money etc.
+                        try:
+                            dv = float(default) if default not in ("", None) else 0.0
+                        except Exception:
+                            dv = 0.0
+                        values[fkey] = st.number_input(label_req, value=float(dv), step=0.01, format="%.2f", key=k)
+
                 elif typ == "date":
                     try: d = pd.to_datetime(default).date() if default else date.today()
                     except Exception: d = date.today()
@@ -826,11 +848,12 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                 chosen_doc_name = values.get(r["FieldKey"])
                 break
         if chosen_doc_name:
-            scope_client = None if str(ROLE).strip().lower() in ("super admin", "superadmin") else CLIENT_ID
-            ddf = doctors_master(client_id=scope_client)
+            ph_id = ph_disp.split(" - ", 1)[0].strip() if " - " in ph_disp else ""
+            ddf = doctors_master(client_id=scope_client, pharmacy_id=(ph_id or None))
             hit = ddf.loc[ddf["Display"] == chosen_doc_name]
             if not hit.empty and "doctor_id" in rows["FieldKey"].tolist():
                 values["doctor_id"] = hit.iloc[0]["DoctorID"]
+
     except Exception:
         pass
 
@@ -850,12 +873,22 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
             val = pd.to_datetime(val).strftime("%Y-%m-%d")
         if isinstance(val, list):
             val = ", ".join([str(x) for x in val])
+        # Decide which fields should be formatted as money/decimal
+        DECIMAL_KEYS = {"net_amount", "patient_share"}  # extend if needed
+        
         if isinstance(val, float):
-            try:
-                val = f"{float(val):.2f}"
-            except Exception:
-                pass
-        data_map[col] = "" if val is None else str(val)
+            if fk in DECIMAL_KEYS:
+                try:
+                    val = f"{float(val):.2f}"
+                except Exception:
+                    pass
+            else:
+                # keep as plain int-like if it’s integral, else minimal string
+                if float(val).is_integer():
+                    val = str(int(val))
+                else:
+                    val = str(val)
+
 
     # Duplicate check
     try:
@@ -1132,20 +1165,17 @@ if page != "—":
             ddf_all = doctors_master(client_id=None)
             st.dataframe(ddf_all, use_container_width=True, hide_index=True)
 
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                did = st.text_input("DoctorID", placeholder="e.g., D001")
-            with c2:
-                dname = st.text_input("Doctor Name", placeholder="Dr. Ahmed Ali")
-            with c3:
-                dspec = st.text_input("Specialty", placeholder="Pediatrics")
-            with c4:
-                dclient = st.text_input("ClientID", value=CLIENT_ID, key="doc_client_id")
-
+            c1, c2, c3, c4, c5 = st.columns(5) 
+            with c1: did = st.text_input("DoctorID", placeholder="e.g., D001")
+            with c2: dname = st.text_input("Doctor Name", placeholder="Dr. Ahmed Ali")
+            with c3: dspec = st.text_input("Specialty", placeholder="Pediatrics")
+            with c4: dclient = st.text_input("ClientID", value=CLIENT_ID, key="doc_client_id")
+            with c5: dpharm = st.text_input("PharmacyID", placeholder="e.g., 106")
+        
             if st.button("Add Doctor", key="doc_add"):
                 if did.strip() and dname.strip() and dclient.strip():
                     retry(lambda: ws(MS_DOCTORS).append_row(
-                        [did.strip(), dname.strip(), dspec.strip(), dclient.strip()],
+                        [did.strip(), dname.strip(), dspec.strip(), dclient.strip(), dpharm.strip()],
                         value_input_option="USER_ENTERED"
                     ))
                     doctors_master.clear()
