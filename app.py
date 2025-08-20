@@ -418,7 +418,7 @@ if page == "Intake Form":
         c1, c2, c3 = st.columns(3, gap="large")
         with c1:
             st.text_input("Employee Name*", key="employee_name")
-            st.date_input("Submission Date*", value=st.session_state["submission_date"], key="submission_date")
+            st.date_input("Submission Date*", key="submission_date")
             st.selectbox("Submission Mode*", submission_modes, key="submission_mode")
         with c2:
             st.selectbox("Pharmacy (ID - Name)*", pharm_choices, key="pharmacy_display")
