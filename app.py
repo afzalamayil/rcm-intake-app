@@ -693,9 +693,427 @@ def seed_form_schema_for_module(module: str, client_id: str = "DEFAULT"):
 # ─────────────────────────────────────────────────────────────────────────────
 # Form rendering
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _render_legacy_pharmacy_intake(sheet_name: str):
+    """
+    Exact legacy Pharmacy intake, wired to the target sheet_name (e.g. Data_Pharmacy).
+    Leaves all other modules on the dynamic engine.
+    """
+    # ---- headers expected by the legacy sheet ----
+    LEGACY_HEADERS = [
+        "Timestamp","SubmittedBy","Role",
+        "PharmacyID","PharmacyName",
+        "EmployeeName","SubmissionDate","SubmissionMode",
+        "Portal","ERXNumber","InsuranceCode","InsuranceName",
+        "MemberID","EID","ClaimID","ApprovalCode",
+        "NetAmount","PatientShare","Remark","Status"
+    ]
+
+    # ensure legacy headers on this module sheet (only if empty or wrong)
+    wsx = ws(sheet_name)
+    head = retry(lambda: wsx.row_values(1))
+    if not head:
+        retry(lambda: wsx.update("A1", [LEGACY_HEADERS]))
+    else:
+        # if headers differ, merge them (don’t break if extra cols exist)
+        merged = list(dict.fromkeys([*head, *LEGACY_HEADERS]))
+        if [h.lower() for h in head] != [h.lower() for h in merged]:
+            retry(lambda: wsx.update("A1", [merged]))
+
+    # masters
+    submission_modes = safe_list(MS_SUBMISSION_MODE, ["Walk-in","Phone","Email","Portal"])
+    portals          = safe_list(MS_PORTAL, ["DHPO","Riayati","Insurance Portal"])
+    statuses         = safe_list(MS_STATUS, ["Submitted","Approved","Rejected","Pending","RA Pending"])
+    pharm_df         = pharm_master()
+    ins_df           = insurance_master()
+
+    # ACL filter for selectable pharmacies
+    if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"]:
+        pharm_df = pharm_df[pharm_df["ID"].isin(ALLOWED_PHARM_IDS)]
+    pharm_choices = pharm_df["Display"].tolist() if not pharm_df.empty else ["—"]
+
+    # form state (same keys as legacy)
+    def _reset_form():
+        defaults = {
+            "employee_name": "",
+            "submission_date": date.today(),
+            "submission_mode": "",
+            "pharmacy_display": "",
+            "portal": "",
+            "erx_number": "",
+            "insurance_display": "",
+            "member_id": "",
+            "eid": "",
+            "claim_id": "",
+            "approval_code": "",
+            "net_amount": 0.0,
+            "patient_share": 0.0,
+            "status": "",
+            "remark": "",
+            "allow_dup_override": False,
+        }
+        for k, v in defaults.items():
+            st.session_state.setdefault(k, v)
+
+    if st.session_state.get("_clear_form", False):
+        for k in ("employee_name","submission_date","submission_mode","pharmacy_display","portal","erx_number",
+                  "insurance_display","member_id","eid","claim_id","approval_code","net_amount","patient_share",
+                  "status","remark","allow_dup_override"):
+            st.session_state.pop(k, None)
+        _reset_form()
+        st.session_state["_clear_form"] = False
+    _reset_form()
+
+    # duplicate check (same-day, ERX+Net) against this module's sheet
+    def _is_dup_today(erx_number: str, net_amount: float, subm_date: date) -> bool:
+        try:
+            df = pd.DataFrame(retry(lambda: wsx.get_all_records()))
+            if df.empty:
+                return False
+            df["SubmissionDate"] = pd.to_datetime(df.get("SubmissionDate"), errors="coerce").dt.date
+            same_day = df[df["SubmissionDate"] == subm_date]
+            if same_day.empty:
+                return False
+            net_str = f"{float(net_amount):.2f}"
+            erx_ok  = same_day.get("ERXNumber", pd.Series([], dtype=str)).astype(str).str.strip() == str(erx_number).strip()
+            net_ok  = pd.to_numeric(same_day.get("NetAmount", 0), errors="coerce").fillna(0.0).map(lambda x: f"{x:.2f}") == net_str
+            return bool((erx_ok & net_ok).any())
+        except Exception:
+            return False
+
+    # ---- UI (exact legacy layout/labels) ----
+    with st.form("pharmacy_intake_legacy", clear_on_submit=False):
+        c1, c2, c3 = st.columns(3, gap="large")
+        with c1:
+            st.text_input("Employee Name*", key="employee_name")
+            st.date_input("Submission Date*", key="submission_date")          # (no 'value=' to avoid yellow warning)
+            st.selectbox("Submission Mode*", submission_modes, key="submission_mode")
+        with c2:
+            st.selectbox("Pharmacy (ID - Name)*", pharm_choices, key="pharmacy_display")
+            st.selectbox("Portal* (DHPO / Riayati / Insurance Portal)", portals, key="portal")
+            st.text_input("ERX Number*", key="erx_number")
+        with c3:
+            st.selectbox("Insurance (Code - Name)*",
+                         ins_df["Display"].tolist() if not ins_df.empty else ["—"],
+                         key="insurance_display")
+            st.text_input("Member ID*", key="member_id")
+            st.text_input("EID*", key="eid")
+
+        st.text_input("Claim ID*", key="claim_id")
+        st.text_input("Approval Code*", key="approval_code")
+
+        d1, d2, d3 = st.columns(3, gap="large")
+        with d1:
+            st.number_input("Net Amount*", min_value=0.0, step=0.01, format="%.2f", key="net_amount")
+        with d2:
+            st.number_input("Patient Share*", min_value=0.0, step=0.01, format="%.2f", key="patient_share")
+        with d3:
+            st.selectbox("Status*", statuses, key="status")
+
+        st.text_area("Remark (optional)", key="remark")
+        st.checkbox("Allow duplicate override", key="allow_dup_override")
+
+        submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
+
+    if not submitted:
+        return
+
+    # requireds
+    required = {
+        "Employee Name":  st.session_state.employee_name,
+        "Submission Date": st.session_state.submission_date,
+        "Pharmacy":       st.session_state.pharmacy_display,
+        "Submission Mode":st.session_state.submission_mode,
+        "Portal":         st.session_state.portal,
+        "ERX Number":     st.session_state.erx_number,
+        "Insurance":      st.session_state.insurance_display,
+        "Member ID":      st.session_state.member_id,
+        "EID":            st.session_state.eid,
+        "Claim ID":       st.session_state.claim_id,
+        "Approval Code":  st.session_state.approval_code,
+        "Net Amount":     st.session_state.net_amount,
+        "Patient Share":  st.session_state.patient_share,
+        "Status":         st.session_state.status,
+    }
+    missing = [k for k,v in required.items() if (isinstance(v,str) and not v.strip()) or v is None]
+    if missing:
+        st.error("Missing required fields: " + ", ".join(missing))
+        return
+
+    # parse pharmacy + ACL
+    ph_id, ph_name = "", ""
+    if " - " in st.session_state.pharmacy_display:
+        ph_id, ph_name = st.session_state.pharmacy_display.split(" - ", 1)
+        ph_id, ph_name = ph_id.strip(), ph_name.strip()
+    if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"] and ph_id not in ALLOWED_PHARM_IDS:
+        st.error("You are not allowed to submit for this pharmacy.")
+        return
+
+    # parse insurance
+    ins_code, ins_name = "", ""
+    if " - " in st.session_state.insurance_display:
+        ins_code, ins_name = st.session_state.insurance_display.split(" - ", 1)
+        ins_code, ins_name = ins_code.strip(), ins_name.strip()
+    else:
+        ins_name = st.session_state.insurance_display
+
+    # duplicate check (same-day ERX+Net)
+    if _is_dup_today(st.session_state.erx_number, st.session_state.net_amount, st.session_state.submission_date):
+        if not st.session_state.allow_dup_override and str(ROLE).strip().lower() not in ("super admin","superadmin"):
+            st.warning("Possible duplicate for today (ERX + Net). Tick override to proceed.")
+            return
+
+    # build the row
+    record = [
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        (username or name),
+        ROLE,
+        ph_id, ph_name,
+        st.session_state.employee_name.strip(),
+        st.session_state.submission_date.strftime("%Y-%m-%d"),
+        st.session_state.submission_mode,
+        st.session_state.portal,
+        st.session_state.erx_number.strip(),
+        ins_code, ins_name,
+        st.session_state.member_id.strip(),
+        st.session_state.eid.strip(),
+        st.session_state.claim_id.strip(),
+        st.session_state.approval_code.strip(),
+        f"{float(st.session_state.net_amount):.2f}",
+        f"{float(st.session_state.patient_share):.2f}",
+        st.session_state.remark.strip(),
+        st.session_state.status,
+    ]
+
+    # save
+    try:
+        retry(lambda: wsx.append_row(record, value_input_option="USER_ENTERED"))
+        st.success("Saved ✔️")
+        # refresh data caches so View/Export & Summary see the new row
+        try:
+            load_module_df.clear()
+        except Exception:
+            pass
+        st.session_state["_clear_form"] = True
+        st.rerun()
+    except Exception as e:
+        st.error(f"Save failed: {e}")
+def _render_legacy_pharmacy_intake(sheet_name: str):
+    """
+    Pharmacy intake with the exact 3× grid layout shown in the screenshot.
+    Saves to the module's sheet (e.g., Data_Pharmacy). Other modules stay dynamic.
+    """
+    LEGACY_HEADERS = [
+        "Timestamp","SubmittedBy","Role",
+        "PharmacyID","PharmacyName",
+        "EmployeeName","SubmissionDate","SubmissionMode",
+        "Portal","ERXNumber","InsuranceCode","InsuranceName",
+        "MemberID","EID","ClaimID","ApprovalCode",
+        "NetAmount","PatientShare","Remark","Status"
+    ]
+
+    # ensure headers exist
+    wsx = ws(sheet_name)
+    head = retry(lambda: wsx.row_values(1))
+    if not head:
+        retry(lambda: wsx.update("A1", [LEGACY_HEADERS]))
+    else:
+        merged = list(dict.fromkeys([*head, *LEGACY_HEADERS]))
+        if [h.lower() for h in head] != [h.lower() for h in merged]:
+            retry(lambda: wsx.update("A1", [merged]))
+
+    # masters
+    submission_modes = safe_list(MS_SUBMISSION_MODE, ["Walk-in","Phone","Email","Portal"])
+    portals          = safe_list(MS_PORTAL, ["DHPO","Riayati","Insurance Portal"])
+    statuses         = safe_list(MS_STATUS, ["Submitted","Approved","Rejected","Pending","RA Pending"])
+    pharm_df         = pharm_master()
+    ins_df           = insurance_master()
+
+    if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"]:
+        pharm_df = pharm_df[pharm_df["ID"].isin(ALLOWED_PHARM_IDS)]
+    pharm_choices = pharm_df["Display"].tolist() if not pharm_df.empty else ["—"]
+
+    # form defaults (avoid the yellow “value set via Session State” warning)
+    def _reset_form():
+        defaults = {
+            "employee_name": "",
+            "submission_date": date.today(),
+            "submission_mode": "",
+            "pharmacy_display": "",
+            "portal": "",
+            "erx_number": "",
+            "insurance_display": "",
+            "member_id": "",
+            "eid": "",
+            "claim_id": "",
+            "approval_code": "",
+            "net_amount": 0.0,
+            "patient_share": 0.0,
+            "status": "",
+            "remark": "",
+            "allow_dup_override": False,
+        }
+        for k, v in defaults.items():
+            st.session_state.setdefault(k, v)
+
+    if st.session_state.get("_clear_form", False):
+        for k in ("employee_name","submission_date","submission_mode","pharmacy_display","portal","erx_number",
+                  "insurance_display","member_id","eid","claim_id","approval_code","net_amount","patient_share",
+                  "status","remark","allow_dup_override"):
+            st.session_state.pop(k, None)
+        _reset_form()
+        st.session_state["_clear_form"] = False
+    _reset_form()
+
+    # ===== UI (matches screenshot) =====
+    # Optional border=True if your Streamlit version supports it
+    try:
+        container_ctx = st.container(border=True)
+    except TypeError:
+        container_ctx = st.container()
+
+    with container_ctx:
+        with st.form("pharmacy_intake_legacy", clear_on_submit=False):
+            # Row 1
+            r1c1, r1c2, r1c3 = st.columns(3, gap="large")
+            with r1c1: st.text_input("Employee Name*", key="employee_name")
+            with r1c2: st.selectbox("Pharmacy (ID - Name)*", pharm_choices, key="pharmacy_display")
+            with r1c3: st.selectbox("Insurance (Code - Name)*",
+                                    ins_df["Display"].tolist() if not ins_df.empty else ["—"],
+                                    key="insurance_display")
+
+            # Row 2
+            r2c1, r2c2, r2c3 = st.columns(3, gap="large")
+            with r2c1: st.date_input("Submission Date*", key="submission_date")
+            with r2c2: st.selectbox("Portal* (DHPO / Riayati / Insurance Portal)", portals, key="portal")
+            with r2c3: st.text_input("Member ID*", key="member_id")
+
+            # Row 3
+            r3c1, r3c2, r3c3 = st.columns(3, gap="large")
+            with r3c1: st.selectbox("Submission Mode*", submission_modes, key="submission_mode")
+            with r3c2: st.text_input("ERX Number*", key="erx_number")
+            with r3c3: st.text_input("EID*", key="eid")
+
+            # Full-width rows
+            st.text_input("Claim ID*", key="claim_id")
+            st.text_input("Approval Code*", key="approval_code")
+
+            # Row 4
+            r4c1, r4c2, r4c3 = st.columns(3, gap="large")
+            with r4c1: st.number_input("Net Amount*", min_value=0.0, step=0.01, format="%.2f", key="net_amount")
+            with r4c2: st.number_input("Patient Share*", min_value=0.0, step=0.01, format="%.2f", key="patient_share")
+            with r4c3: st.selectbox("Status*", statuses, key="status")
+
+            # Full-width remark + dup override + submit
+            st.text_area("Remark (optional)", key="remark")
+            st.checkbox("Allow duplicate override", key="allow_dup_override")
+            submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
+
+    if not submitted:
+        return
+
+    # requireds
+    required = {
+        "Employee Name":  st.session_state.employee_name,
+        "Submission Date": st.session_state.submission_date,
+        "Pharmacy":       st.session_state.pharmacy_display,
+        "Submission Mode":st.session_state.submission_mode,
+        "Portal":         st.session_state.portal,
+        "ERX Number":     st.session_state.erx_number,
+        "Insurance":      st.session_state.insurance_display,
+        "Member ID":      st.session_state.member_id,
+        "EID":            st.session_state.eid,
+        "Claim ID":       st.session_state.claim_id,
+        "Approval Code":  st.session_state.approval_code,
+        "Net Amount":     st.session_state.net_amount,
+        "Patient Share":  st.session_state.patient_share,
+        "Status":         st.session_state.status,
+    }
+    missing = [k for k,v in required.items() if (isinstance(v,str) and not v.strip()) or v is None]
+    if missing:
+        st.error("Missing required fields: " + ", ".join(missing))
+        return
+
+    # ACL + parses
+    ph_id, ph_name = "", ""
+    if " - " in st.session_state.pharmacy_display:
+        ph_id, ph_name = st.session_state.pharmacy_display.split(" - ", 1)
+        ph_id, ph_name = ph_id.strip(), ph_name.strip()
+    if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"] and ph_id not in ALLOWED_PHARM_IDS:
+        st.error("You are not allowed to submit for this pharmacy.")
+        return
+
+    ins_code, ins_name = "", ""
+    if " - " in st.session_state.insurance_display:
+        ins_code, ins_name = st.session_state.insurance_display.split(" - ", 1)
+        ins_code, ins_name = ins_code.strip(), ins_name.strip()
+    else:
+        ins_name = st.session_state.insurance_display
+
+    # duplicate check (same-day ERX+Net) scoped to this sheet
+    try:
+        df_dup = pd.DataFrame(retry(lambda: wsx.get_all_records()))
+        dup = False
+        if not df_dup.empty:
+            df_dup["SubmissionDate"] = pd.to_datetime(df_dup.get("SubmissionDate"), errors="coerce").dt.date
+            same_day = df_dup[df_dup["SubmissionDate"] == st.session_state.submission_date]
+            net_str = f"{float(st.session_state.net_amount):.2f}"
+            dup = (
+                same_day.get("ERXNumber", pd.Series([], dtype=str)).astype(str).str.strip()
+                .eq(str(st.session_state.erx_number).strip())
+                &
+                pd.to_numeric(same_day.get("NetAmount", 0), errors="coerce").fillna(0.0)
+                .map(lambda x: f"{x:.2f}").eq(net_str)
+            ).any()
+        if dup and not st.session_state.allow_dup_override and str(ROLE).strip().lower() not in ("super admin","superadmin"):
+            st.warning("Possible duplicate for today (ERX + Net). Tick override to proceed.")
+            return
+    except Exception:
+        pass
+
+    # build & save
+    record = [
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        (username or name),
+        ROLE,
+        ph_id, ph_name,
+        st.session_state.employee_name.strip(),
+        st.session_state.submission_date.strftime("%Y-%m-%d"),
+        st.session_state.submission_mode,
+        st.session_state.portal,
+        st.session_state.erx_number.strip(),
+        ins_code, ins_name,
+        st.session_state.member_id.strip(),
+        st.session_state.eid.strip(),
+        st.session_state.claim_id.strip(),
+        st.session_state.approval_code.strip(),
+        f"{float(st.session_state.net_amount):.2f}",
+        f"{float(st.session_state.patient_share):.2f}",
+        st.session_state.remark.strip(),
+        st.session_state.status,
+    ]
+
+    try:
+        retry(lambda: wsx.append_row(record, value_input_option="USER_ENTERED"))
+        st.success("Saved ✔️")
+        try: load_module_df.clear()
+        except Exception: pass
+        st.session_state["_clear_form"] = True
+        st.rerun()
+    except Exception as e:
+        st.error(f"Save failed: {e}")
+def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role: str):
+    # Render Pharmacy with the legacy intake layout
+    if str(module_name).strip().lower() == "pharmacy":
+        _render_legacy_pharmacy_intake(sheet_name)
+        return
+    # ...keep the rest of your dynamic renderer unchanged...
+
 def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role: str):
     sdf = schema_df()
-
+    if str(module_name).strip().lower() == "pharmacy":
+        _render_legacy_pharmacy_intake(sheet_name)
+        return
     # accept current client, DEFAULT, or ALL as wildcards
     rows = sdf[(sdf["Module"] == module_name) & (sdf["ClientID"].isin([client_id, "DEFAULT", "ALL"]))]
 
@@ -1761,7 +2179,11 @@ if page != "—":
 else:   # ← align this with "if page ==" and "elif page =="
     if module_choice:
         sheet_name = dict(module_pairs).get(module_choice)
-        st.subheader(f"{module_choice} — Dynamic Intake")
-        _render_dynamic_form(module_choice, sheet_name, CLIENT_ID, ROLE)
+        if module_choice.strip().lower() == "pharmacy":
+            st.subheader("New Submission")            # matches screenshot
+            _render_legacy_pharmacy_intake(sheet_name)
+        else:
+            st.subheader(f"{module_choice} — Dynamic Intake")
+            _render_dynamic_form(module_choice, sheet_name, CLIENT_ID, ROLE)
     else:
         st.info("No modules enabled. Pick a page on the left.")
