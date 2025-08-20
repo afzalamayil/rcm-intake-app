@@ -333,16 +333,15 @@ def doctors_master(client_id: str | None = None, pharmacy_id: str | None = None)
     if df.empty:
         return pd.DataFrame(columns=["DoctorID","DoctorName","Specialty","ClientID","PharmacyID","Display"])
 
-    # Ensure/normalize columns
     for c in ["DoctorID","DoctorName","Specialty","ClientID","PharmacyID"]:
         if c not in df.columns:
             df[c] = ""
         df[c] = df[c].astype(str).str.strip()
 
-    # Prefer pharmacy filter; fall back to client filter
-    if pharmacy_id:
+    # Prefer pharmacy filter; treat "ALL" / "" as no filter
+    if pharmacy_id and str(pharmacy_id).strip().upper() not in ("", "ALL"):
         df = df[df["PharmacyID"] == str(pharmacy_id).strip()]
-    elif client_id:
+    elif client_id and str(client_id).strip().upper() not in ("", "ALL"):
         df = df[df["ClientID"].str.upper() == str(client_id).strip().upper()]
 
     df["Display"] = df["DoctorName"] + " (" + df["Specialty"].replace("", "—") + ")"
@@ -542,19 +541,17 @@ def _options_from_token(token: str) -> list[str]:
         key = token.split(":", 1)[1].strip().lower()
 
         if key in ("doctors", "doctorsall"):
-            # get the Pharmacy ID from the visible selectbox (e.g., "345 - Al Iman ...")
+            # currently selected pharmacy (e.g. "106 - Al Iman")
             ph_disp = st.session_state.get(f"{st.session_state.get('nav_mod','')}_pharmacy_display", "")
             ph_id = ph_disp.split(" - ", 1)[0].strip() if " - " in ph_disp else ""
 
+            # Super Admin or DoctorsAll → no client constraint
+            role_is_super = str(ROLE).strip().lower() in ("super admin","superadmin")
+            use_client = None if role_is_super or key == "doctorsall" or str(CLIENT_ID).upper() in ("", "ALL") else CLIENT_ID
+            use_pharm  = ph_id if ph_id not in ("", "ALL") else None
+
             try:
-                if key == "doctorsall" and str(ROLE).strip().lower() in ("super admin","superadmin"):
-                    df = doctors_master(client_id=None, pharmacy_id=None)  # no filters
-                else:
-                    # Prefer pharmacy filter; if no pharmacy chosen yet, fall back to client filter
-                    df = doctors_master(
-                        client_id=(None if not CLIENT_ID else CLIENT_ID),
-                        pharmacy_id=(ph_id or None)
-                    )
+                df = doctors_master(client_id=use_client, pharmacy_id=use_pharm)
                 return df["Display"].tolist() if not df.empty else []
             except Exception:
                 return []
