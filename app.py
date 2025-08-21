@@ -1113,6 +1113,171 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
         st.success("Saved ✔️")
     except Exception as e:
         st.error(f"Save failed: {e}")
+# ─────────────────────────────────────────────────────────────────────────────
+# Static pages
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_view_export_page():
+    with intake_page("View / Export", "Filter, preview & download", badge=ROLE):
+        if not module_pairs:
+            st.info("No modules enabled."); return
+        mod = st.selectbox("Module", [m for m,_ in module_pairs], index=0)
+        sheet = dict(module_pairs)[mod]
+        df = load_module_df(sheet)
+        df = _apply_common_filters(df)
+
+        # Optional filters
+        if not df.empty:
+            date_col = "SubmissionDate" if "SubmissionDate" in df.columns else None
+            if date_col:
+                d1, d2 = st.date_input(
+                    "Date range",
+                    (date.today() - timedelta(days=30), date.today())
+                )
+                dc = pd.to_datetime(df[date_col], errors="coerce").dt.date
+                df = df[(dc >= d1) & (dc <= d2)]
+
+            q = st.text_input("Search (any column)")
+            if q.strip():
+                df = df[df.apply(lambda r: r.astype(str).str.contains(q, case=False, na=False).any(), axis=1)]
+
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        if st.button("Refresh data"):
+            load_module_df.clear(); st.rerun()
+
+        if not df.empty:
+            csv = df.to_csv(index=False).encode("utf-8")
+            st.download_button("Download CSV", csv, f"{mod}_export.csv", "text/csv")
+
+def _render_email_whatsapp_page():
+    with intake_page("Email / WhatsApp", "Pull contacts from ClientContacts", badge=ROLE):
+        cdf = read_sheet_df(CLIENT_CONTACTS_TAB, REQUIRED_HEADERS[CLIENT_CONTACTS_TAB]).fillna("")
+        cdf = cdf[cdf["ClientID"].astype(str).str.upper() == str(CLIENT_ID).upper()]
+        if cdf.empty:
+            st.info("No contacts found for this client."); return
+
+        to = "; ".join([x for x in cdf["To"].tolist() if x])
+        cc = "; ".join([x for x in cdf["CC"].tolist() if x])
+        wa = ", ".join([x for x in cdf["WhatsApp"].tolist() if x])
+
+        st.subheader("Email")
+        st.write("**To:**"); st.code(to or "—")
+        st.write("**CC:**"); st.code(cc or "—")
+
+        st.subheader("WhatsApp")
+        st.code(wa or "—")
+        st.caption("Copy/paste into your mail/WhatsApp client.")
+
+def _render_masters_admin_page():
+    with intake_page("Masters Admin", "Add values to masters", badge=ROLE):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown("**Submission Mode**")
+            sm = st.text_input("Add mode", key="add_sm")
+            if st.button("Add mode"):
+                if sm.strip():
+                    ws(MS_SUBMISSION_MODE).append_row([sm.strip()], value_input_option="USER_ENTERED")
+                    st.success("Added."); st.rerun()
+        with col2:
+            st.markdown("**Portal**")
+            po = st.text_input("Add portal", key="add_portal")
+            if st.button("Add portal"):
+                if po.strip():
+                    ws(MS_PORTAL).append_row([po.strip()], value_input_option="USER_ENTERED")
+                    st.success("Added."); st.rerun()
+        with col3:
+            st.markdown("**Status**")
+            stt = st.text_input("Add status", key="add_status")
+            if st.button("Add status"):
+                if stt.strip():
+                    ws(MS_STATUS).append_row([stt.strip()], value_input_option="USER_ENTERED")
+                    st.success("Added."); st.rerun()
+
+        st.markdown("---")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Pharmacies**")
+            pid = st.text_input("ID")
+            pname = st.text_input("Name")
+            if st.button("Add pharmacy"):
+                if pid.strip() and pname.strip():
+                    ws(MS_PHARM).append_row([pid.strip(), pname.strip()], value_input_option="USER_ENTERED")
+                    st.success("Added."); st.rerun()
+        with c2:
+            st.markdown("**Insurance**")
+            code = st.text_input("Code")
+            name = st.text_input("Name")
+            if st.button("Add insurance"):
+                if code.strip() and name.strip():
+                    ws(MS_INSURANCE).append_row([code.strip(), name.strip()], value_input_option="USER_ENTERED")
+                    st.success("Added."); st.rerun()
+
+def _render_bulk_import_insurance_page():
+    with intake_page("Bulk Import Insurance", "Upload CSV with Code,Name", badge=ROLE):
+        up = st.file_uploader("CSV file", type=["csv"])
+        if not up: return
+        try:
+            df = pd.read_csv(up).fillna("")
+            if not {"Code","Name"}.issubset(df.columns):
+                st.error("CSV must contain columns: Code, Name"); return
+            data = [["Code","Name"], *df[["Code","Name"]].astype(str).values.tolist()]
+            w = ws(MS_INSURANCE)
+            try:
+                w.clear()
+            except Exception:
+                w.batch_clear(["A:Z"])
+            w.update("A1", data)
+            st.success(f"Imported {len(df)} rows.")
+            insurance_master.clear()
+        except Exception as e:
+            st.error(f"Import failed: {e}")
+
+def _render_summary_page():
+    with intake_page("Summary", "Quick counts per module", badge=ROLE):
+        if not module_pairs:
+            st.info("No modules enabled."); return
+        cols = st.columns(3)
+        for i, (mod, sheet) in enumerate(module_pairs[:9]):  # show first 9 as cards
+            df = _apply_common_filters(load_module_df(sheet))
+            total = len(df)
+            approved = int((df.get("Status","").astype(str).str.lower()=="approved").sum()) if "Status" in df.columns else 0
+            pending  = int((df.get("Status","").astype(str).str.lower()=="pending").sum())  if "Status" in df.columns else 0
+            with cols[i % 3]:
+                st.metric(f"{mod} — Total", total)
+                st.caption(f"Approved: {approved} · Pending: {pending}")
+
+def _render_update_record_page():
+    with intake_page("Update Record", "Edit a single row", badge=ROLE):
+        if not module_pairs:
+            st.info("No modules enabled."); return
+        mod = st.selectbox("Module", [m for m,_ in module_pairs], index=0)
+        sheet = dict(module_pairs)[mod]
+        df = _apply_common_filters(load_module_df(sheet))
+        if df.empty:
+            st.info("No rows to edit."); return
+
+        st.caption("Pick a row number (as shown below) to edit.")
+        st.dataframe(df.reset_index().rename(columns={"index":"Row#"}), use_container_width=True)
+        rownum = st.number_input("Row# to edit", min_value=0, max_value=len(df)-1, step=1)
+        editable_cols = [c for c in df.columns if c not in ("Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module")]
+        st.write("Editable columns:", ", ".join(editable_cols) or "—")
+        edits = {}
+        for c in editable_cols:
+            edits[c] = st.text_input(c, value=str(df.iloc[rownum][c]))
+
+        if st.button("Save changes", type="primary"):
+            w = ws(sheet)
+            # Header row is 1; data starts at 2; add rownum offset + 2
+            target_row = int(rownum) + 2
+            header = w.row_values(1)
+            # Build updated row from existing + edits
+            current = w.row_values(target_row)
+            current += [""] * (len(header) - len(current))
+            cur_map = {h: current[i] if i < len(current) else "" for i, h in enumerate(header)}
+            cur_map.update(edits)
+            w.update(f"A{target_row}", [ [cur_map.get(h,"") for h in header] ])
+            st.success("Row updated.")
+            load_module_df.clear(); st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Navigation (dynamic modules + static pages)
@@ -1151,11 +1316,22 @@ static_choice = st.sidebar.radio(
 
 page = static_choice  # <-- define unconditionally
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Navigation dispatcher
+# ─────────────────────────────────────────────────────────────────────────────
 if page != "—":
-    # ===================== Other Pages =====================
-    # Keep your existing implementations here if you have them.
-    # View / Export, Email / WhatsApp, Masters Admin, Bulk Import Insurance, Summary, Update Record.
-    pass
+    if page == "View / Export":
+        _render_view_export_page()
+    elif page == "Email / WhatsApp":
+        _render_email_whatsapp_page()
+    elif page == "Masters Admin":
+        _render_masters_admin_page()
+    elif page == "Bulk Import Insurance":
+        _render_bulk_import_insurance_page()
+    elif page == "Summary":
+        _render_summary_page()
+    elif page == "Update Record":
+        _render_update_record_page()
 else:
     # ===================== Dynamic Module =====================
     if module_choice:
