@@ -544,7 +544,7 @@ def schema_df() -> pd.DataFrame:
     df["Module"]         = df["Module"].astype(str).str.strip()
     df["FieldKey"]       = df["FieldKey"].astype(str).str.strip()
     df["Label"]          = df["Label"].astype(str)
-    df["Type"]           = df["Type"].astype(str).lower().str.strip()
+    df["Type"]           = df["Type"].astype(str).str.lower().str.strip()   # <- fixed .str.lower()
     df["Required"]       = df["Required"].astype(str).str.upper().isin(["TRUE","1","YES"])
     df["RoleVisibility"] = df["RoleVisibility"].astype(str)
     df["Order"]          = pd.to_numeric(df["Order"], errors="coerce").fillna(9999).astype(int)
@@ -558,6 +558,10 @@ def schema_df() -> pd.DataFrame:
 if str(ROLE).strip().lower() in ("super admin", "superadmin"):
     with st.expander("🔍 Debug: FormSchema Preview (first 50 rows)"):
         st.dataframe(schema_df().head(50), use_container_width=True, hide_index=True)
+
+# ---- Field typing helpers (Age => integer, Phone => text) ----
+INT_KEYS   = {"age", "years"}
+PHONE_KEYS = {"phone", "mobile", "contact", "whatsapp", "tel"}
 
 def _options_from_token(token: str) -> list[str]:
     token = (token or "").strip()
@@ -607,10 +611,6 @@ def _is_readonly(readonly_roles: str, role: str) -> bool:
     if not spec: return False
     allowed = [x.strip().lower() for x in spec.split("|") if x.strip()]
     return str(role).strip().lower() in allowed
-
-# ---- Field typing helpers (Age => integer, Phone => text) ----
-INT_KEYS   = {"age", "years"}
-PHONE_KEYS = {"phone", "mobile", "contact", "whatsapp", "tel"}
 
 def _is_int_field(key: str) -> bool:
     k = (key or "").strip().lower()
@@ -930,6 +930,88 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                 cols = st.columns(3, gap="large")
                 values = {}
 
+                # ----- Render fields from FormSchema (INSIDE THE FORM) -----
+                for i, (_, r) in enumerate(rows.iterrows()):
+                    if not _role_visible(r["RoleVisibility"], role):
+                        continue
+
+                    fkey    = r["FieldKey"]
+                    label   = r["Label"]
+                    typ     = (r["Type"] or "").lower().strip()
+                    required= bool(r["Required"])
+                    default = r["Default"]
+                    opts    = _options_from_token(r["Options"])
+                    readonly= _is_readonly(r.get("ReadOnlyRoles",""), role)
+
+                    key       = f"{module_name}_{fkey}"
+                    label_req = label + ("*" if required else "")
+                    target    = st if typ == "textarea" else cols[i % 3]
+
+                    with (st if typ == "textarea" else target):
+                        if readonly:
+                            if typ in ("integer","int") or _is_int_field(fkey):
+                                try: dv = int(float(default)) if str(default).strip() else 0
+                                except Exception: dv = 0
+                                st.number_input(label_req, value=int(dv), step=1, min_value=0, key=key+"_ro", disabled=True)
+                                values[fkey] = dv
+                            elif typ in ("phone","tel") or _is_phone_field(fkey):
+                                st.text_input(label_req, value=str(default), key=key+"_ro", disabled=True)
+                                values[fkey] = str(default)
+                            elif typ == "number":
+                                try: dv = float(default) if str(default).strip() else 0.0
+                                except Exception: dv = 0.0
+                                st.number_input(label_req, value=float(dv), step=0.01, format="%.2f", key=key+"_ro", disabled=True)
+                                values[fkey] = dv
+                            elif typ == "date":
+                                try: d = pd.to_datetime(default).date() if default else date.today()
+                                except Exception: d = date.today()
+                                st.date_input(label_req, value=d, key=key+"_ro", disabled=True)
+                                values[fkey] = d
+                            elif typ == "select":
+                                show = opts if opts else ["—"]
+                                idx  = show.index(default) if default in show else 0
+                                st.selectbox(label_req, options=show, index=idx, key=key+"_ro", disabled=True)
+                                values[fkey] = default if default in show else show[idx]
+                            elif typ == "multiselect":
+                                show = opts if opts else ["—"]
+                                st.multiselect(label_req, options=show, default=[default] if default else [], key=key+"_ro", disabled=True)
+                                values[fkey] = [default] if default else []
+                            elif typ == "checkbox":
+                                v = str(default).strip().lower() in ("true","1","yes")
+                                st.checkbox(label, value=v, key=key+"_ro", disabled=True)
+                                values[fkey] = v
+                            else:
+                                st.text_input(label_req, value=str(default), key=key+"_ro", disabled=True)
+                                values[fkey] = str(default)
+                            continue
+
+                        # Editable widgets
+                        if typ in ("integer","int") or _is_int_field(fkey):
+                            try: dv = int(float(default)) if str(default).strip() else 0
+                            except Exception: dv = 0
+                            values[fkey] = st.number_input(label_req, value=int(dv), step=1, min_value=0, key=key)
+                        elif typ in ("phone","tel") or _is_phone_field(fkey):
+                            values[fkey] = st.text_input(label_req, value=str(default), key=key, placeholder="+9715XXXXXXXX")
+                        elif typ == "number":
+                            try: dv = float(default) if str(default).strip() else 0.0
+                            except Exception: dv = 0.0
+                            values[fkey] = st.number_input(label_req, value=float(dv), step=0.01, format="%.2f", key=key)
+                        elif typ == "date":
+                            try: d = pd.to_datetime(default).date() if default else date.today()
+                            except Exception: d = date.today()
+                            values[fkey] = st.date_input(label_req, value=d, key=key)
+                        elif typ == "select":
+                            values[fkey] = st.selectbox(label_req, options=(opts or ["—"]), key=key)
+                        elif typ == "multiselect":
+                            values[fkey] = st.multiselect(label_req, options=(opts or ["—"]), key=key)
+                        elif typ == "checkbox":
+                            v = str(default).strip().lower() in ("true","1","yes")
+                            values[fkey] = st.checkbox(label, value=v, key=key)
+                        elif typ == "textarea":
+                            values[fkey] = st.text_area(label_req, value=str(default), key=key)
+                        else:
+                            values[fkey] = st.text_input(label_req, value=str(default), key=key)
+                # ----- end fields loop -----
 
                 dup_override_key = f"{module_name}_dup_override"
                 st.checkbox("Allow duplicate override", key=dup_override_key)
@@ -938,9 +1020,10 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
     if not submitted:
         return
 
+    # Validate requireds
     missing = []
     for _, r in rows.iterrows():
-        if not _role_visible(r["RoleVisibility"], role): 
+        if not _role_visible(r["RoleVisibility"], role):
             continue
         if bool(r["Required"]):
             val = values.get(r["FieldKey"])
@@ -949,6 +1032,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
     if missing:
         st.error("Missing required fields: " + ", ".join(missing)); return
 
+    # ACL check for pharmacy
     ph_id, ph_name = "", ""
     ph_disp = st.session_state.get(f"{module_name}_pharmacy_display","")
     if " - " in ph_disp:
@@ -956,6 +1040,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
     if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"] and ph_id not in ALLOWED_PHARM_IDS:
         st.error("You are not allowed to submit for this pharmacy."); return
 
+    # Ensure headers exist
     meta = ["Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module"]
     save_map = {r["FieldKey"]: (r["SaveTo"] or r["FieldKey"]) for _, r in rows.iterrows()
                 if _role_visible(r["RoleVisibility"], role)}
@@ -968,6 +1053,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
         retry(lambda: wsx.update("A1", [merged]))
         target_headers = merged
 
+    # Build row data
     data_map = {
         "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "SubmittedBy": username or name,
@@ -977,25 +1063,24 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
         "PharmacyName": ph_name,
         "Module": module_name,
     }
-    # Build a map of types for quick lookup during save
-    typ_map = { rr["FieldKey"]: rr["Type"].lower().strip() for _, rr in rows.iterrows() }
-    
+    typ_map = { rr["FieldKey"]: str(rr["Type"]).lower().strip() for _, rr in rows.iterrows() }  # safe cast
+
     for fk, col in save_map.items():
         val = values.get(fk)
-    
+
         # normalize dates/lists
         if isinstance(val, (date, datetime)):
             val = pd.to_datetime(val).strftime("%Y-%m-%d")
         if isinstance(val, list):
             val = ", ".join([str(x) for x in val])
-    
+
         # money-style fields keep 2 decimals
         if isinstance(val, float) and fk in {"net_amount","patient_share"}:
             try:
                 val = f"{float(val):.2f}"
             except Exception:
                 pass
-    
+
         # integer (by schema type OR by common key names)
         if typ_map.get(fk) in ("integer","int") or _is_int_field(fk):
             if str(val).strip() != "":
@@ -1003,14 +1088,15 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                     val = str(int(float(val)))
                 except Exception:
                     val = ""
-    
+
         # phone (by schema type OR by common key names)
         if typ_map.get(fk) in ("phone","tel") or _is_phone_field(fk):
             phone = re.sub(r"[^0-9+]", "", str(val))
             val = f"'{phone}" if phone else ""
-    
+
         data_map[col] = val
 
+    # Duplicate check if configured
     try:
         if _check_duplicate_if_needed(sheet_name, module_name, data_map):
             allow_override = st.session_state.get(dup_override_key, False)
@@ -1021,6 +1107,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
     except Exception as e:
         st.info(f"Duplicate check skipped: {e}")
 
+    # Save
     row = [data_map.get(h, "") for h in target_headers]
     try:
         retry(lambda: wsx.append_row(row, value_input_option="USER_ENTERED"))
@@ -1067,13 +1154,9 @@ page = static_choice  # <-- define unconditionally
 
 if page != "—":
     # ===================== Other Pages =====================
-    # (everything below unchanged except for any small fixes you had—omitted here for brevity)
-    # ——— KEEP YOUR EXISTING "View / Export", "Email / WhatsApp", "Masters Admin",
-    #     "Bulk Import Insurance", "Summary", and "Update Record" blocks EXACTLY
-    #     as you pasted (they were fine). ———
-    # (For space, keep those sections from your last file version.)
+    # Keep your existing implementations here if you have them.
+    # View / Export, Email / WhatsApp, Masters Admin, Bulk Import Insurance, Summary, Update Record.
     pass
-
 else:
     # ===================== Dynamic Module =====================
     if module_choice:
