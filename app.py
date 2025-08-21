@@ -43,29 +43,24 @@ def apply_intake_theme(page_title: str = "RCM Intake", page_icon: str = "🧾"):
     st.markdown("""
     <style>
       :root{
-        --bg:#0b1020; --panel:#111833; --text:#e7ecff; --muted:#a7b0d6;
-        --brand:#4f8cff; --brand2:#22d3ee; --radius:18px; --shadow:0 10px 30px rgba(0,0,0,.35);
+        --bg:#ffffff; --panel:#ffffff; --text:#111833; --muted:#445; 
+        --brand:#4f8cff; --brand2:#22d3ee; --radius:12px; --shadow:0 4px 14px rgba(0,0,0,.08);
       }
-      .stApp {background:
-        radial-gradient(1200px 600px at 20% -10%, rgba(79,140,255,.18), transparent 45%),
-        radial-gradient(900px 500px at 120% 10%, rgba(34,211,238,.14), transparent 35%), var(--bg)!important;}
-      header, .viewerBadge_link__1S137 {display:none!important}
-      .block-container{padding-top:2.2rem; padding-bottom:3rem; max-width:1200px}
-      label{color:var(--muted)!important; font-weight:600!important}
-      .intake-topbar{background:linear-gradient(90deg, rgba(79,140,255,.85), rgba(34,211,238,.85));
-                     padding:10px 14px; border-radius:12px; box-shadow:var(--shadow)}
-      .intake-card{background:linear-gradient(180deg, rgba(255,255,255,.02), rgba(255,255,255,.00));
-                   border:1px solid rgba(255,255,255,.08); border-radius:var(--radius);
-                   padding:22px 22px 16px; box-shadow:var(--shadow)}
-      .sec{display:flex; align-items:center; gap:.6rem; margin:6px 0 14px}
-      .sec .dot{width:10px; height:10px; border-radius:999px;
-                background:linear-gradient(90deg,var(--brand),var(--brand2))}
-      .sec h3{margin:0; color:var(--text); font-size:1.15rem; letter-spacing:.2px}
-      .stButton>button{border-radius:12px; padding:.6rem 1rem; font-weight:700;
-                       border:1px solid rgba(255,255,255,.12);
-                       background:linear-gradient(180deg, rgba(79,140,255,.18), rgba(34,211,238,.18)); color:var(--text)}
+      .stApp { background:#ffffff !important; }
+      header, .viewerBadge_link__1S137 { display:none!important; }
+      .block-container { padding-top:2rem; padding-bottom:2.5rem; max-width:1200px; }
+      label{ color:#334; font-weight:600!important }
+      .intake-topbar{ background:#f5f7ff; padding:10px 14px; border-radius:10px; border:1px solid #e7ebff; }
+      .intake-card{
+          background:#ffffff; border:1px solid #eef1f7; border-radius:var(--radius);
+          padding:22px 22px 16px; box-shadow:var(--shadow);
+      }
+      .stButton>button{
+          border-radius:10px; padding:.55rem .9rem; font-weight:700;
+          border:1px solid #e5e9f2; background:#ffffff; color:#111833;
+      }
       .stTextInput input, .stNumberInput input, .stDateInput input,
-      .stSelectbox > div > div {background:rgba(255,255,255,.04)!important; color:var(--text)!important; border-radius:12px!important}
+      .stSelectbox > div > div { background:#ffffff!important; color:#111833!important; border-radius:10px!important; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -489,10 +484,14 @@ def modules_catalog_df() -> pd.DataFrame:
     if not df.empty:
         df["Module"] = df["Module"].astype(str).str.strip()
         df["SheetName"] = df["SheetName"].astype(str).str.strip()
-        df["DefaultEnabled"] = df["DefaultEnabled"].astype(str).upper().isin(["TRUE","1","YES"])
+        df["DefaultEnabled"] = (
+            df.get("DefaultEnabled", pd.Series([""]))
+              .astype(str).str.upper().isin(["TRUE","1","YES"])
+        )
         df["DupKeys"] = df.get("DupKeys","").astype(str)
         df["NumericFieldsJSON"] = df.get("NumericFieldsJSON","[]").astype(str)
     return df
+
 
 @st.cache_data(ttl=60)
 def client_modules_df() -> pd.DataFrame:
