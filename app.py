@@ -61,6 +61,11 @@ def apply_intake_theme(page_title: str = "RCM Intake", page_icon: str = "🧾"):
       }
       .stTextInput input, .stNumberInput input, .stDateInput input,
       .stSelectbox > div > div { background:#ffffff!important; color:#111833!important; border-radius:10px!important; }
+
+      /* section header used by intake_card() */
+      .sec{display:flex;align-items:center;gap:.6rem;margin:6px 0 14px}
+      .sec .dot{width:10px;height:10px;border-radius:999px;background:linear-gradient(90deg,#4f8cff,#22d3ee)}
+      .sec h3{margin:0;color:#111833;font-size:1.05rem;letter-spacing:.2px}
     </style>
     """, unsafe_allow_html=True)
 
@@ -68,14 +73,14 @@ def apply_intake_theme(page_title: str = "RCM Intake", page_icon: str = "🧾"):
 def intake_page(title: str, subtitle: str | None = None, badge: str | None = None):
     c1, c2 = st.columns([0.8,0.2])
     with c1:
-        st.markdown(f"<div style='font-weight:800;font-size:1.95rem;color:#e7ecff'>{title}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='font-weight:800;font-size:1.95rem;color:#111833'>{title}</div>", unsafe_allow_html=True)
         if subtitle:
             st.markdown(f"<div style='color:#a7b0d6'>{subtitle}</div>", unsafe_allow_html=True)
     with c2:
         if badge:
             st.markdown("<div style='display:flex;justify-content:flex-end'><span style='padding:.35rem .6rem;border-radius:999px;color:white;background:rgba(79,140,255,.35);border:1px solid rgba(255,255,255,.18);font-weight:700'>"
                         + badge + "</span></div>", unsafe_allow_html=True)
-    st.markdown("<div class='intake-topbar'><small style='color:white;font-weight:600'>Intake · Unified Layout</small></div>", unsafe_allow_html=True)
+    st.markdown("<div class='intake-topbar'><small style='color:#111833;font-weight:600'>Intake · Unified Layout</small></div>", unsafe_allow_html=True)
     yield
 
 @contextmanager
@@ -478,20 +483,21 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 # Dynamic modules engine
 # ─────────────────────────────────────────────────────────────────────────────
+
 @st.cache_data(ttl=60)
 def modules_catalog_df() -> pd.DataFrame:
     df = read_sheet_df(MS_MODULES, REQUIRED_HEADERS[MS_MODULES]).fillna("")
     if not df.empty:
         df["Module"] = df["Module"].astype(str).str.strip()
         df["SheetName"] = df["SheetName"].astype(str).str.strip()
-        df["DefaultEnabled"] = (
-            df.get("DefaultEnabled", pd.Series([""]))
-              .astype(str).str.upper().isin(["TRUE","1","YES"])
-        )
-        df["DupKeys"] = df.get("DupKeys","").astype(str)
-        df["NumericFieldsJSON"] = df.get("NumericFieldsJSON","[]").astype(str)
+        if "DefaultEnabled" in df.columns:
+            s = df["DefaultEnabled"].astype(str)
+        else:
+            s = pd.Series([""] * len(df), index=df.index)
+        df["DefaultEnabled"] = s.str.upper().isin(["TRUE","1","YES"])
+        df["DupKeys"] = df.get("DupKeys", "").astype(str)
+        df["NumericFieldsJSON"] = df.get("NumericFieldsJSON", "[]").astype(str)
     return df
-
 
 @st.cache_data(ttl=60)
 def client_modules_df() -> pd.DataFrame:
@@ -543,7 +549,7 @@ def schema_df() -> pd.DataFrame:
     df["Module"]         = df["Module"].astype(str).str.strip()
     df["FieldKey"]       = df["FieldKey"].astype(str).str.strip()
     df["Label"]          = df["Label"].astype(str)
-    df["Type"]           = df["Type"].astype(str).str.lower().str.strip()   # <- fixed .str.lower()
+    df["Type"]           = df["Type"].astype(str).str.lower().str.strip()
     df["Required"]       = df["Required"].astype(str).str.upper().isin(["TRUE","1","YES"])
     df["RoleVisibility"] = df["RoleVisibility"].astype(str)
     df["Order"]          = pd.to_numeric(df["Order"], errors="coerce").fillna(9999).astype(int)
@@ -910,6 +916,10 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
         if rows.empty:
             st.info("No schema configured for this module (add rows in FormSchema).")
             return
+    # Reload schema on demand
+    if st.button("Reload schema", key=f"reload_schema_{module_name}"):
+        schema_df.clear()
+        st.rerun()
 
     with intake_page(module_name, "Create / update entry", badge=role):
         try:
@@ -944,9 +954,12 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
 
                     key       = f"{module_name}_{fkey}"
                     label_req = label + ("*" if required else "")
-                    target    = st if typ == "textarea" else cols[i % 3]
+                    target    = cols[i % 3]
 
-                    with (st if typ == "textarea" else target):
+                    # IMPORTANT: st is not a context manager → use a container for textareas
+                    container = st.container() if typ == "textarea" else target
+
+                    with container:
                         if readonly:
                             if typ in ("integer","int") or _is_int_field(fkey):
                                 try: dv = int(float(default)) if str(default).strip() else 0
@@ -1111,8 +1124,14 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
     try:
         retry(lambda: wsx.append_row(row, value_input_option="USER_ENTERED"))
         st.success("Saved ✔️")
+        try:
+            load_module_df.clear()   # so View/Export reflects the new row immediately
+        except Exception:
+            pass
+        st.rerun()                   # optional, but matches the legacy pharmacy flow
     except Exception as e:
         st.error(f"Save failed: {e}")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Static pages
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1121,33 +1140,33 @@ def _render_view_export_page():
     with intake_page("View / Export", "Filter, preview & download", badge=ROLE):
         if not module_pairs:
             st.info("No modules enabled."); return
-        mod = st.selectbox("Module", [m for m,_ in module_pairs], index=0)
+        mod = st.selectbox("Module", [m for m,_ in module_pairs], index=0, key="view_mod")
         sheet = dict(module_pairs)[mod]
-        df = load_module_df(sheet)
-        df = _apply_common_filters(df)
+        df = _apply_common_filters(load_module_df(sheet))
 
-        # Optional filters
-        if not df.empty:
-            date_col = "SubmissionDate" if "SubmissionDate" in df.columns else None
-            if date_col:
-                d1, d2 = st.date_input(
-                    "Date range",
-                    (date.today() - timedelta(days=30), date.today())
-                )
-                dc = pd.to_datetime(df[date_col], errors="coerce").dt.date
-                df = df[(dc >= d1) & (dc <= d2)]
-
-            q = st.text_input("Search (any column)")
+        if df.empty:
+            st.info("No data found for this module."); 
+        else:
+            # Optional search
+            q = st.text_input("Search (matches any column)", key="view_q")
             if q.strip():
                 df = df[df.apply(lambda r: r.astype(str).str.contains(q, case=False, na=False).any(), axis=1)]
 
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        if st.button("Refresh data"):
-            load_module_df.clear(); st.rerun()
+            # Optional date filter (OFF by default)
+            use_date = st.checkbox("Filter by Submission Date", value=False, key="view_use_date")
+            if use_date and "SubmissionDate" in df.columns:
+                sd = pd.to_datetime(df["SubmissionDate"], errors="coerce").dt.date
+                if sd.notna().any():
+                    d1 = st.date_input("From", sd.min(), key="view_d1")
+                    d2 = st.date_input("To",   sd.max(), key="view_d2")
+                    df = df[(sd >= d1) & (sd <= d2)]
 
-        if not df.empty:
+            st.dataframe(df, use_container_width=True, hide_index=True)
             csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button("Download CSV", csv, f"{mod}_export.csv", "text/csv")
+            st.download_button("Download CSV", csv, f"{mod}_export.csv", "text/csv", key="view_dl")
+
+        if st.button("Refresh data", key="view_refresh"):
+            load_module_df.clear(); st.rerun()
 
 def _render_email_whatsapp_page():
     with intake_page("Email / WhatsApp", "Pull contacts from ClientContacts", badge=ROLE):
@@ -1169,48 +1188,79 @@ def _render_email_whatsapp_page():
         st.caption("Copy/paste into your mail/WhatsApp client.")
 
 def _render_masters_admin_page():
-    with intake_page("Masters Admin", "Add values to masters", badge=ROLE):
-        col1, col2, col3 = st.columns(3)
-        with col1:
+    with intake_page("Masters Admin", "Add values to masters & modules", badge=ROLE):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Pharmacies")
+            pid   = st.text_input("ID",   key="pharm_id")
+            pname = st.text_input("Name", key="pharm_name")
+            if st.button("Add pharmacy", key="btn_add_pharm"):
+                if pid.strip() and pname.strip():
+                    ws(MS_PHARM).append_row([pid.strip(), pname.strip()], value_input_option="USER_ENTERED")
+                    st.success("Pharmacy added."); pharm_master.clear(); st.rerun()
+
+        with c2:
+            st.subheader("Insurance")
+            icode = st.text_input("Code", key="ins_code")
+            iname = st.text_input("Name", key="ins_name")
+            if st.button("Add insurance", key="btn_add_ins"):
+                if icode.strip() and iname.strip():
+                    ws(MS_INSURANCE).append_row([icode.strip(), iname.strip()], value_input_option="USER_ENTERED")
+                    st.success("Insurance added."); insurance_master.clear(); st.rerun()
+
+        st.markdown("---")
+        c3, c4, c5 = st.columns(3)
+        with c3:
             st.markdown("**Submission Mode**")
-            sm = st.text_input("Add mode", key="add_sm")
-            if st.button("Add mode"):
-                if sm.strip():
-                    ws(MS_SUBMISSION_MODE).append_row([sm.strip()], value_input_option="USER_ENTERED")
+            new_sm = st.text_input("Add mode", key="new_sm")
+            if st.button("Add mode", key="btn_add_sm"):
+                if new_sm.strip():
+                    ws(MS_SUBMISSION_MODE).append_row([new_sm.strip()], value_input_option="USER_ENTERED")
                     st.success("Added."); st.rerun()
-        with col2:
+        with c4:
             st.markdown("**Portal**")
-            po = st.text_input("Add portal", key="add_portal")
-            if st.button("Add portal"):
-                if po.strip():
-                    ws(MS_PORTAL).append_row([po.strip()], value_input_option="USER_ENTERED")
+            new_portal = st.text_input("Add portal", key="new_portal")
+            if st.button("Add portal", key="btn_add_portal"):
+                if new_portal.strip():
+                    ws(MS_PORTAL).append_row([new_portal.strip()], value_input_option="USER_ENTERED")
                     st.success("Added."); st.rerun()
-        with col3:
+        with c5:
             st.markdown("**Status**")
-            stt = st.text_input("Add status", key="add_status")
-            if st.button("Add status"):
-                if stt.strip():
-                    ws(MS_STATUS).append_row([stt.strip()], value_input_option="USER_ENTERED")
+            new_status = st.text_input("Add status", key="new_status")
+            if st.button("Add status", key="btn_add_status"):
+                if new_status.strip():
+                    ws(MS_STATUS).append_row([new_status.strip()], value_input_option="USER_ENTERED")
                     st.success("Added."); st.rerun()
 
         st.markdown("---")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Pharmacies**")
-            pid = st.text_input("ID")
-            pname = st.text_input("Name")
-            if st.button("Add pharmacy"):
-                if pid.strip() and pname.strip():
-                    ws(MS_PHARM).append_row([pid.strip(), pname.strip()], value_input_option="USER_ENTERED")
-                    st.success("Added."); st.rerun()
-        with c2:
-            st.markdown("**Insurance**")
-            code = st.text_input("Code")
-            name = st.text_input("Name")
-            if st.button("Add insurance"):
-                if code.strip() and name.strip():
-                    ws(MS_INSURANCE).append_row([code.strip(), name.strip()], value_input_option="USER_ENTERED")
-                    st.success("Added."); st.rerun()
+        st.subheader("Modules")
+        m1, m2, m3 = st.columns([1, 1, 1])
+        with m1:
+            mod_name   = st.text_input("Module",     key="mod_name")
+            sheet_name = st.text_input("Sheet name (optional)", key="mod_sheet")
+        with m2:
+            def_enabled = st.checkbox("Default enabled", value=True, key="mod_def_enabled")
+            dupkeys     = st.text_input("DupKeys (pipe-separated)", key="mod_dupkeys")
+        with m3:
+            nums_json   = st.text_input('NumericFieldsJSON (e.g. ["NetAmount"] )', key="mod_numsjson")
+
+        if st.button("Add module", key="btn_add_module"):
+            m = mod_name.strip()
+            if not m:
+                st.error("Module name is required.")
+            else:
+                sn = sheet_name.strip() or f"Data_{m}"
+                ws(MS_MODULES).append_row(
+                    [m, sn, "TRUE" if def_enabled else "FALSE", dupkeys.strip(), nums_json.strip() or "[]"],
+                    value_input_option="USER_ENTERED"
+                )
+                # Ensure backing sheet exists, enable for this client, and seed schema.
+                _ensure_module_sheets_exist()
+                ws(MS_CLIENT_MODULES).append_row([CLIENT_ID, m, "TRUE"], value_input_option="USER_ENTERED")
+                seed_form_schema_for_module(m, CLIENT_ID)
+                modules_catalog_df.clear(); client_modules_df.clear(); schema_df.clear()
+                st.success(f"Module '{m}' added and enabled.")
+                st.rerun()
 
 def _render_bulk_import_insurance_page():
     with intake_page("Bulk Import Insurance", "Upload CSV with Code,Name", badge=ROLE):
@@ -1237,45 +1287,42 @@ def _render_summary_page():
         if not module_pairs:
             st.info("No modules enabled."); return
         cols = st.columns(3)
-        for i, (mod, sheet) in enumerate(module_pairs[:9]):  # show first 9 as cards
+        for i, (mod, sheet) in enumerate(module_pairs[:12]):
             df = _apply_common_filters(load_module_df(sheet))
-            total = len(df)
+            total    = len(df)
             approved = int((df.get("Status","").astype(str).str.lower()=="approved").sum()) if "Status" in df.columns else 0
             pending  = int((df.get("Status","").astype(str).str.lower()=="pending").sum())  if "Status" in df.columns else 0
             with cols[i % 3]:
-                st.metric(f"{mod} — Total", total)
+                st.metric(f"{mod}: total", total)
                 st.caption(f"Approved: {approved} · Pending: {pending}")
 
 def _render_update_record_page():
     with intake_page("Update Record", "Edit a single row", badge=ROLE):
         if not module_pairs:
             st.info("No modules enabled."); return
-        mod = st.selectbox("Module", [m for m,_ in module_pairs], index=0)
+        mod = st.selectbox("Module", [m for m,_ in module_pairs], index=0, key="upd_mod")
         sheet = dict(module_pairs)[mod]
         df = _apply_common_filters(load_module_df(sheet))
         if df.empty:
             st.info("No rows to edit."); return
 
-        st.caption("Pick a row number (as shown below) to edit.")
-        st.dataframe(df.reset_index().rename(columns={"index":"Row#"}), use_container_width=True)
-        rownum = st.number_input("Row# to edit", min_value=0, max_value=len(df)-1, step=1)
+        show = df.reset_index().rename(columns={"index":"Row#"})
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        rownum = st.number_input("Row# to edit", min_value=0, max_value=len(df)-1, step=1, key="upd_row")
         editable_cols = [c for c in df.columns if c not in ("Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module")]
-        st.write("Editable columns:", ", ".join(editable_cols) or "—")
         edits = {}
         for c in editable_cols:
-            edits[c] = st.text_input(c, value=str(df.iloc[rownum][c]))
+            edits[c] = st.text_input(c, value=str(df.iloc[rownum][c]), key=f"upd_{c}")
 
-        if st.button("Save changes", type="primary"):
+        if st.button("Save changes", type="primary", key="upd_save"):
             w = ws(sheet)
-            # Header row is 1; data starts at 2; add rownum offset + 2
-            target_row = int(rownum) + 2
             header = w.row_values(1)
-            # Build updated row from existing + edits
-            current = w.row_values(target_row)
-            current += [""] * (len(header) - len(current))
-            cur_map = {h: current[i] if i < len(current) else "" for i, h in enumerate(header)}
+            target_row = int(rownum) + 2   # header + 1-based index
+            current_row_vals = w.row_values(target_row)
+            current_row_vals += [""] * (len(header) - len(current_row_vals))
+            cur_map = {h: (current_row_vals[i] if i < len(current_row_vals) else "") for i, h in enumerate(header)}
             cur_map.update(edits)
-            w.update(f"A{target_row}", [ [cur_map.get(h,"") for h in header] ])
+            w.update(f"A{target_row}", [[cur_map.get(h,"") for h in header]])
             st.success("Row updated.")
             load_module_df.clear(); st.rerun()
 
