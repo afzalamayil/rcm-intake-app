@@ -574,8 +574,8 @@ def _options_from_token(token: str) -> list[str]:
         return []
     if key in ("doctors", "doctorsall"):
     # Prefer the pharmacy picked in THIS form render
-    mod_key = st.session_state.get("_current_module", st.session_state.get("nav_mod", ""))
-    ph_id = st.session_state.get("_current_pharmacy_id", "")
+        mod_key = st.session_state.get("_current_module", st.session_state.get("nav_mod", ""))
+        ph_id = st.session_state.get("_current_pharmacy_id", "")
     if not ph_id:
         ph_disp = st.session_state.get(f"{mod_key}_pharmacy_display", "")
         ph_id = ph_disp.split(" - ", 1)[0].strip() if " - " in ph_disp else ""
