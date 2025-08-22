@@ -935,7 +935,10 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                     ph_df = ph_df[ph_df["ID"].isin(ALLOWED_PHARM_IDS)]
                 pharm_choices = ph_df["Display"].tolist() if not ph_df.empty else ["—"]
                 st.selectbox("Pharmacy (ID - Name)*", pharm_choices, key=f"{module_name}_pharmacy_display")
-
+                st.session_state["_current_module"] = module_name
+                ph_disp = st.session_state.get(f"{module_name}_pharmacy_display", "")
+                st.session_state["_current_pharmacy_id"] = ph_disp.split(" - ", 1)[0].strip() if " - " in ph_disp else ""
+                
                 cols = st.columns(3, gap="large")
                 values = {}
 
