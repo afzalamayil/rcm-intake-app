@@ -572,19 +572,28 @@ def _options_from_token(token: str) -> list[str]:
     token = (token or "").strip()
     if not token:
         return []
-    if token.startswith("MS:"):
-        key = token.split(":", 1)[1].strip().lower()
-        if key in ("doctors", "doctorsall"):
-            ph_disp = st.session_state.get(f"{st.session_state.get('nav_mod','')}_pharmacy_display", "")
-            ph_id = ph_disp.split(" - ", 1)[0].strip() if " - " in ph_disp else ""
-            role_is_super = str(ROLE).strip().lower() in ("super admin","superadmin")
-            use_client = None if role_is_super or key == "doctorsall" or str(CLIENT_ID).upper() in ("", "ALL") else CLIENT_ID
-            use_pharm  = ph_id if ph_id not in ("", "ALL") else None
-            try:
-                df = doctors_master(client_id=use_client, pharmacy_id=use_pharm)
-                return df["Display"].tolist() if not df.empty else []
-            except Exception:
-                return []
+    if key in ("doctors", "doctorsall"):
+    # Prefer the pharmacy picked in THIS form render
+    mod_key = st.session_state.get("_current_module", st.session_state.get("nav_mod", ""))
+    ph_id = st.session_state.get("_current_pharmacy_id", "")
+    if not ph_id:
+        ph_disp = st.session_state.get(f"{mod_key}_pharmacy_display", "")
+        ph_id = ph_disp.split(" - ", 1)[0].strip() if " - " in ph_disp else ""
+
+    role_is_super = str(ROLE).strip().lower() in ("super admin", "superadmin")
+    use_client = None if role_is_super or key == "doctorsall" or str(CLIENT_ID).upper() in ("", "ALL") else CLIENT_ID
+    use_pharm  = ph_id if ph_id and ph_id.upper() != "ALL" else None
+
+    try:
+        df = doctors_master(client_id=use_client, pharmacy_id=use_pharm)
+        # graceful fallback: if no rows for pharmacy, try client, then all
+        if df.empty and use_client:
+            df = doctors_master(client_id=use_client, pharmacy_id=None)
+        if df.empty:
+            df = doctors_master(client_id=None, pharmacy_id=None)
+        return df["Display"].tolist() if not df.empty else []
+    except Exception:
+        return []
         if key == "insurance":
             df = insurance_master()
             return df["Display"].tolist() if not df.empty else []
