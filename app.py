@@ -572,28 +572,46 @@ def _options_from_token(token: str) -> list[str]:
     token = (token or "").strip()
     if not token:
         return []
-    if key in ("doctors", "doctorsall"):
-    # Prefer the pharmacy picked in THIS form render
-        mod_key = st.session_state.get("_current_module", st.session_state.get("nav_mod", ""))
-        ph_id = st.session_state.get("_current_pharmacy_id", "")
-    if not ph_id:
-        ph_disp = st.session_state.get(f"{mod_key}_pharmacy_display", "")
-        ph_id = ph_disp.split(" - ", 1)[0].strip() if " - " in ph_disp else ""
 
-    role_is_super = str(ROLE).strip().lower() in ("super admin", "superadmin")
-    use_client = None if role_is_super or key == "doctorsall" or str(CLIENT_ID).upper() in ("", "ALL") else CLIENT_ID
-    use_pharm  = ph_id if ph_id and ph_id.upper() != "ALL" else None
+    if token.startswith("MS:"):
+        key = token.split(":", 1)[1].strip().lower()
 
-    try:
-        df = doctors_master(client_id=use_client, pharmacy_id=use_pharm)
-        # graceful fallback: if no rows for pharmacy, try client, then all
-        if df.empty and use_client:
-            df = doctors_master(client_id=use_client, pharmacy_id=None)
-        if df.empty:
-            df = doctors_master(client_id=None, pharmacy_id=None)
-        return df["Display"].tolist() if not df.empty else []
-    except Exception:
-        return []
+        # ------- Doctors resolver (pharmacy-aware with safe fallbacks) -------
+        if key in ("doctors", "doctorsall"):
+            # Prefer the pharmacy picked in THIS form render
+            ph_id = st.session_state.get("_current_pharmacy_id", "")
+
+            # Fallback: use current module's pharmacy display selection
+            if not ph_id:
+                mod_key = st.session_state.get("_current_module", st.session_state.get("nav_mod", ""))
+                if mod_key:
+                    ph_disp = st.session_state.get(f"{mod_key}_pharmacy_display", "")
+                    if isinstance(ph_disp, str) and " - " in ph_disp:
+                        ph_id = ph_disp.split(" - ", 1)[0].strip()
+
+            # Last resort: scan any *_pharmacy_display held in session_state
+            if not ph_id:
+                for k, v in st.session_state.items():
+                    if k.endswith("_pharmacy_display") and isinstance(v, str) and " - " in v:
+                        ph_id = v.split(" - ", 1)[0].strip()
+                        break
+
+            role_is_super = str(ROLE).strip().lower() in ("super admin", "superadmin")
+            use_client = None if role_is_super or key == "doctorsall" or str(CLIENT_ID).upper() in ("", "ALL") else CLIENT_ID
+            use_pharm  = ph_id if ph_id and ph_id.upper() != "ALL" else None
+
+            try:
+                df = doctors_master(client_id=use_client, pharmacy_id=use_pharm)
+                # graceful fallbacks
+                if df.empty and use_client:
+                    df = doctors_master(client_id=use_client, pharmacy_id=None)
+                if df.empty:
+                    df = doctors_master(client_id=None, pharmacy_id=None)
+                return df["Display"].tolist() if not df.empty else []
+            except Exception:
+                return []
+        # ---------------------------------------------------------------------
+
         if key == "insurance":
             df = insurance_master()
             return df["Display"].tolist() if not df.empty else []
@@ -604,14 +622,17 @@ def _options_from_token(token: str) -> list[str]:
         if key == "submissionmode":
             return safe_list(MS_SUBMISSION_MODE, [])
         return []
+
     if token.startswith("L:"):
         return [x.strip() for x in token[2:].split("|") if x.strip()]
+
     try:
         arr = json.loads(token)
         if isinstance(arr, list):
             return [str(x) for x in arr]
     except Exception:
         pass
+
     return []
 
 def _role_visible(rolespec: str, role: str) -> bool:
