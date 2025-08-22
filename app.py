@@ -228,16 +228,31 @@ def load_module_df(sheet_name: str) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers used by data pages (scope to client & pharmacy ACL)
 # ─────────────────────────────────────────────────────────────────────────────
-def _apply_common_filters(df: pd.DataFrame) -> pd.DataFrame:
+def _is_admin_like(role: str) -> bool:
+    r = (role or "").strip().lower()
+    return r in ("admin", "super admin", "superadmin")
+
+def _apply_common_filters(df: pd.DataFrame, scope_to_user: bool = False) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     out = df.copy()
+
+    # Client scope
     if "ClientID" in out.columns:
-        out = out[out["ClientID"].astype(str).str.upper() == str(CLIENT_ID).upper()]
+        if str(CLIENT_ID).strip().upper() not in ("", "ALL"):
+            out = out[out["ClientID"].astype(str).str.upper() == str(CLIENT_ID).strip().upper()]
+
+    # Pharmacy ACL scope
     if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"] and "PharmacyID" in out.columns:
         out = out[out["PharmacyID"].astype(str).isin([str(x) for x in ALLOWED_PHARM_IDS])]
-    return out.fillna("")
 
+    # User scope (only on pages where we ask for it)
+    if scope_to_user and not _is_admin_like(ROLE):
+        if "SubmittedBy" in out.columns:
+            mine = {(username or "").strip().lower(), (name or "").strip().lower()}
+            out = out[out["SubmittedBy"].astype(str).str.lower().isin(mine)]
+
+    return out.fillna("")
 # ─────────────────────────────────────────────────────────────────────────────
 # Masters & Config sheets
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1333,31 +1348,127 @@ def _render_update_record_page():
     with intake_page("Update Record", "Edit a single row", badge=ROLE):
         if not module_pairs:
             st.info("No modules enabled."); return
+
         mod = st.selectbox("Module", [m for m,_ in module_pairs], index=0, key="upd_mod")
         sheet = dict(module_pairs)[mod]
-        df = _apply_common_filters(load_module_df(sheet))
-        if df.empty:
-            st.info("No rows to edit."); return
 
-        show = df.reset_index().rename(columns={"index":"Row#"})
-        st.dataframe(show, use_container_width=True, hide_index=True)
-        rownum = st.number_input("Row# to edit", min_value=0, max_value=len(df)-1, step=1, key="upd_row")
-        editable_cols = [c for c in df.columns if c not in ("Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module")]
+        # Load and apply ACLs (client/pharmacy + per-user)
+        df = load_module_df(sheet)
+        df = _apply_common_filters(df, scope_to_user=True)
+
+        if df.empty:
+            st.info("No rows to edit for your scope."); return
+
+        # ------- Flexible filters (ClaimID, EID, Patient, Approval, Member, Insurance, Status)
+        def _find_col(cands: list[str]) -> str | None:
+            lowmap = {c.strip().lower(): c for c in df.columns}
+            for c in cands:
+                k = c.strip().lower()
+                if k in lowmap:
+                    return lowmap[k]
+            return None
+
+        col_claim     = _find_col(["ClaimID","Claim Id","Claim#","Claim Number"])
+        col_eid       = _find_col(["EID","EmiratesID","Emirates ID"])
+        col_patient   = _find_col(["PatientName","Patient Name","Patient"])
+        col_approval  = _find_col(["ApprovalCode","Approval Code"])
+        col_member    = _find_col(["MemberID","Member ID"])
+        col_ins       = _find_col(["InsuranceName","Insurance","Insurance Code","InsuranceCode"])
+        col_status    = _find_col(["Status","ApprovalStatus","Final Status","FinalStatus"])
+
+        with st.expander("Filters", expanded=True):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                f_claim   = st.text_input("Claim ID", key="f_claim") if col_claim else ""
+                f_eid     = st.text_input("EID", key="f_eid") if col_eid else ""
+                f_patient = st.text_input("Patient Name", key="f_patient") if col_patient else ""
+            with c2:
+                f_approval = st.text_input("Approval Code", key="f_approval") if col_approval else ""
+                f_member   = st.text_input("Member ID", key="f_member") if col_member else ""
+            with c3:
+                if col_ins:
+                    f_insurance = st.text_input("Insurance (text match)", key="f_insurance")
+                else:
+                    f_insurance = ""
+                if col_status:
+                    opts = [""] + sorted([x for x in df[col_status].astype(str).unique() if x])
+                    f_status = st.selectbox("Status", opts, index=0, key="f_status")
+                else:
+                    f_status = ""
+
+        # Apply filters (case-insensitive contains)
+        def _contains(col, needle):
+            if not col or not needle.strip():
+                return True
+            return df[col].astype(str).str.contains(needle.strip(), case=False, na=False)
+
+        mask = (
+            _contains(col_claim, f_claim) &
+            _contains(col_eid, f_eid) &
+            _contains(col_patient, f_patient) &
+            _contains(col_approval, f_approval) &
+            _contains(col_member, f_member) &
+            _contains(col_ins, f_insurance)
+        )
+        if col_status and f_status:
+            mask = mask & (df[col_status].astype(str) == f_status)
+
+        df = df[mask]
+        if df.empty:
+            st.warning("No rows match the filters."); return
+
+        # Show preview with TRUE sheet indices (Row# = sheet row index = dataframe index + 2)
+        preview = df.copy()
+        preview.insert(0, "Row#", preview.index)  # original DF index
+        st.dataframe(preview, use_container_width=True, hide_index=True)
+
+        # Row selector uses the REAL index values, so updates hit the correct sheet row.
+        row_choices = sorted(df.index.tolist())
+        selected_row_index = st.selectbox("Row to edit (Row# from table above)", row_choices, format_func=str, key="upd_row_idx")
+        row_current = df.loc[selected_row_index]
+
+        # Build editors for editable columns
+        non_editable = {"Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module"}
+        editable_cols = [c for c in df.columns if c not in non_editable]
+
         edits = {}
         for c in editable_cols:
-            edits[c] = st.text_input(c, value=str(df.iloc[rownum][c]), key=f"upd_{c}")
+            # choose a reasonable widget by dtype/column name
+            val = str(row_current.get(c, ""))
+            if "date" in c.lower():
+                try:
+                    d = pd.to_datetime(val, errors="coerce").date() if val else date.today()
+                except Exception:
+                    d = date.today()
+                edits[c] = st.date_input(c, value=d, key=f"upd_{c}")
+            elif c.lower() in {"status","approvalstatus"}:
+                u = sorted([x for x in df[c].astype(str).unique() if x])
+                edits[c] = st.selectbox(c, options=u or [val], index=(u.index(val) if val in u else 0), key=f"upd_{c}")
+            elif c.lower() in {"insurance","insurancename","insurancecode"}:
+                edits[c] = st.text_input(c, value=val, key=f"upd_{c}")
+            else:
+                # keep simple; data is saved as text to the sheet
+                edits[c] = st.text_input(c, value=val, key=f"upd_{c}")
 
         if st.button("Save changes", type="primary", key="upd_save"):
             w = ws(sheet)
             header = w.row_values(1)
-            target_row = int(rownum) + 2   # header + 1-based index
-            current_row_vals = w.row_values(target_row)
+            # Convert date widgets back to yyyy-mm-dd
+            for k, v in edits.items():
+                if isinstance(v, (date, datetime)):
+                    edits[k] = pd.to_datetime(v).strftime("%Y-%m-%d")
+
+            # Read current row from the sheet, merge edits, and update
+            sheet_row_num = int(selected_row_index) + 2  # header row + 1-based
+            current_row_vals = w.row_values(sheet_row_num)
             current_row_vals += [""] * (len(header) - len(current_row_vals))
             cur_map = {h: (current_row_vals[i] if i < len(current_row_vals) else "") for i, h in enumerate(header)}
-            cur_map.update(edits)
-            w.update(f"A{target_row}", [[cur_map.get(h,"") for h in header]])
+            for c in editable_cols:
+                cur_map[c] = edits[c]
+            w.update(f"A{sheet_row_num}", [[cur_map.get(h, "") for h in header]])
             st.success("Row updated.")
-            load_module_df.clear(); st.rerun()
+            load_module_df.clear()
+            st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Navigation (dynamic modules + static pages)
