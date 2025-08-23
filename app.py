@@ -2156,6 +2156,15 @@ def nav_pages_for(role: str):
 
 module_pairs, static_pages = nav_pages_for(ROLE)
 
+# Remember what the user clicked last so we can switch views naturally
+st.session_state.setdefault("_nav_active", "module" if module_pairs else "static")
+
+def _pick_module():
+    st.session_state["_nav_active"] = "module"
+
+def _pick_static():
+    st.session_state["_nav_active"] = "static"
+
 st.sidebar.markdown("### Modules")
 module_choice = (
     st.sidebar.radio(
@@ -2163,38 +2172,50 @@ module_choice = (
         [m for (m, _) in module_pairs],
         index=0,
         key="nav_mod",
+        on_change=_pick_module,
     )
     if module_pairs else None
 )
 
 st.sidebar.markdown("---")
-static_choice = st.sidebar.radio(
-    "Other Pages",
-    ["—"] + static_pages,   # sentinel at index 0
-    index=0,
-    key="nav_page",
-)
 
-page = static_choice  # <-- define unconditionally
+# Rename section and remove the dummy "—" option.
+# Use a selectbox with a placeholder (no default selection).
+try:
+    static_choice = st.sidebar.selectbox(
+        "Tools & Reports",
+        static_pages,
+        index=None,                         # show placeholder until user picks
+        placeholder="Open a page…",
+        key="nav_page",
+        on_change=_pick_static,
+    )
+except TypeError:
+    # Older Streamlit fallback (no index=None support)
+    _items = ["<choose…>"] + static_pages
+    pick = st.sidebar.selectbox("Tools & Reports", _items, index=0, key="nav_page_fallback", on_change=_pick_static)
+    static_choice = None if pick == "<choose…>" else pick
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Navigation dispatcher
 # ─────────────────────────────────────────────────────────────────────────────
-if page != "—":
-    if page == "View / Export":
+active = st.session_state.get("_nav_active", "module")
+
+if active == "static" and static_choice:
+    if static_choice == "View / Export":
         _render_view_export_page()
-    elif page == "Email / WhatsApp":
+    elif static_choice == "Email / WhatsApp":
         _render_email_whatsapp_page()
-    elif page == "Masters Admin":
+    elif static_choice == "Masters Admin":
         _render_masters_admin_page()
-    elif page == "Bulk Import Insurance":
+    elif static_choice == "Bulk Import Insurance":
         _render_bulk_import_insurance_page()
-    elif page == "Summary":
+    elif static_choice == "Summary":
         _render_summary_page()
-    elif page == "Update Record":
+    elif static_choice == "Update Record":
         _render_update_record_page()
 else:
-    # ===================== Dynamic Module =====================
+    # Show the selected module (default behavior)
     if module_choice:
         sheet_name = dict(module_pairs).get(module_choice)
         if module_choice.strip().lower() == "pharmacy":
@@ -2204,4 +2225,5 @@ else:
             st.subheader(f"{module_choice} — Dynamic Intake")
             _render_dynamic_form(module_choice, sheet_name, CLIENT_ID, ROLE)
     else:
-        st.info("No modules enabled. Pick a page on the left.")
+        st.info("No modules enabled. Choose a page on the left.")
+
