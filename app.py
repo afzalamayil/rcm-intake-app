@@ -23,7 +23,7 @@ import json
 import time
 import random
 from datetime import datetime, date, timedelta
-
+import uuid
 import pandas as pd
 import streamlit as st
 import gspread
@@ -191,7 +191,9 @@ def ws(name: str):
     try: return retry(lambda: sh.worksheet(name))
     except gspread.WorksheetNotFound: return retry(lambda: sh.add_worksheet(name, rows=2000, cols=120))
 
-def list_titles(): return {w.title for w in retry(lambda: sh.worksheets())}
+@st.cache_data(ttl=60)
+def list_titles():
+    return {w.title for w in retry(lambda: sh.worksheets())}
 
 # Robust reader: ALWAYS returns a DataFrame with the requested headers (even when sheet is empty/missing)
 def read_sheet_df(title: str, required_headers: list[str] | None = None) -> pd.DataFrame:
@@ -249,9 +251,9 @@ def _apply_common_filters(df: pd.DataFrame, scope_to_user: bool = False) -> pd.D
     # User scope (only on pages where we ask for it)
     if scope_to_user and not _is_admin_like(ROLE):
         if "SubmittedBy" in out.columns:
-            mine = {(username or "").strip().lower(), (name or "").strip().lower()}
+            mine = {s for s in [(username or "").strip().lower(), (name or "").strip().lower()] if s}
             out = out[out["SubmittedBy"].astype(str).str.lower().isin(mine)]
-
+    
     return out.fillna("")
 # ─────────────────────────────────────────────────────────────────────────────
 # Masters & Config sheets
@@ -352,7 +354,7 @@ def _ensure_module_sheets_exist():
         wsx = ws(sheet)
         head = retry(lambda: wsx.row_values(1))
         if not head:
-            meta = ["Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module"]
+            meta = ["Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module","RecordID"]
             retry(lambda: wsx.update("A1", [meta]))
 
 _init_sheets_once()
@@ -388,11 +390,15 @@ def doctors_master(client_id: str | None = None, pharmacy_id: str | None = None)
     for c in ["DoctorID","DoctorName","Specialty","ClientID","PharmacyID"]:
         if c not in df.columns: df[c] = ""
         df[c] = df[c].astype(str).str.strip()
+
     if pharmacy_id and str(pharmacy_id).strip().upper() not in ("", "ALL"):
         df = df[df["PharmacyID"] == str(pharmacy_id).strip()]
     elif client_id and str(client_id).strip().upper() not in ("", "ALL"):
         df = df[df["ClientID"].str.upper() == str(client_id).strip().upper()]
-    df["Display"] = df["DoctorName"] + " (" + df["Specialty"].replace("", "—") + ")"
+
+    spec = df["Specialty"].astype(str)
+    spec = spec.where(spec.str.strip() != "", "—")
+    df["Display"] = df["DoctorName"].astype(str) + " (" + spec + ")"
     return df[["DoctorID","DoctorName","Specialty","ClientID","PharmacyID","Display"]]
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -519,8 +525,8 @@ def client_modules_df() -> pd.DataFrame:
     df = read_sheet_df(MS_CLIENT_MODULES, REQUIRED_HEADERS[MS_CLIENT_MODULES]).fillna("")
     if not df.empty:
         df["ClientID"] = df["ClientID"].astype(str).str.strip()
-        df["Module"] = df["Module"].astype(str).str.strip()
-        df["Enabled"] = df["Enabled"].astype(str).upper().isin(["TRUE","1","YES"])
+        df["Module"]   = df["Module"].astype(str).str.strip()
+        df["Enabled"]  = _to_bool_series(df["Enabled"])  # <— important change
     return df
 
 @st.cache_data(ttl=60)
@@ -529,7 +535,7 @@ def user_modules_df() -> pd.DataFrame:
     if not df.empty:
         df["Username"] = df["Username"].astype(str).str.strip()
         df["Module"]   = df["Module"].astype(str).str.strip()
-        df["Enabled"]  = df["Enabled"].astype(str).upper().isin(["TRUE","1","YES"])
+        df["Enabled"]  = _to_bool_series(df["Enabled"])  # <— important change
     return df
 
 def modules_enabled_for(client_id: str, role: str) -> list[tuple[str,str]]:
@@ -694,8 +700,9 @@ def _check_duplicate_if_needed(sheet_name: str, module_name: str, data_map: dict
                 pass
         mask = pd.Series([True]*len(df))
         for k in dup_keys:
-            sv = str(data_map.get(k,"")).strip()
-            mask = mask & (df.get(k,"").astype(str).str.strip() == sv)
+            sv = str(data_map.get(k, "")).strip().lower()
+            mask = mask & (df.get(k, "").astype(str).str.strip().str.lower() == sv)
+
         return bool(df[mask].shape[0] > 0)
     except Exception:
         return False
@@ -850,6 +857,10 @@ def _clear_all_caches():
         load_module_df.clear()
     except Exception:
         pass
+
+def _sanitize_cell(v):
+    s = str(v or "")
+    return "'" + s if s and s[0] in "=+-@" else s
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Form rendering
@@ -1034,6 +1045,8 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         st.session_state.remark.strip(),
         st.session_state.status,
     ]
+    # sanitize all text-like cells
+    record = [_sanitize_cell(x) if isinstance(x, str) else x for x in record]
 
     try:
         retry(lambda: wsx.append_row(record, value_input_option="USER_ENTERED"))
@@ -1105,7 +1118,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                     target    = cols[i % 3]
 
                     # IMPORTANT: st is not a context manager → use a container for textareas
-                    container = st.container() if typ == "textarea" else target
+                    container = target
 
                     with container:
                         if readonly:
@@ -1201,7 +1214,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
         st.error("You are not allowed to submit for this pharmacy."); return
 
     # Ensure headers exist
-    meta = ["Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module"]
+    meta = ["Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module","RecordID"]
     save_map = {r["FieldKey"]: (r["SaveTo"] or r["FieldKey"]) for _, r in rows.iterrows()
                 if _role_visible(r["RoleVisibility"], role)}
     target_headers = meta + list(dict.fromkeys(save_map.values()))
@@ -1223,6 +1236,9 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
         "PharmacyName": ph_name,
         "Module": module_name,
     }
+    # add a unique ID for this record
+    data_map["RecordID"] = str(uuid.uuid4())
+
     typ_map = { rr["FieldKey"]: str(rr["Type"]).lower().strip() for _, rr in rows.iterrows() }  # safe cast
 
     for fk, col in save_map.items():
@@ -1268,6 +1284,10 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
         st.info(f"Duplicate check skipped: {e}")
 
     # Save
+    # sanitize all string values to avoid formula injection
+    for k in list(data_map.keys()):
+        if isinstance(data_map[k], str):
+            data_map[k] = _sanitize_cell(data_map[k])
     row = [data_map.get(h, "") for h in target_headers]
     try:
         retry(lambda: wsx.append_row(row, value_input_option="USER_ENTERED"))
@@ -1365,6 +1385,11 @@ def _render_view_export_page():
             mask &= df.apply(lambda r: r.astype(str).str.contains(esc, case=False, na=False).any(), axis=1)
 
         df = df[mask]
+        for _col in ("NetAmount", "PatientShare"):
+            if _col in df.columns:
+                _num = pd.to_numeric(df[_col], errors="coerce")
+                if _num.notna().any():
+                    df[_col] = _num.map(lambda v: f"{v:.2f}")
         if df.empty:
             st.warning("No rows match the filters."); 
         else:
@@ -1435,74 +1460,60 @@ def _render_masters_admin_page():
                                 udf_edit.loc[idx[0],"password"] = hashed
                                 if _save_whole_sheet(USERS_TAB, udf_edit, REQUIRED_HEADERS[USERS_TAB]):
                                     _clear_all_caches(); st.success("Password updated.")
+            
+            # Load current users (from the editor above) and modules catalog
+            available_users = udf_edit["username"].astype(str).tolist() if not udf_edit.empty else []
+            available_modules = modules_catalog_df()["Module"].astype(str).tolist()
+            
+            umdf = _load_for_editor(MS_USER_MODULES, REQUIRED_HEADERS[MS_USER_MODULES])
+            
+            colA, colB = st.columns([1,2])
+            with colA:
+                sel_user = st.selectbox("User", available_users, key="um_sel_user")
+            with colB:
+                # Current enabled modules for this user
+                cur = []
+                if not umdf.empty and sel_user:
+                    cur = umdf[(umdf["Username"].astype(str).str.lower() == sel_user.lower()) & ( _to_bool_series(umdf["Enabled"]) )]["Module"].astype(str).tolist()
+            
+                chosen = st.multiselect("Enabled modules", options=available_modules, default=cur, key="um_chosen")
+            
+            row1, row2 = st.columns([1,1])
+            with row1:
+                if st.button("Save user module access", type="primary", key="btn_save_user_modules", disabled=not sel_user):
+                    # Rebuild rows for this user: one row per module with Enabled TRUE/FALSE
+                    base = pd.DataFrame({
+                        "Username": [sel_user]*len(available_modules),
+                        "Module":   available_modules,
+                        "Enabled":  [m in chosen for m in available_modules],
+                    })
+                    # Keep other users' rows as-is
+                    others = umdf[umdf["Username"].astype(str).str.lower() != sel_user.lower()].copy()
+                    out = pd.concat([others, base], ignore_index=True)
+            
+                    if _save_whole_sheet(MS_USER_MODULES, out, REQUIRED_HEADERS[MS_USER_MODULES]):
+                        _clear_all_caches()
+                        st.success("Per-user modules saved.")
+            with row2:
+                if st.button("Open raw editor (advanced)", key="btn_open_um_editor"):
+                    st.data_editor(
+                        umdf, key="ed_user_modules_raw", num_rows="dynamic",
+                        use_container_width=True, hide_index=True,
+                        column_config={
+                            "Username": st.column_config.TextColumn("Username", required=True),
+                            "Module":   st.column_config.TextColumn("Module", required=True),
+                            "Enabled":  st.column_config.CheckboxColumn("Enabled"),
+                        },
+                        height=260,
+                    )
+                    if st.button("Save raw user-modules", key="btn_save_um_raw"):
+                        if _save_whole_sheet(MS_USER_MODULES, st.session_state["ed_user_modules_raw"], REQUIRED_HEADERS[MS_USER_MODULES]):
+                            _clear_all_caches()
+                            st.success("UserModules sheet saved.")
 
                         # --- Per-user Module Access ---------------------------------------
             st.divider()
-            st.markdown("#### Per-user module access")
-
-            # All modules from catalog
-            all_mods = sorted(modules_catalog_df()["Module"].astype(str).tolist())
-
-            # Current user-modules map (tolerant loader)
-            umdf = _load_for_editor(MS_USER_MODULES, REQUIRED_HEADERS[MS_USER_MODULES])
-
-            # Pick which user to manage
-            user_list = udf_edit["username"].astype(str).tolist() if not udf_edit.empty else []
-            sel_user_mod = st.selectbox("Pick user to manage modules", user_list, key="user_mod_pick")
-
-            # Pre-select modules currently enabled for this user
-            if sel_user_mod:
-                cur_enabled = []
-                if not umdf.empty:
-                    cur_enabled = (
-                        umdf[
-                            (umdf["Username"].astype(str).str.lower() == str(sel_user_mod).lower())
-                            & _to_bool_series(umdf["Enabled"])
-                        ]["Module"]
-                        .astype(str)
-                        .tolist()
-                    )
-                chosen = st.multiselect(
-                    "Modules visible to this user (leave empty to remove overrides and fall back to client/default)",
-                    options=all_mods,
-                    default=sorted(cur_enabled),
-                    key="user_mods_sel",
-                )
-
-                b1, b2, b3 = st.columns([1,1,1])
-                with b1:
-                    if st.button("Save module access", type="primary", key="btn_save_user_modules"):
-                        # Overwrite this user's rows with TRUE for selected modules
-                        base = umdf[umdf["Username"].astype(str).str.lower() != str(sel_user_mod).lower()].copy()
-                        new_rows = pd.DataFrame(
-                            [{"Username": sel_user_mod, "Module": m, "Enabled": True} for m in chosen]
-                        )
-                        out = pd.concat([base, new_rows], ignore_index=True)
-                        if _save_whole_sheet(MS_USER_MODULES, out, REQUIRED_HEADERS[MS_USER_MODULES]):
-                            _clear_all_caches()
-                            st.success("User module access saved.")
-
-                with b2:
-                    if st.button("Clear overrides for this user", key="btn_clear_user_modules"):
-                        # Remove all UserModules rows for this user (reverts to client/default visibility)
-                        base = umdf[umdf["Username"].astype(str).str.lower() != str(sel_user_mod).lower()].copy()
-                        if _save_whole_sheet(MS_USER_MODULES, base, REQUIRED_HEADERS[MS_USER_MODULES]):
-                            _clear_all_caches()
-                            st.success("Cleared per-user module overrides. This user now follows client/default module visibility.")
-
-                with b3:
-                    if st.button("Disable ALL modules for this user", key="btn_disable_all_user_modules"):
-                        # Write FALSE rows for every module, so allowed set becomes empty
-                        base = umdf[umdf["Username"].astype(str).str.lower() != str(sel_user_mod).lower()].copy()
-                        new_rows = pd.DataFrame(
-                            [{"Username": sel_user_mod, "Module": m, "Enabled": False} for m in all_mods]
-                        )
-                        out = pd.concat([base, new_rows], ignore_index=True)
-                        if _save_whole_sheet(MS_USER_MODULES, out, REQUIRED_HEADERS[MS_USER_MODULES]):
-                            _clear_all_caches()
-                            st.success("All modules disabled for this user.")
-
-        
+            
         # ---------- Clients ----------
         with tabs[1]:
             st.subheader("Clients")
@@ -1598,9 +1609,13 @@ def _render_masters_admin_page():
                                         help_text="After save, click Reconcile to auto-create sheets + seed FormSchema.")
             with right:
                 st.markdown("**Validation**")
-                ok, msg = _json_validate_field(mdf_edit.get("NumericFieldsJSON","[]").iloc[0] if not mdf_edit.empty else "[]")
-                st.write("NumericFieldsJSON:", "✅" if ok else f"❌ {msg}")
-
+                bad = []
+                if not mdf_edit.empty and "NumericFieldsJSON" in mdf_edit.columns:
+                    for i, v in enumerate(mdf_edit["NumericFieldsJSON"].astype(str), start=2):  # +1 header +1 index
+                        ok, msg = _json_validate_field(v)
+                        if not ok: bad.append(f"row {i}: {msg}")
+                st.write("✅ All good" if not bad else "❌ " + " | ".join(bad))
+            
             a1, a2 = st.columns([1,1])
             with a1:
                 if st.button("Save Modules", type="primary", key="btn_save_modules"):
@@ -2069,7 +2084,13 @@ def _render_update_record_page():
             current_row_vals += [""] * (len(header) - len(current_row_vals))
             cur_map = {h: (current_row_vals[i] if i < len(current_row_vals) else "") for i, h in enumerate(header)}
             for c in editable_cols:
-                cur_map[c] = edits[c]
+                val = edits[c]
+                if isinstance(val, (date, datetime)):
+                    val = pd.to_datetime(val).strftime("%Y-%m-%d")
+                if isinstance(val, str):
+                    val = _sanitize_cell(val)
+                cur_map[c] = val
+
             w.update(f"A{sheet_row_num}", [[cur_map.get(h, "") for h in header]])
             st.success("Row updated.")
             load_module_df.clear()
