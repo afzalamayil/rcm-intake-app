@@ -469,6 +469,16 @@ name = st.session_state.get("name"); username = st.session_state.get("username")
 if not authentication_status:
     if authentication_status is False: st.error("Invalid credentials")
     st.stop()
+# --- One-time flash message shown after a rerun ---
+_flash = st.session_state.pop("_flash_msg", None)
+if _flash:
+    level, msg = _flash
+    if level == "warning":
+        st.warning(msg)
+    elif level == "error":
+        st.error(msg)
+    else:
+        st.success(msg)
 
 def get_user_role_pharms_client(u):
     if USERS_DF is not None and not USERS_DF.empty:
@@ -862,6 +872,19 @@ def _sanitize_cell(v):
     s = str(v or "")
     return "'" + s if s and s[0] in "=+-@" else s
 
+def _clear_module_form_state(module_name: str, schema_rows: pd.DataFrame):
+    """Remove all Streamlit widget state for a module so the form starts blank on rerun."""
+    try:
+        keys = [f"{module_name}_pharmacy_display", f"{module_name}_dup_override"]
+        if schema_rows is not None and not schema_rows.empty and "FieldKey" in schema_rows.columns:
+            for fk in schema_rows["FieldKey"].astype(str):
+                keys.append(f"{module_name}_{fk}")
+                keys.append(f"{module_name}_{fk}_ro")  # read-only mirror keys
+        for k in keys:
+            st.session_state.pop(k, None)
+    except Exception:
+        pass
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Form rendering
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1050,10 +1073,13 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
 
     try:
         retry(lambda: wsx.append_row(record, value_input_option="USER_ENTERED"))
-        st.success("Saved ✔️")
-        try: load_module_df.clear()
-        except Exception: pass
-        st.session_state["_clear_form"] = True
+        # Show message after reload, then clear the form and rerun
+        st.session_state["_flash_msg"] = ("success", "Saved ✔️")
+        try:
+            load_module_df.clear()
+        except Exception:
+            pass
+        st.session_state["_clear_form"] = True  # your existing clear hook
         st.rerun()
     except Exception as e:
         st.error(f"Save failed: {e}")
@@ -1291,12 +1317,14 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
     row = [data_map.get(h, "") for h in target_headers]
     try:
         retry(lambda: wsx.append_row(row, value_input_option="USER_ENTERED"))
-        st.success("Saved ✔️")
+        # After saving: show message on next load, clear the module form, and rerun
+        st.session_state["_flash_msg"] = ("success", "Saved ✔️")
+        _clear_module_form_state(module_name, rows)
         try:
-            load_module_df.clear()   # so View/Export reflects the new row immediately
+            load_module_df.clear()   # ensure View/Export sees the new row immediately
         except Exception:
             pass
-        st.rerun()                   # optional, but matches the legacy pharmacy flow
+        st.rerun()
     except Exception as e:
         st.error(f"Save failed: {e}")
 
