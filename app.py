@@ -2079,24 +2079,40 @@ def _render_update_record_page():
         non_editable = {"Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module"}
         editable_cols = [c for c in df.columns if c not in non_editable]
 
+        # 3-column grid like other modules
+        cols = st.columns(3, gap="large")
+        
+        def _is_numbery(name: str) -> bool:
+            n = name.lower()
+            # tweak this pattern if you want more/less numeric detection
+            return bool(re.search(r"(amount|total|qty|quantity|price|share|value|number)$", n)) or n in {"netamount","patientshare"}
+        
         edits = {}
-        for c in editable_cols:
-            # choose a reasonable widget by dtype/column name
-            val = str(row_current.get(c, ""))
-            if "date" in c.lower():
-                try:
-                    d = pd.to_datetime(val, errors="coerce").date() if val else date.today()
-                except Exception:
-                    d = date.today()
-                edits[c] = st.date_input(c, value=d, key=f"upd_{c}")
-            elif c.lower() in {"status","approvalstatus"}:
-                u = sorted([x for x in df[c].astype(str).unique() if x])
-                edits[c] = st.selectbox(c, options=u or [val], index=(u.index(val) if val in u else 0), key=f"upd_{c}")
-            elif c.lower() in {"insurance","insurancename","insurancecode"}:
-                edits[c] = st.text_input(c, value=val, key=f"upd_{c}")
-            else:
-                # keep simple; data is saved as text to the sheet
-                edits[c] = st.text_input(c, value=val, key=f"upd_{c}")
+        for i, c in enumerate(editable_cols):
+            low = c.lower()
+            val = row_current.get(c, "")
+            with cols[i % 3]:
+                if "date" in low:
+                    try:
+                        d = pd.to_datetime(str(val), errors="coerce").date() if str(val) else date.today()
+                    except Exception:
+                        d = date.today()
+                    edits[c] = st.date_input(c, value=d, key=f"upd_{c}")
+                elif low in {"status","approvalstatus"}:
+                    opts = sorted([x for x in df[c].astype(str).unique() if x])
+                    edits[c] = st.selectbox(c, options=opts or [str(val)],
+                                            index=(opts.index(str(val)) if str(val) in opts and opts else 0),
+                                            key=f"upd_{c}")
+                elif low in {"remark","notes","note","comments","comment"}:
+                    edits[c] = st.text_area(c, value=str(val), key=f"upd_{c}")
+                elif _is_numbery(low):
+                    try:
+                        num = float(str(val).replace(",", ""))
+                    except Exception:
+                        num = 0.0
+                    edits[c] = st.number_input(c, value=num, step=0.01, format="%.2f", key=f"upd_{c}")
+                else:
+                    edits[c] = st.text_input(c, value=str(val), key=f"upd_{c}")
 
         if st.button("Save changes", type="primary", key="upd_save"):
             w = ws(sheet)
