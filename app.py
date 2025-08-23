@@ -1396,26 +1396,28 @@ def _render_update_record_page():
                 else:
                     f_status = ""
 
-        # Apply filters (case-insensitive contains)
-        def _contains(col, needle):
-            if not col or not needle.strip():
-                return True
-            return df[col].astype(str).str.contains(needle.strip(), case=False, na=False)
+        # ---------- Apply filters (safe even when EVERYTHING is blank) ----------
+        # Start with a True vector aligned to the dataframe index
+        mask = pd.Series(True, index=df.index)
 
-        mask = (
-            _contains(col_claim, f_claim) &
-            _contains(col_eid, f_eid) &
-            _contains(col_patient, f_patient) &
-            _contains(col_approval, f_approval) &
-            _contains(col_member, f_member) &
-            _contains(col_ins, f_insurance)
-        )
+        def _and_contains(col: str | None, needle: str):
+            nonlocal mask
+            if col and needle and needle.strip():
+                # case-insensitive contains; escape to avoid regex surprises
+                mask &= df[col].astype(str).str.contains(re.escape(needle.strip()), case=False, na=False)
+
+        _and_contains(col_claim,   f_claim)
+        _and_contains(col_eid,     f_eid)
+        _and_contains(col_patient, f_patient)
+        _and_contains(col_approval,f_approval)
+        _and_contains(col_member,  f_member)
+        _and_contains(col_ins,     f_insurance)
+
         if col_status and f_status:
-            mask = mask & (df[col_status].astype(str) == f_status)
+            mask &= (df[col_status].astype(str) == f_status)
 
         df = df[mask]
-        if df.empty:
-            st.warning("No rows match the filters."); return
+        # -----------------------------------------------------------------------
 
         # Show preview with TRUE sheet indices (Row# = sheet row index = dataframe index + 2)
         preview = df.copy()
