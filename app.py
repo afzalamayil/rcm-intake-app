@@ -2285,8 +2285,8 @@ def _render_clinic_purchase_summary(sheet_name: str):
     df["Util_Value"]   = (df["Util_Qty"]   * df["UnitPrice"]).round(2)
 
     with st.expander("Filters — Clinic Purchase", expanded=True):
-        dmin = df["Date"].min() if df["Date"].notna()].any() else date.today()
-        dmax = df["Date"].max() if df["Date"].notna()].any() else date.today()
+        dmin = df["Date"].min() if df["Date"].notna().any() else date.today()
+        dmax = df["Date"].max() if df["Date"].notna().any() else date.today()
         f_date = st.date_input("Date range", value=(dmin, dmax))
         f_items = st.multiselect("Item(s)", sorted([x for x in df["Item"].unique() if x]))
     if f_date and all(f_date):
