@@ -36,6 +36,33 @@ from email.mime.text import MIMEText
 from email import encoders
 import streamlit_authenticator as stauth
 from contextlib import contextmanager
+# --- Flash + form reset helpers (add once) ---
+import time
+
+def flash(message: str, level: str = "success"):
+    """Persist a one-run flash message and trigger a rerun."""
+    st.session_state["_flash"] = {"message": message, "level": level, "ts": time.time()}
+    st.rerun()
+
+def render_flash():
+    """Render then clear any pending flash message."""
+    data = st.session_state.pop("_flash", None)
+    if not data:
+        return
+    msg, lvl = data["message"], data["level"]
+    if   lvl == "success": st.success(msg, icon="✅")
+    elif lvl == "info":    st.info(msg, icon="ℹ️")
+    elif lvl == "warning": st.warning(msg, icon="⚠️")
+    else:                  st.error(msg, icon="❌")
+
+def clear_module_widgets(prefix: str):
+    """
+    Remove session_state entries for the current module’s inputs.
+    Use the same 'key' prefix you assigned to the module's widgets.
+    """
+    for k in list(st.session_state.keys()):
+        if k.startswith(prefix + ":"):
+            st.session_state.pop(k, None)
 
 # --- Unified Look (theme + wrappers) ---
 def apply_intake_theme(page_title: str = "RCM Intake", page_icon: str = "🧾"):
@@ -127,6 +154,9 @@ with st.sidebar:
         st.image(LOGO_PATH, use_container_width=True)
     if UI_BRAND:
         st.success(f"👋 {UI_BRAND}")
+
+# Show any pending success/error from the last submit
+render_flash()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Google Sheets connect (retry + cache)
@@ -958,7 +988,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         container_ctx = st.container()
 
     with container_ctx:
-        with st.form("pharmacy_intake_legacy", clear_on_submit=False):
+        with st.form("pharmacy_intake_legacy", clear_on_submit=True):
             r1c1, r1c2, r1c3 = st.columns(3, gap="large")
             with r1c1: st.text_input("Employee Name*", key="employee_name")
             with r1c2: st.selectbox("Pharmacy (ID - Name)*", pharm_choices, key="pharmacy_display")
@@ -1049,12 +1079,12 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         pass
 
     record = [
-        datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
+        datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
         (username or name),
         ROLE,
         ph_id, ph_name,
         st.session_state.employee_name.strip(),
-        st.session_state.submission_date.strftime("%d-%m-%Y"),
+        st.session_state.submission_date.strftime("%d/%m/%Y"),
         st.session_state.submission_mode,
         st.session_state.portal,
         st.session_state.erx_number.strip(),
@@ -1112,7 +1142,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
             frame = st.container()
 
         with frame:
-            with st.form(f"dyn_form_{module_name}", clear_on_submit=False):
+            with st.form(f"dyn_form_{module_name}", clear_on_submit=True):
                 # Pharmacy at the top for consistency
                 ph_df = pharm_master()
                 if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"]:
@@ -1254,7 +1284,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
 
     # Build row data
     data_map = {
-        "Timestamp": datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
+        "Timestamp": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
         "SubmittedBy": username or name,
         "Role": ROLE,
         "ClientID": CLIENT_ID,
@@ -1272,7 +1302,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
 
         # normalize dates/lists
         if isinstance(val, (date, datetime)):
-            val = pd.to_datetime(val).strftime("%d-%m-%Y")
+            val = pd.to_datetime(val).strftime("%d/%m/%Y")
         if isinstance(val, list):
             val = ", ".join([str(x) for x in val])
 
@@ -2120,7 +2150,7 @@ def _render_update_record_page():
             # Convert date widgets back to yyyy-mm-dd
             for k, v in edits.items():
                 if isinstance(v, (date, datetime)):
-                    edits[k] = pd.to_datetime(v).strftime("%d-%m-%Y")
+                    edits[k] = pd.to_datetime(v).strftime("%d/%m/%Y")
 
             # Read current row from the sheet, merge edits, and update
             sheet_row_num = int(selected_row_index) + 2  # header row + 1-based
@@ -2130,7 +2160,7 @@ def _render_update_record_page():
             for c in editable_cols:
                 val = edits[c]
                 if isinstance(val, (date, datetime)):
-                    val = pd.to_datetime(val).strftime("%d-%m-%Y")
+                    val = pd.to_datetime(val).strftime("%d/%m/%Y")
                 if isinstance(val, str):
                     val = _sanitize_cell(val)
                 cur_map[c] = val
