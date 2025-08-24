@@ -20,7 +20,6 @@ import io
 import os
 import re
 import json
-import time
 import random
 from datetime import datetime, date, timedelta
 import uuid
@@ -38,6 +37,17 @@ import streamlit_authenticator as stauth
 from contextlib import contextmanager
 # --- Flash + form reset helpers (add once) ---
 import time
+
+# --- Date helpers (single source of truth) ---
+DATE_FMT = "%d/%m/%Y"
+
+def format_date(d) -> str:
+    """Format a date/datetime to dd/mm/YYYY for Sheets."""
+    return pd.to_datetime(d).strftime(DATE_FMT)
+
+def parse_date(s: pd.Series | str):
+    """Parse sheet date strings that are dd/mm/YYYY (or messy) safely."""
+    return pd.to_datetime(s, dayfirst=True, errors="coerce")
 
 def flash(message: str, level: str = "success"):
     """Persist a one-run flash message and trigger a rerun."""
@@ -63,6 +73,28 @@ def clear_module_widgets(prefix: str):
     for k in list(st.session_state.keys()):
         if k.startswith(prefix + ":"):
             st.session_state.pop(k, None)
+
+# --- Clinic Purchase: roles & constants ---
+ROLE_CLINIC = "Clinic"
+ROLE_SECOND_PARTY = "SecondParty"
+
+CLINIC_PURCHASE_MODULE_KEY = "Clinic Purchase"
+CLINIC_PURCHASE_SHEET = "ClinicPurchase"
+CLINIC_PURCHASE_MASTERS_ITEMS = "MS:Items"        # columns: Sl.No., Particulars, Value
+CLINIC_PURCHASE_OPENING = "OpeningStock"
+
+# Data-sheet columns (we'll compute *_Value from master price; keep as columns for export)
+CP_COLS = [
+    "Timestamp", "EnteredBy", "Date", "EmpName", "Item",
+    # Clinic band (yellow)
+    "Clinic_Qty", "Clinic_Value", "Clinic_Status", "Audit", "Comments",
+    # Second Party band
+    "SP_Status", "SP_Qty", "SP_Value",
+    # Utilization band (yellow)
+    "Util_Qty", "Util_Value",
+    # Computed stock
+    "Instock_Qty", "Instock_Value"
+]
 
 # --- Unified Look (theme + wrappers) ---
 def apply_intake_theme(page_title: str = "RCM Intake", page_icon: str = "🧾"):
@@ -405,6 +437,100 @@ def pharm_display_list() -> list[str]:
     df = pharm_master()
     return df["Display"].tolist() if not df.empty else ["—"]
 
+# ---------- Clinic Purchase: price map + seeders ----------
+@st.cache_data(ttl=120, show_spinner=False)
+def _clinic_items_price_map() -> dict:
+    df = read_sheet_df(CLINIC_PURCHASE_MASTERS_ITEMS, ["Sl.No.","Particulars","Value"]).fillna("")
+    if df.empty:
+        return {}
+    df["Value"] = pd.to_numeric(df["Value"], errors="coerce").fillna(0.0)
+    pm = {}
+    for _, r in df.iterrows():
+        name = str(r.get("Particulars","")).strip()
+        price = float(r.get("Value", 0.0))
+        if name:
+            pm[name] = price
+    return pm
+
+def _ensure_ws_with_headers(title: str, headers: list[str]):
+    # always "get or add" via ws(); avoids stale cached titles
+    w = ws(title)
+    head = retry(lambda: w.row_values(1))
+    merged = list(dict.fromkeys((head or []) + headers))
+    if (head or []) != merged:
+        retry(lambda: w.update("A1", [merged]))
+    return w
+
+def seed_clinic_purchase_assets_for_client(client_id: str):
+    client_id = (client_id or "DEFAULT").strip() or "DEFAULT"
+
+    # 1) Masters & data sheet
+    _ensure_ws_with_headers(CLINIC_PURCHASE_MASTERS_ITEMS, ["Sl.No.","Particulars","Value"])
+    _ensure_ws_with_headers(CLINIC_PURCHASE_OPENING, ["Item","OpeningQty","OpeningValue"])
+    _ensure_ws_with_headers(CLINIC_PURCHASE_SHEET, CP_COLS)
+
+    # 2) Modules row (catalog)
+    mdf = read_sheet_df(MS_MODULES, REQUIRED_HEADERS[MS_MODULES]).fillna("")
+    if (mdf.empty) or not (mdf["Module"].astype(str) == CLINIC_PURCHASE_MODULE_KEY).any():
+        new = pd.DataFrame([{
+            "Module": CLINIC_PURCHASE_MODULE_KEY,
+            "SheetName": CLINIC_PURCHASE_SHEET,
+            "DefaultEnabled": True,
+            "DupKeys": "Date|Item|EmpName",
+            "NumericFieldsJSON": json.dumps(["Clinic_Value","SP_Value","Util_Value"])
+        }])
+        out = pd.concat([mdf, new], ignore_index=True)
+        _save_whole_sheet(MS_MODULES, out, REQUIRED_HEADERS[MS_MODULES])
+
+    # 3) Enable for this client (if missing)
+    cmdf = read_sheet_df(MS_CLIENT_MODULES, REQUIRED_HEADERS[MS_CLIENT_MODULES]).fillna("")
+    mask = (cmdf["ClientID"].astype(str) == client_id) & (cmdf["Module"].astype(str) == CLINIC_PURCHASE_MODULE_KEY)
+    if cmdf.empty or not mask.any():
+        row = pd.DataFrame([{"ClientID": client_id, "Module": CLINIC_PURCHASE_MODULE_KEY, "Enabled": True}])
+        out = pd.concat([cmdf, row], ignore_index=True)
+        _save_whole_sheet(MS_CLIENT_MODULES, out, REQUIRED_HEADERS[MS_CLIENT_MODULES])
+
+    # 4) FormSchema rows (rendered by your dynamic form engine)
+    fs = read_sheet_df(MS_FORM_SCHEMA, REQUIRED_HEADERS[MS_FORM_SCHEMA]).fillna("")
+    has = (fs["ClientID"].astype(str).str.upper() == client_id.upper()) & (fs["Module"].astype(str) == CLINIC_PURCHASE_MODULE_KEY)
+    if not has.any():
+        rows = []
+        add = rows.append; M = CLINIC_PURCHASE_MODULE_KEY; C = client_id
+
+        # Common
+        add([C,M,"date","Date","date",True,"","","All",10,"Date",""])
+        add([C,M,"emp_name","Emp Name","text",False,"","","All",20,"EmpName",""])
+        # Item dropdown from MS:Items!Particulars
+        add([C,M,"item","Item","select",True,"MS:Items!Particulars","","All",30,"Item",""])
+
+        # Clinic band (yellow) – SecondParty cannot edit
+        add([C,M,"clinic_qty","Clinic Qty","number",False,"","SecondParty","All",40,"Clinic_Qty",""])
+        add([C,M,"clinic_status","Clinic Status","select",False,"MS:Status","SecondParty","All",50,"Clinic_Status",""])
+        add([C,M,"audit","Audit","text",False,"","SecondParty","All",60,"Audit",""])
+        add([C,M,"comments","Comments","textarea",False,"","SecondParty","All",70,"Comments",""])
+        # Value auto-computed (read-only for both)
+        add([C,M,"clinic_value","Clinic Value (auto)","number",False,"","Clinic|SecondParty","All",45,"Clinic_Value",""])
+
+        # Second Party band – Clinic cannot edit
+        add([C,M,"sp_qty","SP Qty","number",False,"","Clinic","All",80,"SP_Qty",""])
+        add([C,M,"sp_status","SP Status","select",False,"MS:Status","Clinic","All",90,"SP_Status",""])
+        # Value auto-computed (read-only for both)
+        add([C,M,"sp_value","SP Value (auto)","number",False,"","Clinic|SecondParty","All",85,"SP_Value",""])
+
+        # Utilization – SecondParty cannot edit
+        add([C,M,"util_qty","Utilization Qty","number",False,"","SecondParty","All",100,"Util_Qty",""])
+        # Value auto-computed (read-only for both)
+        add([C,M,"util_value","Utilization Value (auto)","number",False,"","Clinic|SecondParty","All",105,"Util_Value",""])
+
+        # (Instock columns are computed in Summary only; not shown in form)
+
+        newfs = pd.DataFrame(rows, columns=REQUIRED_HEADERS[MS_FORM_SCHEMA])
+        out = pd.concat([fs, newfs], ignore_index=True)
+        _save_whole_sheet(MS_FORM_SCHEMA, out, REQUIRED_HEADERS[MS_FORM_SCHEMA])
+        schema_df.clear()
+        modules_catalog_df.clear()
+        client_modules_df.clear()
+
 @st.cache_data(ttl=60, show_spinner=False)
 def insurance_master() -> pd.DataFrame:
     df = read_sheet_df(MS_INSURANCE, REQUIRED_HEADERS[MS_INSURANCE]).fillna("")
@@ -634,59 +760,64 @@ def _options_from_token(token: str) -> list[str]:
     if not token:
         return []
 
+    low = token.lower()
+
+    # --- SPECIALS FIRST (so they don't get swallowed by generic MS:) ---
+    if low in ("ms:doctors", "ms:doctorsall"):
+        key = "doctorsall" if low.endswith("doctorsall") else "doctors"
+        ph_id = st.session_state.get("_current_pharmacy_id", "")
+        if not ph_id:
+            mod_key = st.session_state.get("_current_module", st.session_state.get("nav_mod", ""))
+            if mod_key:
+                ph_disp = st.session_state.get(f"{mod_key}_pharmacy_display", "")
+                if isinstance(ph_disp, str) and " - " in ph_disp:
+                    ph_id = ph_disp.split(" - ", 1)[0].strip()
+        role_is_super = str(ROLE).strip().lower() in ("super admin","superadmin")
+        use_client = None if role_is_super or key == "doctorsall" or str(CLIENT_ID).upper() in ("", "ALL") else CLIENT_ID
+        use_pharm  = ph_id if ph_id and ph_id.upper() != "ALL" else None
+        try:
+            df = doctors_master(client_id=use_client, pharmacy_id=use_pharm)
+            if df.empty and use_client:
+                df = doctors_master(client_id=use_client, pharmacy_id=None)
+            if df.empty:
+                df = doctors_master(client_id=None, pharmacy_id=None)
+            return df["Display"].tolist() if not df.empty else []
+        except Exception:
+            return []
+
+    if low == "ms:insurance":
+        df = insurance_master()
+        return df["Display"].tolist() if not df.empty else []
+    if low == "ms:status":
+        return safe_list(MS_STATUS, [])
+    if low == "ms:portal":
+        return safe_list(MS_PORTAL, [])
+    if low == "ms:submissionmode":
+        return safe_list(MS_SUBMISSION_MODE, [])
+
+    # --- GENERIC: MS:<Sheet>[!<Column>] ---
     if token.startswith("MS:"):
-        key = token.split(":", 1)[1].strip().lower()
-
-        # ------- Doctors resolver (pharmacy-aware with safe fallbacks) -------
-        if key in ("doctors", "doctorsall"):
-            # Prefer the pharmacy picked in THIS form render
-            ph_id = st.session_state.get("_current_pharmacy_id", "")
-
-            # Fallback: use current module's pharmacy display selection
-            if not ph_id:
-                mod_key = st.session_state.get("_current_module", st.session_state.get("nav_mod", ""))
-                if mod_key:
-                    ph_disp = st.session_state.get(f"{mod_key}_pharmacy_display", "")
-                    if isinstance(ph_disp, str) and " - " in ph_disp:
-                        ph_id = ph_disp.split(" - ", 1)[0].strip()
-
-            # Last resort: scan any *_pharmacy_display held in session_state
-            if not ph_id:
-                for k, v in st.session_state.items():
-                    if k.endswith("_pharmacy_display") and isinstance(v, str) and " - " in v:
-                        ph_id = v.split(" - ", 1)[0].strip()
-                        break
-
-            role_is_super = str(ROLE).strip().lower() in ("super admin", "superadmin")
-            use_client = None if role_is_super or key == "doctorsall" or str(CLIENT_ID).upper() in ("", "ALL") else CLIENT_ID
-            use_pharm  = ph_id if ph_id and ph_id.upper() != "ALL" else None
-
+        m = re.match(r"^MS:([^!]+)(?:!(.+))?$", token)
+        if m:
+            sheet = m.group(1).strip()
+            col   = (m.group(2) or "").strip()
             try:
-                df = doctors_master(client_id=use_client, pharmacy_id=use_pharm)
-                # graceful fallbacks
-                if df.empty and use_client:
-                    df = doctors_master(client_id=use_client, pharmacy_id=None)
-                if df.empty:
-                    df = doctors_master(client_id=None, pharmacy_id=None)
-                return df["Display"].tolist() if not df.empty else []
+                df = read_sheet_df(sheet, None).fillna("")
+                if df.empty: return []
+                if col and col in df.columns:
+                    ser = df[col].astype(str)
+                else:
+                    pick = next((c for c in df.columns if df[c].astype(str).str.strip().any()), df.columns[0])
+                    ser = df[pick].astype(str)
+                return [v for v in ser.str.strip().unique().tolist() if v]
             except Exception:
                 return []
-        # ---------------------------------------------------------------------
 
-        if key == "insurance":
-            df = insurance_master()
-            return df["Display"].tolist() if not df.empty else []
-        if key == "status":
-            return safe_list(MS_STATUS, [])
-        if key == "portal":
-            return safe_list(MS_PORTAL, [])
-        if key == "submissionmode":
-            return safe_list(MS_SUBMISSION_MODE, [])
-        return []
-
+    # --- Literal list ---
     if token.startswith("L:"):
         return [x.strip() for x in token[2:].split("|") if x.strip()]
 
+    # --- JSON array ---
     try:
         arr = json.loads(token)
         if isinstance(arr, list):
@@ -733,11 +864,13 @@ def _check_duplicate_if_needed(sheet_name: str, module_name: str, data_map: dict
             df = df[df["PharmacyID"].astype(str).str.strip() == str(data_map["PharmacyID"]).strip()]
         if "SubmissionDate" in dup_keys and "SubmissionDate" in df.columns and "SubmissionDate" in data_map:
             try:
-                target_date = pd.to_datetime(str(data_map["SubmissionDate"]), errors="coerce").date()
-                df["_SD"] = pd.to_datetime(df["SubmissionDate"], errors="coerce").dt.date
-                df = df[df["_SD"] == target_date]
+                target_date = parse_date(str(data_map["SubmissionDate"])).date() if data_map["SubmissionDate"] else None
+                df["_SD"] = parse_date(df["SubmissionDate"]).dt.date
+                if target_date:
+                    df = df[df["_SD"] == target_date]
             except Exception:
                 pass
+
         mask = pd.Series([True]*len(df))
         for k in dup_keys:
             sv = str(data_map.get(k, "")).strip().lower()
@@ -895,6 +1028,9 @@ def _clear_all_caches():
         user_modules_df.clear()
         schema_df.clear()
         load_module_df.clear()
+        list_titles.clear()              # added
+        _clinic_items_price_map.clear()  # added
+        _clinic_opening_map.clear()      # added
     except Exception:
         pass
 
@@ -1062,7 +1198,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         df_dup = pd.DataFrame(retry(lambda: wsx.get_all_records()))
         dup = False
         if not df_dup.empty:
-            df_dup["SubmissionDate"] = pd.to_datetime(df_dup.get("SubmissionDate"), errors="coerce").dt.date
+            df_dup["SubmissionDate"] = parse_date(df_dup.get("SubmissionDate")).dt.date
             same_day = df_dup[df_dup["SubmissionDate"] == st.session_state.submission_date]
             net_str = f"{float(st.session_state.net_amount):.2f}"
             dup = (
@@ -1084,7 +1220,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         ROLE,
         ph_id, ph_name,
         st.session_state.employee_name.strip(),
-        st.session_state.submission_date.strftime("%d/%m/%Y"),
+        format_date(st.session_state.submission_date),
         st.session_state.submission_mode,
         st.session_state.portal,
         st.session_state.erx_number.strip(),
@@ -1192,7 +1328,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                                 st.number_input(label_req, value=float(dv), step=0.01, format="%.2f", key=key+"_ro", disabled=True)
                                 values[fkey] = dv
                             elif typ == "date":
-                                try: d = pd.to_datetime(default).date() if default else date.today()
+                                try: d = parse_date(default).date() if default else date.today()
                                 except Exception: d = date.today()
                                 st.date_input(label_req, value=d, key=key+"_ro", disabled=True)
                                 values[fkey] = d
@@ -1226,7 +1362,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                             except Exception: dv = 0.0
                             values[fkey] = st.number_input(label_req, value=float(dv), step=0.01, format="%.2f", key=key)
                         elif typ == "date":
-                            try: d = pd.to_datetime(default).date() if default else date.today()
+                            try: d = parse_date(default).date() if default else date.today()
                             except Exception: d = date.today()
                             values[fkey] = st.date_input(label_req, value=d, key=key)
                         elif typ == "select":
@@ -1248,7 +1384,26 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
 
     if not submitted:
         return
+    # Require pharmacy selection
+    ph_disp = st.session_state.get(f"{module_name}_pharmacy_display","")
+    if " - " not in ph_disp:
+        st.error("Please select a Pharmacy before submitting.")
+        return
 
+    # ---- Auto-compute price-based values for Clinic Purchase ----
+    if str(module_name).strip() == CLINIC_PURCHASE_MODULE_KEY:
+        pm = _clinic_items_price_map()
+        item_name = str(values.get("item","")).strip()
+        unit = float(pm.get(item_name, 0.0))
+        def _val(q): 
+            try: return round(float(q or 0) * unit, 2)
+            except Exception: return 0.0
+        # make sure these keys exist in 'values' so SaveTo picks them up
+        values["clinic_value"] = _val(values.get("clinic_qty"))
+        values["sp_value"]     = _val(values.get("sp_qty"))
+        values["util_value"]   = _val(values.get("util_qty"))
+
+    
     # Validate requireds
     missing = []
     for _, r in rows.iterrows():
@@ -1302,7 +1457,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
 
         # normalize dates/lists
         if isinstance(val, (date, datetime)):
-            val = pd.to_datetime(val).strftime("%d/%m/%Y")
+            val = format_date(val)
         if isinstance(val, list):
             val = ", ".join([str(x) for x in val])
 
@@ -1400,7 +1555,7 @@ def _render_view_export_page():
                 q = st.text_input("Search (matches any column)", key="view_q")
                 use_date = st.checkbox("Filter by date range", value=False, key="view_use_date")
                 if use_date and col_date:
-                    sd = pd.to_datetime(df[col_date], errors="coerce").dt.date
+                    sd = parse_date(df[col_date]).dt.date
                     d1 = st.date_input("From", sd[sd.notna()].min() if sd.notna().any() else date.today(), key="view_d1")
                     d2 = st.date_input("To",   sd[sd.notna()].max() if sd.notna().any() else date.today(), key="view_d2")
             with c2:
@@ -1435,7 +1590,7 @@ def _render_view_export_page():
             mask &= (df[col_status].astype(str).str.lower() == f_status.lower())
 
         if 'use_date' in locals() and use_date and col_date:
-            sd = pd.to_datetime(df[col_date], errors="coerce").dt.date
+            sd = parse_date(df[col_date]).dt.date
             mask &= sd.between(d1, d2)
 
         if q.strip():
@@ -1489,69 +1644,78 @@ def _render_masters_admin_page():
         with tabs[0]:
             st.subheader("Users")
             udf = _load_for_editor(USERS_TAB, REQUIRED_HEADERS[USERS_TAB])
+        
+            # Show everything except password; keep password only for saving/merge
+            view_cols = [c for c in udf.columns if c != "password"]
             colconf = {
-                "username": st.column_config.TextColumn("username", required=True, help="Unique user login"),
-                "name":     st.column_config.TextColumn("name", required=True),
-                "password": st.column_config.TextColumn("password (bcrypt hash)", help="Use Reset Password tool below"),
-                "role":     st.column_config.SelectboxColumn("role", options=["User","Admin","Super Admin"], required=True),
+                "username":   st.column_config.TextColumn("username", required=True, help="Unique user login"),
+                "name":       st.column_config.TextColumn("name", required=True),
+                # password intentionally hidden from editor; reset via the popover below
+                "role":       st.column_config.SelectboxColumn("role", options=["User","Admin","Super Admin"], required=True),
                 "pharmacies": st.column_config.TextColumn("pharmacies", help="Comma-separated pharmacy IDs or 'ALL'"),
-                "client_id":  st.column_config.TextColumn("client_id", help="Client scope for this user")
+                "client_id":  st.column_config.TextColumn("client_id", help="Client scope for this user"),
             }
-            udf_edit = _data_editor(udf, "ed_users", column_config=colconf, help_text="Tip: leave password column alone; use Reset Password below")
-            c1, c2 = st.columns([1,1])
-            with c1:
+            udf_view_edit = _data_editor(
+                udf[view_cols], "ed_users", column_config=colconf,
+                help_text="Password hidden here; use Reset Password tool below.", height=None
+            )
+        
+            rowA, rowB = st.columns([1,1])
+            with rowA:
                 if st.button("Save Users", type="primary", key="btn_save_users"):
-                    if _save_whole_sheet(USERS_TAB, udf_edit, REQUIRED_HEADERS[USERS_TAB]):
+                    # Merge edited non-password cols back into full df; preserve existing password hashes
+                    to_save = udf.copy()
+                    for col in view_cols:
+                        to_save[col] = udf_view_edit[col]
+                    if _save_whole_sheet(USERS_TAB, to_save, REQUIRED_HEADERS[USERS_TAB]):
                         _clear_all_caches(); st.success("Users saved.")
-            with c2:
+            with rowB:
                 with st.popover("Reset Password"):
-                    st.caption("This will store a new bcrypt hash into the password field.")
-                    pick_user = st.selectbox("User", udf_edit["username"].tolist() if not udf_edit.empty else [])
+                    st.caption("This stores a new bcrypt hash into the password field.")
+                    pick_user = st.selectbox("User", udf_view_edit["username"].astype(str).tolist() if not udf_view_edit.empty else [])
                     new_pwd = st.text_input("New password", type="password")
                     if st.button("Apply reset", key="btn_pwd_reset"):
                         if not pick_user or not new_pwd:
                             st.error("Select user and enter a new password")
                         else:
                             hashed = stauth.Hasher([new_pwd]).generate()[0]
-                            idx = udf_edit.index[udf_edit["username"]==pick_user]
-                            if len(idx)>0:
-                                udf_edit.loc[idx[0],"password"] = hashed
-                                if _save_whole_sheet(USERS_TAB, udf_edit, REQUIRED_HEADERS[USERS_TAB]):
+                            idx = udf.index[udf["username"].astype(str) == str(pick_user)]
+                            if len(idx) > 0:
+                                udf.loc[idx[0], "password"] = hashed
+                                if _save_whole_sheet(USERS_TAB, udf, REQUIRED_HEADERS[USERS_TAB]):
                                     _clear_all_caches(); st.success("Password updated.")
-            
-            # Load current users (from the editor above) and modules catalog
-            available_users = udf_edit["username"].astype(str).tolist() if not udf_edit.empty else []
+        
+            # --- Per-user Module Access ---------------------------------------
+            st.divider()
+            available_users   = udf_view_edit["username"].astype(str).tolist() if not udf_view_edit.empty else []
             available_modules = modules_catalog_df()["Module"].astype(str).tolist()
-            
+        
             umdf = _load_for_editor(MS_USER_MODULES, REQUIRED_HEADERS[MS_USER_MODULES])
-            
+        
             colA, colB = st.columns([1,2])
             with colA:
                 sel_user = st.selectbox("User", available_users, key="um_sel_user")
             with colB:
-                # Current enabled modules for this user
                 cur = []
                 if not umdf.empty and sel_user:
-                    cur = umdf[(umdf["Username"].astype(str).str.lower() == sel_user.lower()) & ( _to_bool_series(umdf["Enabled"]) )]["Module"].astype(str).tolist()
-            
+                    cur = umdf[
+                        (umdf["Username"].astype(str).str.lower() == str(sel_user).lower()) &
+                        (_to_bool_series(umdf["Enabled"]))
+                    ]["Module"].astype(str).tolist()
                 chosen = st.multiselect("Enabled modules", options=available_modules, default=cur, key="um_chosen")
-            
+        
             row1, row2 = st.columns([1,1])
             with row1:
                 if st.button("Save user module access", type="primary", key="btn_save_user_modules", disabled=not sel_user):
-                    # Rebuild rows for this user: one row per module with Enabled TRUE/FALSE
                     base = pd.DataFrame({
                         "Username": [sel_user]*len(available_modules),
                         "Module":   available_modules,
                         "Enabled":  [m in chosen for m in available_modules],
                     })
-                    # Keep other users' rows as-is
-                    others = umdf[umdf["Username"].astype(str).str.lower() != sel_user.lower()].copy()
+                    others = umdf[umdf["Username"].astype(str).str.lower() != str(sel_user).lower()].copy()
                     out = pd.concat([others, base], ignore_index=True)
-            
                     if _save_whole_sheet(MS_USER_MODULES, out, REQUIRED_HEADERS[MS_USER_MODULES]):
-                        _clear_all_caches()
-                        st.success("Per-user modules saved.")
+                        _clear_all_caches(); st.success("Per-user modules saved.")
             with row2:
                 if st.button("Open raw editor (advanced)", key="btn_open_um_editor"):
                     st.data_editor(
@@ -1566,11 +1730,7 @@ def _render_masters_admin_page():
                     )
                     if st.button("Save raw user-modules", key="btn_save_um_raw"):
                         if _save_whole_sheet(MS_USER_MODULES, st.session_state["ed_user_modules_raw"], REQUIRED_HEADERS[MS_USER_MODULES]):
-                            _clear_all_caches()
-                            st.success("UserModules sheet saved.")
-
-                        # --- Per-user Module Access ---------------------------------------
-            st.divider()
+                            _clear_all_caches(); st.success("UserModules sheet saved.")
             
         # ---------- Clients ----------
         with tabs[1]:
@@ -1822,6 +1982,12 @@ def _render_summary_page():
         mod = st.selectbox("Module", [m for m,_ in module_pairs], index=0, key="sum_mod")
         sheet = dict(module_pairs)[mod]
 
+        # ---- Special summary for Clinic Purchase ----
+        if str(mod).strip() == CLINIC_PURCHASE_MODULE_KEY:
+            _render_clinic_purchase_summary(sheet)
+            return
+
+        
         # 2) Load + scope (client + pharmacies + per-user like Update Record)
         df = _apply_common_filters(load_module_df(sheet), scope_to_user=True)
         if df is None or df.empty:
@@ -1859,7 +2025,7 @@ def _render_summary_page():
                 q = st.text_input("Search (matches any column)", key="sum_q")
                 use_date = st.checkbox("Filter by date range", value=False, key="sum_use_date")
                 if use_date and col_date:
-                    sd = pd.to_datetime(df[col_date], errors="coerce").dt.date
+                    sd = parse_date(df[col_date]).dt.date
                     d1 = st.date_input("From", sd[sd.notna()].min() if sd.notna().any() else date.today(), key="sum_d1")
                     d2 = st.date_input("To",   sd[sd.notna()].max() if sd.notna().any() else date.today(), key="sum_d2")
             with c2:
@@ -1909,7 +2075,7 @@ def _render_summary_page():
             mask &= df[col_pharm].astype(str).isin(sel_pharm)
 
         if 'use_date' in locals() and use_date and col_date:
-            sd = pd.to_datetime(df[col_date], errors="coerce").dt.date
+            sd = parse_date(df[col_date]).dt.date
             mask &= sd.between(d1, d2)
 
         if q.strip():
@@ -1959,7 +2125,7 @@ def _render_summary_page():
 
         # 8) Normalize types needed for pivot
         if col_date:
-            df["_Date"] = pd.to_datetime(df[col_date], errors="coerce").dt.date
+            df["_Date"] = parse_date(df[col_date]).dt.date
         else:
             df["_Date"] = date.today()  # dummy single date if missing
         df["_Mode"]  = df[col_mode].replace("", "Unknown") if col_mode else "Unknown"
@@ -2019,6 +2185,91 @@ def _render_summary_page():
 
         if st.button("🔄 Refresh summary", key="sum_refresh"):
             load_module_df.clear(); st.rerun()
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _clinic_opening_map() -> dict:
+    try:
+        df = read_sheet_df(CLINIC_PURCHASE_OPENING, ["Item","OpeningQty","OpeningValue"]).fillna("")
+        if df.empty: return {}
+        df["OpeningQty"] = pd.to_numeric(df["OpeningQty"], errors="coerce").fillna(0.0)
+        return {str(r["Item"]).strip(): float(r["OpeningQty"]) for _, r in df.iterrows() if str(r.get("Item","")).strip()}
+    except Exception:
+        return {}
+
+def _render_clinic_purchase_summary(sheet_name: str):
+    import numpy as np
+    df = _apply_common_filters(load_module_df(sheet_name), scope_to_user=False)
+    if df.empty:
+        st.info("No Clinic Purchase data yet."); return
+
+    # Normalize
+    for c in ("Clinic_Qty","SP_Qty","Util_Qty"):
+        if c not in df.columns: df[c] = 0
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+    if "Date" in df.columns:
+        df["Date"] = parse_date(df["Date"]).dt.date
+    else:
+        df["Date"] = pd.NaT
+
+    df["Item"] = df.get("Item","").astype(str).str.strip()
+    pm = _clinic_items_price_map()
+    df["UnitPrice"] = df["Item"].map(pm).fillna(0.0)
+
+    # Values (derive even if sheet has old blanks)
+    df["Clinic_Value"] = (df["Clinic_Qty"] * df["UnitPrice"]).round(2)
+    df["SP_Value"]     = (df["SP_Qty"]     * df["UnitPrice"]).round(2)
+    df["Util_Value"]   = (df["Util_Qty"]   * df["UnitPrice"]).round(2)
+
+    # Filters UI
+    with st.expander("Filters — Clinic Purchase", expanded=True):
+        dmin = df["Date"].min() if df["Date"].notna().any() else date.today()
+        dmax = df["Date"].max() if df["Date"].notna().any() else date.today()
+        f_date = st.date_input("Date range", value=(dmin, dmax))
+        f_items = st.multiselect("Item(s)", sorted([x for x in df["Item"].unique() if x]))
+    if f_date and all(f_date):
+        df = df[(df["Date"]>=f_date[0]) & (df["Date"]<=f_date[1])]
+    if f_items:
+        df = df[df["Item"].isin(f_items)]
+
+    if df.empty:
+        st.warning("No rows after filters."); return
+
+    # Running Instock by item/date
+    opening = _clinic_opening_map()
+    rows = []
+    for item, grp in df.groupby("Item"):
+        grp = grp.sort_values("Date")
+        prev = float(opening.get(item, 0.0))
+        unit = float(pm.get(item, 0.0))
+        for _, r in grp.iterrows():
+            instock_qty = prev + float(r["SP_Qty"]) - float(r["Util_Qty"])
+            rows.append({
+                "Date": r["Date"], "Item": item,
+                "Clinic_Qty": r["Clinic_Qty"], "Clinic_Value": r["Clinic_Value"],
+                "SP_Qty": r["SP_Qty"], "SP_Value": r["SP_Value"],
+                "Util_Qty": r["Util_Qty"], "Util_Value": r["Util_Value"],
+                "Instock_Qty": instock_qty,
+                "Instock_Value": round(instock_qty * unit, 2),
+            })
+            prev = instock_qty
+    out = pd.DataFrame(rows)
+
+    # Per-day total rows
+    num_cols = ["Clinic_Qty","Clinic_Value","SP_Qty","SP_Value","Util_Qty","Util_Value","Instock_Qty","Instock_Value"]
+    per_day = out.groupby("Date")[num_cols].sum().reset_index()
+    per_day.insert(1, "Item", "Total")
+
+    # Grand Total row
+    grand = {c: float(out[c].sum()) for c in num_cols}
+    grand.update({"Date": "Grand Total", "Item": ""})
+
+    display_cols = ["Date","Item","Clinic_Qty","Clinic_Value","SP_Qty","SP_Value","Util_Qty","Util_Value","Instock_Qty","Instock_Value"]
+    final = pd.concat([pd.DataFrame([grand]), per_day[display_cols], out[display_cols]], ignore_index=True)
+
+    st.dataframe(final, use_container_width=True, hide_index=True)
+    csv = final.to_csv(index=False).encode("utf-8")
+    st.download_button("Download CSV (Clinic Purchase Summary)", csv, f"ClinicPurchase_Summary_{datetime.now():%Y%m%d_%H%M%S}.csv", "text/csv")
 
 def _render_update_record_page():
     with intake_page("Update Record", "Edit a single row", badge=ROLE):
@@ -2112,10 +2363,22 @@ def _render_update_record_page():
         # 3-column grid like other modules
         cols = st.columns(3, gap="large")
         
-        def _is_numbery(name: str) -> bool:
-            n = name.lower()
-            # tweak this pattern if you want more/less numeric detection
-            return bool(re.search(r"(amount|total|qty|quantity|price|share|value|number)$", n)) or n in {"netamount","patientshare"}
+        def _is_numbery(col_name: str) -> bool:
+            # Prefer explicit config from Modules.NumericFieldsJSON (case-insensitive match)
+            try:
+                cat = modules_catalog_df()
+                row = cat[cat["Module"] == mod]
+                nums = json.loads(row.iloc[0]["NumericFieldsJSON"]) if not row.empty else []
+                if str(col_name).lower() in {str(x).lower() for x in nums}:
+                    return True
+            except Exception:
+                pass
+            # Fallback: data-driven check
+            if col_name not in df.columns:
+                return False
+            s = pd.to_numeric(df[col_name], errors="coerce")
+            nonblank = df[col_name].astype(str).str.strip().ne("").sum()
+            return s.notna().sum() >= 0.7 * max(nonblank, 1)
         
         edits = {}
         for i, c in enumerate(editable_cols):
@@ -2124,7 +2387,7 @@ def _render_update_record_page():
             with cols[i % 3]:
                 if "date" in low:
                     try:
-                        d = pd.to_datetime(str(val), errors="coerce").date() if str(val) else date.today()
+                        d = parse_date(str(val)).date() if str(val) else date.today()
                     except Exception:
                         d = date.today()
                     edits[c] = st.date_input(c, value=d, key=f"upd_{c}")
@@ -2135,7 +2398,8 @@ def _render_update_record_page():
                                             key=f"upd_{c}")
                 elif low in {"remark","notes","note","comments","comment"}:
                     edits[c] = st.text_area(c, value=str(val), key=f"upd_{c}")
-                elif _is_numbery(low):
+                elif _is_numbery(c):
+
                     try:
                         num = float(str(val).replace(",", ""))
                     except Exception:
@@ -2160,7 +2424,7 @@ def _render_update_record_page():
             for c in editable_cols:
                 val = edits[c]
                 if isinstance(val, (date, datetime)):
-                    val = pd.to_datetime(val).strftime("%d/%m/%Y")
+                    val = format_date(val)
                 if isinstance(val, str):
                     val = _sanitize_cell(val)
                 cur_map[c] = val
@@ -2183,6 +2447,10 @@ def nav_pages_for(role: str):
     if r == "admin":
         return module_pairs, ["View / Export","Summary"]
     return module_pairs, ["Summary"]
+
+# One-time ensure Clinic Purchase module + sheets exist/enabled for this client
+seed_clinic_purchase_assets_for_client(CLIENT_ID)
+_clear_all_caches()  # make sure newly seeded rows are visible to this session
 
 module_pairs, static_pages = nav_pages_for(ROLE)
 
