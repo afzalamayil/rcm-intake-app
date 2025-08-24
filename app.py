@@ -1628,29 +1628,6 @@ def _render_view_export_page():
                 if use_date and col_date:
                     sd = parse_date(df[col_date]).dt.date
                     d1 = st.date_input("From", sd[sd.notna()].min() if sd.notna().any() else date.today(), key="view_d1")
-                    d2 = st.date_input("To",   sd[sd.notna()].max() if sd.notna().any() else date.today(), key="view_d2")
-            with c2:
-                f_claim   = st.text_input("Claim ID", key="view_claim") if col_claim else ""
-                f_eid     = st.text_input("EID", key="view_eid") if col_eid else ""
-                f_patient = st.text_input("Patient Name", key="view_patient") if col_patient else ""
-            with c3:
-                f_approval = st.text_input("Approval Code", key="view_approval") if col_approval else ""
-                f_member   = st.text_input("Member ID", key="view_member") if col_member else ""
-                f_insurance= st.text_input("Insurance (text match)", key="view_insurance") if col_ins else ""
-                f_status = ""
-                if col_status:
-                    opts = [""] + sorted([x for x in df[col_status].astype(str).unique() if x])
-                    f_status = st.selectbox("Status", opts, index=0, key="view_status")
-
-        # ---- Filters UI (same shape as Update Record) ----
-        with st.expander("Filters", expanded=True):
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                q = st.text_input("Search (matches any column)", key="view_q")
-                use_date = st.checkbox("Filter by date range", value=False, key="view_use_date")
-                if use_date and col_date:
-                    sd = parse_date(df[col_date]).dt.date
-                    d1 = st.date_input("From", sd[sd.notna()].min() if sd.notna().any() else date.today(), key="view_d1")
                     d2 = st.date_input("To",   sd[sd.notna()].max() if sd.notna()].any() else date.today(), key="view_d2")
             with c2:
                 f_claim   = st.text_input("Claim ID", key="view_claim") if col_claim else ""
