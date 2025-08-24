@@ -1164,7 +1164,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
 
             r2c1, r2c2, r2c3 = st.columns(3, gap="large")
             with r2c1: st.date_input("Submission Date*", key="submission_date")
-            with r2c2: st.selectbox("Portal* (DHPO / Riayati / Insurance Portal)", portals_opts, key="portal"))
+            with r2c2: st.selectbox("Portal* (DHPO / Riayati / Insurance Portal)", portals_opts, key="portal")
             with r2c3: st.text_input("Member ID*", key="member_id")
 
             r3c1, r3c2, r3c3 = st.columns(3, gap="large")
