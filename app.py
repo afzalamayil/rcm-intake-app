@@ -1131,6 +1131,36 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
             t1, t2, t3 = st.columns(3, gap="large")
             with t1:
                 st.selectbox("Type*", ["Insurance", "Cash"], key="type")
+            # after: st.selectbox("Type*", ["Insurance", "Cash"], key="type")
+            type_is_cash = (st.session_state.get("type") == "Cash")
+            
+            # Build options, prepending "Cash" only for Cash flow
+            submodes_opts = (["Cash"] + [m for m in submission_modes if m != "Cash"]) if type_is_cash else list(submission_modes)
+            portals_opts  = (["Cash"] + [p for p in portals if p != "Cash"])         if type_is_cash else list(portals)
+            ins_opts_base = ins_df["Display"].tolist() if not ins_df.empty else ["—"]
+            ins_opts      = (["Cash"] + [x for x in ins_opts_base if x != "Cash"])    if type_is_cash else ins_opts_base
+            
+            # One-time transition handler so we don't keep overwriting the user's edits
+            was_cash = st.session_state.get("_was_cash", False)
+            
+            if type_is_cash and not was_cash:
+                # Prefill on switch to Cash
+                st.session_state["submission_mode"]   = "Cash"
+                st.session_state["portal"]            = "Cash"
+                st.session_state["insurance_display"] = "Cash"
+                st.session_state["member_id"]         = "Cash"
+                st.session_state["claim_id"]          = "Cash"
+                st.session_state["approval_code"]     = "Cash"
+                st.session_state["_was_cash"] = True
+            
+            elif (not type_is_cash) and was_cash:
+                # Clean up the Cash autofill when switching back to Insurance
+                for k in ("submission_mode", "portal", "member_id", "claim_id", "approval_code"):
+                    if st.session_state.get(k) == "Cash":
+                        st.session_state[k] = ""
+                if st.session_state.get("insurance_display") == "Cash":
+                    st.session_state["insurance_display"] = ins_opts[0] if ins_opts else ""
+                st.session_state["_was_cash"] = False
             
             type_is_cash = (st.session_state.get("type") == "Cash")
             
