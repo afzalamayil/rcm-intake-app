@@ -2103,7 +2103,7 @@ def _render_summary_page():
                 if use_date and col_date:
                     sd = parse_date(df[col_date]).dt.date
                     d1 = st.date_input("From", sd[sd.notna()].min() if sd.notna().any() else date.today(), key="sum_d1")
-                    d2 = st.date_input("To",   sd[sd.notna()].max() if sd.notna()any() else date.today(), key="sum_d2")
+                    d2 = st.date_input("To",   sd[sd.notna()].max() if sd.notna().any() else date.today(), key="sum_d2")
             with c2:
                 f_claim   = st.text_input("Claim ID", key="sum_claim") if col_claim else ""
                 f_eid     = st.text_input("EID", key="sum_eid") if col_eid else ""
