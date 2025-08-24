@@ -1062,7 +1062,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
     LEGACY_HEADERS = [
         "Timestamp","SubmittedBy","Role",
         "PharmacyID","PharmacyName",
-        "EmployeeName","SubmissionDate","SubmissionMode",
+        "EmployeeName","SubmissionDate","SubmissionMode","Type",
         "Portal","ERXNumber","InsuranceCode","InsuranceName",
         "MemberID","EID","ClaimID","ApprovalCode",
         "NetAmount","PatientShare","Remark","Status"
@@ -1092,6 +1092,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
             "employee_name": "",
             "submission_date": date.today(),
             "submission_mode": "",
+            "type": "Insurance",          # ← NEW default
             "pharmacy_display": "",
             "portal": "",
             "erx_number": "",
@@ -1110,9 +1111,10 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
             st.session_state.setdefault(k, v)
 
     if st.session_state.get("_clear_form", False):
-        for k in ("employee_name","submission_date","submission_mode","pharmacy_display","portal","erx_number",
-                  "insurance_display","member_id","eid","claim_id","approval_code","net_amount","patient_share",
-                  "status","remark","allow_dup_override"):
+        for k in ("employee_name","submission_date","submission_mode","type",  # ← add "type"
+                  "pharmacy_display","portal","erx_number","insurance_display",
+                  "member_id","eid","claim_id","approval_code","net_amount",
+                  "patient_share","status","remark","allow_dup_override"):
             st.session_state.pop(k, None)
         _reset_form()
         st.session_state["_clear_form"] = False
@@ -1125,20 +1127,48 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
 
     with container_ctx:
         with st.form("pharmacy_intake_legacy", clear_on_submit=True):
+            # --- Type selector (put this before r1c1/r1c2/r1c3) ---
+            t1, t2, t3 = st.columns(3, gap="large")
+            with t1:
+                st.selectbox("Type*", ["Insurance", "Cash"], key="type")
+            
+            type_is_cash = (st.session_state.get("type") == "Cash")
+            
+            # Prepare option lists (add literal "Cash" when Type=Cash)
+            submodes_opts = list(submission_modes)
+            portals_opts  = list(portals)
+            ins_opts      = ins_df["Display"].tolist() if not ins_df.empty else ["—"]
+            
+            if type_is_cash:
+                if "Cash" not in submodes_opts: submodes_opts.insert(0, "Cash")
+                if "Cash" not in portals_opts:  portals_opts.insert(0, "Cash")
+                if "Cash" not in ins_opts:      ins_opts.insert(0, "Cash")
+            
+                # Prefill sensible defaults (one-time; won't fight user edits)
+                st.session_state.setdefault("submission_mode", "Cash")
+                st.session_state.setdefault("portal", "Cash")
+                st.session_state.setdefault("insurance_display", "Cash")
+                st.session_state.setdefault("member_id", "Cash")
+                st.session_state.setdefault("claim_id", "Cash")
+                st.session_state.setdefault("approval_code", "Cash")
+            else:
+                # Ensure non-Cash flows start blank-ish if untouched
+                st.session_state.setdefault("submission_mode", "")
+                st.session_state.setdefault("portal", "")
+                st.session_state.setdefault("insurance_display", ins_opts[0] if ins_opts else "")
+
             r1c1, r1c2, r1c3 = st.columns(3, gap="large")
             with r1c1: st.text_input("Employee Name*", key="employee_name")
             with r1c2: st.selectbox("Pharmacy (ID - Name)*", pharm_choices, key="pharmacy_display")
-            with r1c3: st.selectbox("Insurance (Code - Name)*",
-                                    ins_df["Display"].tolist() if not ins_df.empty else ["—"],
-                                    key="insurance_display")
+            with r1c3: st.selectbox("Insurance (Code - Name)*", ins_opts, key="insurance_display")
 
             r2c1, r2c2, r2c3 = st.columns(3, gap="large")
             with r2c1: st.date_input("Submission Date*", key="submission_date")
-            with r2c2: st.selectbox("Portal* (DHPO / Riayati / Insurance Portal)", portals, key="portal")
+            with r2c2: st.selectbox("Portal* (DHPO / Riayati / Insurance Portal)", portals_opts, key="portal"))
             with r2c3: st.text_input("Member ID*", key="member_id")
 
             r3c1, r3c2, r3c3 = st.columns(3, gap="large")
-            with r3c1: st.selectbox("Submission Mode*", submission_modes, key="submission_mode")
+            with r3c1: st.selectbox("Submission Mode*", submodes_opts, key="submission_mode")
             with r3c2: st.text_input("ERX Number*", key="erx_number")
             with r3c3: st.text_input("EID*", key="eid")
 
@@ -1162,6 +1192,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         "Submission Date": st.session_state.submission_date,
         "Pharmacy":       st.session_state.pharmacy_display,
         "Submission Mode":st.session_state.submission_mode,
+        "Type":           st.session_state.type,
         "Portal":         st.session_state.portal,
         "ERX Number":     st.session_state.erx_number,
         "Insurance":      st.session_state.insurance_display,
@@ -1213,7 +1244,15 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
             return
     except Exception:
         pass
-
+    
+    ins_code, ins_name = "", ""
+    if str(st.session_state.insurance_display).strip().lower() == "cash":
+        ins_code, ins_name = "Cash", "Cash"          # special case
+    elif " - " in st.session_state.insurance_display:
+        ins_code, ins_name = st.session_state.insurance_display.split(" - ", 1)
+        ins_code, ins_name = ins_code.strip(), ins_name.strip()
+    else:
+        ins_name = st.session_state.insurance_display
     record = [
         datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
         (username or name),
@@ -1222,6 +1261,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         st.session_state.employee_name.strip(),
         format_date(st.session_state.submission_date),
         st.session_state.submission_mode,
+        st.session_state.type,
         st.session_state.portal,
         st.session_state.erx_number.strip(),
         ins_code, ins_name,
@@ -1669,6 +1709,7 @@ def _render_masters_admin_page():
                         to_save[col] = udf_view_edit[col]
                     if _save_whole_sheet(USERS_TAB, to_save, REQUIRED_HEADERS[USERS_TAB]):
                         _clear_all_caches(); st.success("Users saved.")
+            
             with rowB:
                 with st.popover("Reset Password"):
                     st.caption("This stores a new bcrypt hash into the password field.")
