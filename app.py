@@ -1049,12 +1049,12 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         pass
 
     record = [
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
         (username or name),
         ROLE,
         ph_id, ph_name,
         st.session_state.employee_name.strip(),
-        st.session_state.submission_date.strftime("%Y-%m-%d"),
+        st.session_state.submission_date.strftime("%d-%m-%Y"),
         st.session_state.submission_mode,
         st.session_state.portal,
         st.session_state.erx_number.strip(),
@@ -1254,7 +1254,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
 
     # Build row data
     data_map = {
-        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Timestamp": datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
         "SubmittedBy": username or name,
         "Role": ROLE,
         "ClientID": CLIENT_ID,
@@ -1272,7 +1272,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
 
         # normalize dates/lists
         if isinstance(val, (date, datetime)):
-            val = pd.to_datetime(val).strftime("%Y-%m-%d")
+            val = pd.to_datetime(val).strftime("%d-%m-%Y")
         if isinstance(val, list):
             val = ", ".join([str(x) for x in val])
 
@@ -2120,7 +2120,7 @@ def _render_update_record_page():
             # Convert date widgets back to yyyy-mm-dd
             for k, v in edits.items():
                 if isinstance(v, (date, datetime)):
-                    edits[k] = pd.to_datetime(v).strftime("%Y-%m-%d")
+                    edits[k] = pd.to_datetime(v).strftime("%d-%m-%Y")
 
             # Read current row from the sheet, merge edits, and update
             sheet_row_num = int(selected_row_index) + 2  # header row + 1-based
@@ -2130,7 +2130,7 @@ def _render_update_record_page():
             for c in editable_cols:
                 val = edits[c]
                 if isinstance(val, (date, datetime)):
-                    val = pd.to_datetime(val).strftime("%Y-%m-%d")
+                    val = pd.to_datetime(val).strftime("%d-%m-%Y")
                 if isinstance(val, str):
                     val = _sanitize_cell(val)
                 cur_map[c] = val
