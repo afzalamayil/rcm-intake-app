@@ -1054,11 +1054,18 @@ def _clear_module_form_state(module_name: str, schema_rows: pd.DataFrame):
 # ─────────────────────────────────────────────────────────────────────────────
 # Form rendering
 # ─────────────────────────────────────────────────────────────────────────────
+# ---- add once at module scope (top of file is fine) ----
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_masters():
+    return {
+        "submission_modes": safe_list(MS_SUBMISSION_MODE, ["Walk-in","Phone","Email","Portal"]),
+        "portals":          safe_list(MS_PORTAL, ["DHPO","Riayati","Insurance Portal"]),
+        "statuses":         safe_list(MS_STATUS, ["Submitted","Approved","Rejected","Pending","RA Pending"]),
+        "pharm_df":         pharm_master(),
+        "ins_df":           insurance_master(),
+    }
+
 def _render_legacy_pharmacy_intake(sheet_name: str):
-    """
-    Pharmacy intake with the exact 3× grid layout.
-    Saves to the module's sheet (e.g., Data_Pharmacy). Other modules stay dynamic.
-    """
     LEGACY_HEADERS = [
         "Timestamp","SubmittedBy","Role",
         "PharmacyID","PharmacyName",
@@ -1068,35 +1075,41 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         "NetAmount","PatientShare","Remark","Status"
     ]
 
-    # --- Ensure sheet & headers ---
-    wsx = ws(sheet_name)
-    head = retry(lambda: wsx.row_values(1))
-    if not head:
-        retry(lambda: wsx.update("A1", [LEGACY_HEADERS]))
+    # --- One-time header ensure per session (prevents slow sheet writes every rerun) ---
+    _hdr_flag = f"_headers_ok_{sheet_name}"
+    if not st.session_state.get(_hdr_flag, False):
+        wsx = ws(sheet_name)
+        head = retry(lambda: wsx.row_values(1))
+        if not head:
+            retry(lambda: wsx.update("A1", [LEGACY_HEADERS]))
+        else:
+            merged = list(dict.fromkeys([*head, *LEGACY_HEADERS]))
+            if [h.lower() for h in head] != [h.lower() for h in merged]:
+                retry(lambda: wsx.update("A1", [merged]))
+        st.session_state[_hdr_flag] = True
     else:
-        merged = list(dict.fromkeys([*head, *LEGACY_HEADERS]))
-        if [h.lower() for h in head] != [h.lower() for h in merged]:
-            retry(lambda: wsx.update("A1", [merged]))
+        # still need the handle for appending later
+        wsx = ws(sheet_name)
 
-    # --- Masters ---
-    submission_modes = safe_list(MS_SUBMISSION_MODE, ["Walk-in","Phone","Email","Portal"])
-    portals          = safe_list(MS_PORTAL, ["DHPO","Riayati","Insurance Portal"])
-    statuses         = safe_list(MS_STATUS, ["Submitted","Approved","Rejected","Pending","RA Pending"])
-    pharm_df         = pharm_master()
-    ins_df           = insurance_master()
+    # --- masters (cached; no I/O on toggle) ---
+    M = _cached_masters()
+    submission_modes = list(M["submission_modes"])
+    portals          = list(M["portals"])
+    statuses         = list(M["statuses"])
+    pharm_df         = M["pharm_df"].copy()
+    ins_df           = M["ins_df"].copy()
 
-    # ACL filter for pharmacies
     if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"]:
         pharm_df = pharm_df[pharm_df["ID"].isin(ALLOWED_PHARM_IDS)]
     pharm_choices = pharm_df["Display"].tolist() if not pharm_df.empty else ["—"]
 
-    # --- Helpers for default/reset ---
+    # --- defaults / reset ---
     def _seed_defaults():
         defaults = {
             "employee_name": "",
             "submission_date": date.today(),
             "submission_mode": "",
-            "type": st.session_state.get("type", "Insurance"),  # persist if present
+            "type": st.session_state.get("type", "Insurance"),
             "pharmacy_display": "",
             "portal": "",
             "erx_number": "",
@@ -1126,33 +1139,32 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         st.session_state["_clear_form"] = False
     _seed_defaults()
 
-    # --- Container (bordered if available) ---
     try:
         container_ctx = st.container(border=True)
     except TypeError:
         container_ctx = st.container()
 
-    # ========== OUTSIDE THE FORM ==========
-    # Single Type selector (only once!)
+    # ---- OUTSIDE THE FORM (single Type selector) ----
     with container_ctx:
-        c1, c2, c3 = st.columns(3, gap="large")
+        c1, _, _ = st.columns(3, gap="large")
         with c1:
             st.selectbox("Type*", ["Insurance", "Cash"], key="type")
 
         type_is_cash = (st.session_state.get("type") == "Cash")
         was_cash     = st.session_state.get("_was_cash", False)
 
-        # One-time transition mapping when switching to/from Cash
+        # One-time transition only; avoid repeated writes
         if type_is_cash and not was_cash:
-            st.session_state["submission_mode"]   = "Cash"
-            st.session_state["portal"]            = "Cash"
-            st.session_state["insurance_display"] = "Cash"
-            st.session_state["member_id"]         = "Cash"
-            st.session_state["claim_id"]          = "Cash"
-            st.session_state["approval_code"]     = "Cash"
-            st.session_state["_was_cash"] = True
+            st.session_state.update({
+                "submission_mode":   "Cash",
+                "portal":            "Cash",
+                "insurance_display": "Cash",
+                "member_id":         "Cash",
+                "claim_id":          "Cash",
+                "approval_code":     "Cash",
+                "_was_cash": True,
+            })
         elif (not type_is_cash) and was_cash:
-            # clear auto-filled "Cash" values back to blanks
             for k in ("submission_mode","portal","member_id","claim_id","approval_code"):
                 if st.session_state.get(k) == "Cash":
                     st.session_state[k] = ""
@@ -1161,16 +1173,19 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
                 st.session_state["insurance_display"] = base_ins[0] if base_ins else ""
             st.session_state["_was_cash"] = False
 
-        # Build options ONCE after type is known
+        # Build option lists AFTER type known (cheap; no I/O)
         submodes_opts = list(submission_modes)
         portals_opts  = list(portals)
-        ins_opts      = ins_df["Display"].tolist() if not ins_df.empty else ["—"]
+        # cache the giant insurance list in session_state to avoid Python → JS diff cost
+        if "_ins_opts_base" not in st.session_state:
+            st.session_state["_ins_opts_base"] = ins_df["Display"].tolist() if not ins_df.empty else ["—"]
+        ins_opts = list(st.session_state["_ins_opts_base"])
         if type_is_cash:
             if "Cash" not in submodes_opts: submodes_opts.insert(0, "Cash")
             if "Cash" not in portals_opts:  portals_opts.insert(0, "Cash")
             if "Cash" not in ins_opts:      ins_opts.insert(0, "Cash")
 
-        # ========== THE ONLY FORM ==========
+        # ---- THE ONLY FORM ----
         with st.form("pharmacy_intake_legacy", clear_on_submit=True):
             r1c1, r1c2, r1c3 = st.columns(3, gap="large")
             with r1c1: st.text_input("Employee Name*", key="employee_name")
@@ -1200,7 +1215,6 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
 
             submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
 
-    # If not submitted, stop here (no errors/missing button warnings)
     if not submitted:
         return
 
@@ -1222,13 +1236,12 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         "Patient Share":   st.session_state.patient_share,
         "Status":          st.session_state.status,
     }
-    missing = [k for k, v in required.items()
-               if (isinstance(v, str) and not v.strip()) or v is None]
+    missing = [k for k,v in required.items() if (isinstance(v,str) and not v.strip()) or v is None]
     if missing:
         st.error("Missing required fields: " + ", ".join(missing))
         return
 
-    # --- Parse pharmacy & enforce ACL ---
+    # --- parse pharmacy / ACL ---
     ph_id, ph_name = "", ""
     if " - " in st.session_state.pharmacy_display:
         ph_id, ph_name = st.session_state.pharmacy_display.split(" - ", 1)
@@ -1237,7 +1250,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         st.error("You are not allowed to submit for this pharmacy.")
         return
 
-    # --- Insurance split (Cash safe-case) ---
+    # --- insurance split (Cash safe) ---
     ins_code, ins_name = "", ""
     if str(st.session_state.insurance_display).strip().lower() == "cash":
         ins_code = ins_name = "Cash"
@@ -1247,7 +1260,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
     else:
         ins_name = st.session_state.insurance_display
 
-    # --- Duplicate check: same-day (ERX + Net) on this sheet ---
+    # --- duplicate check (same-day ERX + Net) ---
     try:
         df_dup = pd.DataFrame(retry(lambda: wsx.get_all_records()))
         dup = False
@@ -1268,14 +1281,14 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
     except Exception:
         pass
 
-    # --- Build record & append ---
+    # --- append record ---
     record = [
         datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
         (username or name),
         ROLE,
         ph_id, ph_name,
         st.session_state.employee_name.strip(),
-        format_date(st.session_state.submission_date),  # keep DD/MM/YYYY via your helper
+        format_date(st.session_state.submission_date),
         st.session_state.submission_mode,
         st.session_state.type,
         st.session_state.portal,
@@ -1295,16 +1308,12 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
     try:
         retry(lambda: wsx.append_row(record, value_input_option="USER_ENTERED"))
         st.session_state["_flash_msg"] = ("success", "Saved ✔️")
-        try:
-            load_module_df.clear()
-        except Exception:
-            pass
+        try: load_module_df.clear()
+        except Exception: pass
 
-        # Clear form for next entry and reset type back to Insurance
         st.session_state["_clear_form"] = True
         st.session_state["type"] = "Insurance"
         st.session_state["_was_cash"] = False
-
         st.rerun()
     except Exception as e:
         st.error(f"Save failed: {e}")
