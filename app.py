@@ -1124,27 +1124,56 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         container_ctx = st.container(border=True)
     except TypeError:
         container_ctx = st.container()
+        
+    # --- Type selector + Cash transition (OUTSIDE the form) ---
+    t1, t2, t3 = st.columns(3, gap="large")
+    with t1:
+        st.selectbox("Type*", ["Insurance", "Cash"], key="type")
+    
+    type_is_cash = (st.session_state.get("type") == "Cash")
+    was_cash = st.session_state.get("_was_cash", False)
+    
+    # One-time transition handler so we don't keep overwriting user edits
+    if type_is_cash and not was_cash:
+        st.session_state["submission_mode"]   = "Cash"
+        st.session_state["portal"]            = "Cash"
+        st.session_state["insurance_display"] = "Cash"
+        st.session_state["member_id"]         = "Cash"
+        st.session_state["claim_id"]          = "Cash"
+        st.session_state["approval_code"]     = "Cash"
+        st.session_state["_was_cash"] = True
+    elif (not type_is_cash) and was_cash:
+        for k in ("submission_mode", "portal", "member_id", "claim_id", "approval_code"):
+            if st.session_state.get(k) == "Cash":
+                st.session_state[k] = ""
+        # put insurance back to a real option if we had "Cash" there
+        base_ins = ins_df["Display"].tolist() if not ins_df.empty else [""]
+        if st.session_state.get("insurance_display") == "Cash":
+            st.session_state["insurance_display"] = base_ins[0] if base_ins else ""
+        st.session_state["_was_cash"] = False
+    
+    # Build option lists once
+    submodes_opts = list(submission_modes)
+    portals_opts  = list(portals)
+    ins_opts      = ins_df["Display"].tolist() if not ins_df.empty else ["—"]
+    
+    if type_is_cash:
+        if "Cash" not in submodes_opts: submodes_opts.insert(0, "Cash")
+        if "Cash" not in portals_opts:  portals_opts.insert(0, "Cash")
+        if "Cash" not in ins_opts:      ins_opts.insert(0, "Cash")
 
     with container_ctx:
         with st.form("pharmacy_intake_legacy", clear_on_submit=True):
-            # --- Type selector (put this before r1c1/r1c2/r1c3) ---
+            # --- Type selector + Cash transition (OUTSIDE the form) ---
             t1, t2, t3 = st.columns(3, gap="large")
             with t1:
                 st.selectbox("Type*", ["Insurance", "Cash"], key="type")
-            # after: st.selectbox("Type*", ["Insurance", "Cash"], key="type")
+            
             type_is_cash = (st.session_state.get("type") == "Cash")
-            
-            # Build options, prepending "Cash" only for Cash flow
-            submodes_opts = (["Cash"] + [m for m in submission_modes if m != "Cash"]) if type_is_cash else list(submission_modes)
-            portals_opts  = (["Cash"] + [p for p in portals if p != "Cash"])         if type_is_cash else list(portals)
-            ins_opts_base = ins_df["Display"].tolist() if not ins_df.empty else ["—"]
-            ins_opts      = (["Cash"] + [x for x in ins_opts_base if x != "Cash"])    if type_is_cash else ins_opts_base
-            
-            # One-time transition handler so we don't keep overwriting the user's edits
             was_cash = st.session_state.get("_was_cash", False)
             
+            # One-time transition handler so we don't keep overwriting the user's edits
             if type_is_cash and not was_cash:
-                # Prefill on switch to Cash
                 st.session_state["submission_mode"]   = "Cash"
                 st.session_state["portal"]            = "Cash"
                 st.session_state["insurance_display"] = "Cash"
@@ -1154,65 +1183,45 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
                 st.session_state["_was_cash"] = True
             
             elif (not type_is_cash) and was_cash:
-                # Clean up the Cash autofill when switching back to Insurance
                 for k in ("submission_mode", "portal", "member_id", "claim_id", "approval_code"):
                     if st.session_state.get(k) == "Cash":
                         st.session_state[k] = ""
                 if st.session_state.get("insurance_display") == "Cash":
-                    st.session_state["insurance_display"] = ins_opts[0] if ins_opts else ""
+                    base_ins = ins_df["Display"].tolist() if not ins_df.empty else [""]
+                    st.session_state["insurance_display"] = base_ins[0] if base_ins else ""
                 st.session_state["_was_cash"] = False
+          
+            # ------------- now open the form -------------
+            with container_ctx:
+                with st.form("pharmacy_intake_legacy", clear_on_submit=True):
+                    # (remove the old Type selectbox from here)
             
-            type_is_cash = (st.session_state.get("type") == "Cash")
+                    r1c1, r1c2, r1c3 = st.columns(3, gap="large")
+                    with r1c1: st.text_input("Employee Name*", key="employee_name")
+                    with r1c2: st.selectbox("Pharmacy (ID - Name)*", pharm_choices, key="pharmacy_display")
+                    with r1c3: st.selectbox("Insurance (Code - Name)*", ins_opts, key="insurance_display")
             
-            # Prepare option lists (add literal "Cash" when Type=Cash)
-            submodes_opts = list(submission_modes)
-            portals_opts  = list(portals)
-            ins_opts      = ins_df["Display"].tolist() if not ins_df.empty else ["—"]
+                    r2c1, r2c2, r2c3 = st.columns(3, gap="large")
+                    with r2c1: st.date_input("Submission Date*", key="submission_date")
+                    with r2c2: st.selectbox("Portal* (DHPO / Riayati / Insurance Portal)", portals_opts, key="portal")
+                    with r2c3: st.text_input("Member ID*", key="member_id")
             
-            if type_is_cash:
-                if "Cash" not in submodes_opts: submodes_opts.insert(0, "Cash")
-                if "Cash" not in portals_opts:  portals_opts.insert(0, "Cash")
-                if "Cash" not in ins_opts:      ins_opts.insert(0, "Cash")
+                    r3c1, r3c2, r3c3 = st.columns(3, gap="large")
+                    with r3c1: st.selectbox("Submission Mode*", submodes_opts, key="submission_mode")
+                    with r3c2: st.text_input("ERX Number*", key="erx_number")
+                    with r3c3: st.text_input("EID*", key="eid")
             
-                # Prefill sensible defaults (one-time; won't fight user edits)
-                st.session_state.setdefault("submission_mode", "Cash")
-                st.session_state.setdefault("portal", "Cash")
-                st.session_state.setdefault("insurance_display", "Cash")
-                st.session_state.setdefault("member_id", "Cash")
-                st.session_state.setdefault("claim_id", "Cash")
-                st.session_state.setdefault("approval_code", "Cash")
-            else:
-                # Ensure non-Cash flows start blank-ish if untouched
-                st.session_state.setdefault("submission_mode", "")
-                st.session_state.setdefault("portal", "")
-                st.session_state.setdefault("insurance_display", ins_opts[0] if ins_opts else "")
-
-            r1c1, r1c2, r1c3 = st.columns(3, gap="large")
-            with r1c1: st.text_input("Employee Name*", key="employee_name")
-            with r1c2: st.selectbox("Pharmacy (ID - Name)*", pharm_choices, key="pharmacy_display")
-            with r1c3: st.selectbox("Insurance (Code - Name)*", ins_opts, key="insurance_display")
-
-            r2c1, r2c2, r2c3 = st.columns(3, gap="large")
-            with r2c1: st.date_input("Submission Date*", key="submission_date")
-            with r2c2: st.selectbox("Portal* (DHPO / Riayati / Insurance Portal)", portals_opts, key="portal")
-            with r2c3: st.text_input("Member ID*", key="member_id")
-
-            r3c1, r3c2, r3c3 = st.columns(3, gap="large")
-            with r3c1: st.selectbox("Submission Mode*", submodes_opts, key="submission_mode")
-            with r3c2: st.text_input("ERX Number*", key="erx_number")
-            with r3c3: st.text_input("EID*", key="eid")
-
-            st.text_input("Claim ID*", key="claim_id")
-            st.text_input("Approval Code*", key="approval_code")
-
-            r4c1, r4c2, r4c3 = st.columns(3, gap="large")
-            with r4c1: st.number_input("Net Amount*", min_value=0.0, step=0.01, format="%.2f", key="net_amount")
-            with r4c2: st.number_input("Patient Share*", min_value=0.0, step=0.01, format="%.2f", key="patient_share")
-            with r4c3: st.selectbox("Status*", statuses, key="status")
-
-            st.text_area("Remark (optional)", key="remark")
-            st.checkbox("Allow duplicate override", key="allow_dup_override")
-            submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
+                    st.text_input("Claim ID*", key="claim_id")
+                    st.text_input("Approval Code*", key="approval_code")
+            
+                    r4c1, r4c2, r4c3 = st.columns(3, gap="large")
+                    with r4c1: st.number_input("Net Amount*", min_value=0.0, step=0.01, format="%.2f", key="net_amount")
+                    with r4c2: st.number_input("Patient Share*", min_value=0.0, step=0.01, format="%.2f", key="patient_share")
+                    with r4c3: st.selectbox("Status*", statuses, key="status")
+            
+                    st.text_area("Remark (optional)", key="remark")
+                    st.checkbox("Allow duplicate override", key="allow_dup_override")
+                    submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
 
     if not submitted:
         return
@@ -1309,13 +1318,17 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
 
     try:
         retry(lambda: wsx.append_row(record, value_input_option="USER_ENTERED"))
-        # Show message after reload, then clear the form and rerun
         st.session_state["_flash_msg"] = ("success", "Saved ✔️")
         try:
             load_module_df.clear()
         except Exception:
             pass
-        st.session_state["_clear_form"] = True  # your existing clear hook
+        st.session_state["_clear_form"] = True
+    
+        # 🔁 reset Type after successful submit
+        st.session_state["type"] = "Insurance"
+        st.session_state["_was_cash"] = False
+    
         st.rerun()
     except Exception as e:
         st.error(f"Save failed: {e}")
