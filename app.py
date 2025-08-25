@@ -1664,29 +1664,22 @@ def _render_view_export_page():
             sd = parse_date(df[col_date]).dt.date
             mask &= sd.between(d1, d2)
 
-        # Faster global search: build a single haystack once
         if q.strip():
             esc = re.escape(q.strip())
-            hay = df.astype(str).agg(" ".join, axis=1)
-            mask &= hay.str.contains(esc, case=False, na=False)
+            mask &= df.apply(lambda r: r.astype(str).str.contains(esc, case=False, na=False).any(), axis=1)
 
-        # Apply mask
-        dfv = df[mask].copy()
-
-        # Pretty-format money without SettingWithCopy warnings
+        df = df[mask]
         for _col in ("NetAmount", "PatientShare"):
-            if _col in dfv.columns:
-                _num = pd.to_numeric(dfv[_col], errors="coerce")
+            if _col in df.columns:
+                _num = pd.to_numeric(df[_col], errors="coerce")
                 if _num.notna().any():
-                    dfv.loc[_num.notna(), _col] = _num[_num.notna()].map(lambda v: f"{v:.2f}")
-
-        if dfv.empty:
-            st.warning("No rows match the filters.")
+                    df[_col] = _num.map(lambda v: f"{v:.2f}")
+        if df.empty:
+            st.warning("No rows match the filters."); 
         else:
-            st.dataframe(dfv, use_container_width=True, hide_index=True)
-            # UTF-8 with BOM so Excel opens Unicode cleanly
-            csv = dfv.to_csv(index=False).encode("utf-8-sig")
-            st.download_button("Download CSV", csv, f"{mod}_export_{datetime.now():%Y%m%d_%H%M%S}.csv", "text/csv", key="view_dl")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            csv = df.to_csv(index=False).encode("utf-8")
+            st.download_button("Download CSV", csv, f"{mod}_export.csv", "text/csv", key="view_dl")
 
         if st.button("Refresh data", key="view_refresh"):
             load_module_df.clear(); st.rerun()
@@ -1711,7 +1704,6 @@ def _render_email_whatsapp_page():
         st.code(wa or "—")
         st.caption("Copy/paste into your mail/WhatsApp client.")
 
-
 def _render_masters_admin_page():
     with intake_page("Masters Admin", "Everything editable here — no need to open Google Sheets", badge=ROLE):
         tabs = st.tabs([
@@ -1719,32 +1711,36 @@ def _render_masters_admin_page():
             "Simple Lists","Modules","Client Modules","Form Schema"
         ])
 
-        # ---------- Users ----------
+        # ---------- Users (Super Admin UX: manage users & reset passwords) ----------
         with tabs[0]:
             st.subheader("Users")
             udf = _load_for_editor(USERS_TAB, REQUIRED_HEADERS[USERS_TAB])
+        
+            # Show everything except password; keep password only for saving/merge
             view_cols = [c for c in udf.columns if c != "password"]
             colconf = {
                 "username":   st.column_config.TextColumn("username", required=True, help="Unique user login"),
                 "name":       st.column_config.TextColumn("name", required=True),
+                # password intentionally hidden from editor; reset via the popover below
                 "role":       st.column_config.SelectboxColumn("role", options=["User","Admin","Super Admin"], required=True),
                 "pharmacies": st.column_config.TextColumn("pharmacies", help="Comma-separated pharmacy IDs or 'ALL'"),
                 "client_id":  st.column_config.TextColumn("client_id", help="Client scope for this user"),
             }
             udf_view_edit = _data_editor(
                 udf[view_cols], "ed_users", column_config=colconf,
-                help_text="Password hidden here; use Reset Password tool below."
+                help_text="Password hidden here; use Reset Password tool below.", height=None
             )
-
+        
             rowA, rowB = st.columns([1,1])
             with rowA:
                 if st.button("Save Users", type="primary", key="btn_save_users"):
+                    # Merge edited non-password cols back into full df; preserve existing password hashes
                     to_save = udf.copy()
                     for col in view_cols:
                         to_save[col] = udf_view_edit[col]
                     if _save_whole_sheet(USERS_TAB, to_save, REQUIRED_HEADERS[USERS_TAB]):
-                        _clear_all_caches()
-                        flash("Users saved.")
+                        _clear_all_caches(); st.success("Users saved.")
+            
             with rowB:
                 with st.popover("Reset Password"):
                     st.caption("This stores a new bcrypt hash into the password field.")
@@ -1759,15 +1755,15 @@ def _render_masters_admin_page():
                             if len(idx) > 0:
                                 udf.loc[idx[0], "password"] = hashed
                                 if _save_whole_sheet(USERS_TAB, udf, REQUIRED_HEADERS[USERS_TAB]):
-                                    _clear_all_caches()
-                                    flash("Password updated.")
-
-            # --- Per-user Module Access ---
+                                    _clear_all_caches(); st.success("Password updated.")
+        
+            # --- Per-user Module Access ---------------------------------------
             st.divider()
             available_users   = udf_view_edit["username"].astype(str).tolist() if not udf_view_edit.empty else []
             available_modules = modules_catalog_df()["Module"].astype(str).tolist()
+        
             umdf = _load_for_editor(MS_USER_MODULES, REQUIRED_HEADERS[MS_USER_MODULES])
-
+        
             colA, colB = st.columns([1,2])
             with colA:
                 sel_user = st.selectbox("User", available_users, key="um_sel_user")
@@ -1779,7 +1775,7 @@ def _render_masters_admin_page():
                         (_to_bool_series(umdf["Enabled"]))
                     ]["Module"].astype(str).tolist()
                 chosen = st.multiselect("Enabled modules", options=available_modules, default=cur, key="um_chosen")
-
+        
             row1, row2 = st.columns([1,1])
             with row1:
                 if st.button("Save user module access", type="primary", key="btn_save_user_modules", disabled=not sel_user):
@@ -1791,8 +1787,7 @@ def _render_masters_admin_page():
                     others = umdf[umdf["Username"].astype(str).str.lower() != str(sel_user).lower()].copy()
                     out = pd.concat([others, base], ignore_index=True)
                     if _save_whole_sheet(MS_USER_MODULES, out, REQUIRED_HEADERS[MS_USER_MODULES]):
-                        _clear_all_caches()
-                        flash("Per-user modules saved.")
+                        _clear_all_caches(); st.success("Per-user modules saved.")
             with row2:
                 if st.button("Open raw editor (advanced)", key="btn_open_um_editor"):
                     st.data_editor(
@@ -1807,9 +1802,8 @@ def _render_masters_admin_page():
                     )
                     if st.button("Save raw user-modules", key="btn_save_um_raw"):
                         if _save_whole_sheet(MS_USER_MODULES, st.session_state["ed_user_modules_raw"], REQUIRED_HEADERS[MS_USER_MODULES]):
-                            _clear_all_caches()
-                            flash("UserModules sheet saved.")
-
+                            _clear_all_caches(); st.success("UserModules sheet saved.")
+            
         # ---------- Clients ----------
         with tabs[1]:
             st.subheader("Clients")
@@ -1817,8 +1811,7 @@ def _render_masters_admin_page():
             ed = _data_editor(cdf, "ed_clients")
             if st.button("Save Clients", type="primary", key="btn_save_clients"):
                 if _save_whole_sheet(CLIENTS_TAB, ed, REQUIRED_HEADERS[CLIENTS_TAB]):
-                    _clear_all_caches()
-                    flash("Clients saved.")
+                    _clear_all_caches(); st.success("Clients saved.")
 
         # ---------- Client Contacts ----------
         with tabs[2]:
@@ -1827,8 +1820,7 @@ def _render_masters_admin_page():
             ed = _data_editor(ccdf, "ed_client_contacts", help_text="Columns: ClientID, To, CC, WhatsApp")
             if st.button("Save Client Contacts", type="primary", key="btn_save_client_contacts"):
                 if _save_whole_sheet(CLIENT_CONTACTS_TAB, ed, REQUIRED_HEADERS[CLIENT_CONTACTS_TAB]):
-                    _clear_all_caches()
-                    flash("Client contacts saved.")
+                    _clear_all_caches(); st.success("Client contacts saved.")
 
         # ---------- Pharmacies ----------
         with tabs[3]:
@@ -1837,19 +1829,18 @@ def _render_masters_admin_page():
             ed = _data_editor(pdf, "ed_pharm")
             if st.button("Save Pharmacies", type="primary", key="btn_save_pharm"):
                 if _save_whole_sheet(MS_PHARM, ed, REQUIRED_HEADERS[MS_PHARM]):
-                    _clear_all_caches()
-                    flash("Pharmacies saved.")
+                    _clear_all_caches(); st.success("Pharmacies saved.")
 
         # ---------- Insurance ----------
         with tabs[4]:
             st.subheader("Insurance")
             idf = _load_for_editor(MS_INSURANCE, REQUIRED_HEADERS[MS_INSURANCE])
+            # compute Display on the fly; don't persist it (sheet schema stays Code/Name)
             idf["Display"] = (idf.get("Code","").astype(str).str.strip()+" - "+idf.get("Name","").astype(str).str.strip()).str.strip(" -")
             ed = _data_editor(idf.drop(columns=["Display"], errors="ignore"), "ed_ins")
             if st.button("Save Insurance", type="primary", key="btn_save_ins"):
                 if _save_whole_sheet(MS_INSURANCE, ed, REQUIRED_HEADERS[MS_INSURANCE]):
-                    _clear_all_caches()
-                    flash("Insurance saved.")
+                    _clear_all_caches(); st.success("Insurance saved.")
 
         # ---------- Doctors ----------
         with tabs[5]:
@@ -1865,8 +1856,7 @@ def _render_masters_admin_page():
             ed = _data_editor(ddf, "ed_docs", column_config=colconf, help_text="Scope by ClientID/PharmacyID; use ClientID='ALL' for global.")
             if st.button("Save Doctors", type="primary", key="btn_save_docs"):
                 if _save_whole_sheet(MS_DOCTORS, ed, REQUIRED_HEADERS[MS_DOCTORS]):
-                    _clear_all_caches()
-                    flash("Doctors saved.")
+                    _clear_all_caches(); st.success("Doctors saved.")
 
         # ---------- Simple Lists ----------
         with tabs[6]:
@@ -1877,27 +1867,25 @@ def _render_masters_admin_page():
                 e1 = _data_editor(sdf, "ed_sm")
                 if st.button("Save Submission Modes", key="btn_save_sm"):
                     if _save_whole_sheet(MS_SUBMISSION_MODE, e1, REQUIRED_HEADERS[MS_SUBMISSION_MODE]):
-                        _clear_all_caches()
-                        flash("Submission modes saved.")
+                        _clear_all_caches(); st.success("Submission modes saved.")
             with t2:
                 pdf = _load_for_editor(MS_PORTAL, REQUIRED_HEADERS[MS_PORTAL])
                 e2 = _data_editor(pdf, "ed_portal")
                 if st.button("Save Portals", key="btn_save_portal"):
                     if _save_whole_sheet(MS_PORTAL, e2, REQUIRED_HEADERS[MS_PORTAL]):
-                        _clear_all_caches()
-                        flash("Portals saved.")
+                        _clear_all_caches(); st.success("Portals saved.")
             with t3:
                 s2 = _load_for_editor(MS_STATUS, REQUIRED_HEADERS[MS_STATUS])
                 e3 = _data_editor(s2, "ed_status")
                 if st.button("Save Status", key="btn_save_status"):
                     if _save_whole_sheet(MS_STATUS, e3, REQUIRED_HEADERS[MS_STATUS]):
-                        _clear_all_caches()
-                        flash("Status saved.")
+                        _clear_all_caches(); st.success("Status saved.")
 
         # ---------- Modules ----------
         with tabs[7]:
             st.subheader("Modules (catalog)")
             mdf = _load_for_editor(MS_MODULES, REQUIRED_HEADERS[MS_MODULES])
+            # validate JSON column visually
             left, right = st.columns([2,1])
             with left:
                 colconf = {
@@ -1905,7 +1893,7 @@ def _render_masters_admin_page():
                     "SheetName": st.column_config.TextColumn("SheetName", help="Defaults to Data_<Module>"),
                     "DefaultEnabled": st.column_config.CheckboxColumn("DefaultEnabled"),
                     "DupKeys": st.column_config.TextColumn("DupKeys", help="Pipe-separated keys e.g. ERXNumber|SubmissionDate|NetAmount"),
-                    "NumericFieldsJSON": st.column_config.TextColumn('NumericFieldsJSON', help='JSON array e.g. ["NetAmount","PatientShare"]')
+                    "NumericFieldsJSON": st.column_config.TextColumn('NumericFieldsJSON', help='JSON array of numeric fields e.g. ["NetAmount","PatientShare"]')
                 }
                 mdf_edit = _data_editor(mdf, "ed_modules", column_config=colconf,
                                         help_text="After save, click Reconcile to auto-create sheets + seed FormSchema.")
@@ -1913,30 +1901,30 @@ def _render_masters_admin_page():
                 st.markdown("**Validation**")
                 bad = []
                 if not mdf_edit.empty and "NumericFieldsJSON" in mdf_edit.columns:
-                    for i, v in enumerate(mdf_edit["NumericFieldsJSON"].astype(str), start=2):
+                    for i, v in enumerate(mdf_edit["NumericFieldsJSON"].astype(str), start=2):  # +1 header +1 index
                         ok, msg = _json_validate_field(v)
                         if not ok: bad.append(f"row {i}: {msg}")
                 st.write("✅ All good" if not bad else "❌ " + " | ".join(bad))
-
+            
             a1, a2 = st.columns([1,1])
             with a1:
                 if st.button("Save Modules", type="primary", key="btn_save_modules"):
+                    # sanitize JSON column
                     if "NumericFieldsJSON" in mdf_edit.columns:
-                        mdf_edit["NumericFieldsJSON"] = mdf_edit["NumericFieldsJSON"].map(
-                            lambda t: _json_validate_field(str(t))[1] if _json_validate_field(str(t))[0] else "[]"
-                        )
+                        mdf_edit["NumericFieldsJSON"] = mdf_edit["NumericFieldsJSON"].map(lambda t: _json_validate_field(str(t))[1] if _json_validate_field(str(t))[0] else "[]")
                     if _save_whole_sheet(MS_MODULES, mdf_edit, REQUIRED_HEADERS[MS_MODULES]):
                         _ensure_module_sheets_exist()
                         _clear_all_caches()
-                        flash("Modules saved and reconciled.")
+                        st.success("Modules saved and reconciled.")
             with a2:
                 if st.button("Reconcile module sheets & seed schema", key="btn_reconcile_mods"):
                     _ensure_module_sheets_exist()
+                    # seed missing schema for currently selected client
                     cat = modules_catalog_df()
                     for _, r in cat.iterrows():
                         seed_form_schema_for_module(str(r["Module"]), CLIENT_ID)
                     schema_df.clear()
-                    flash("Reconciled. Missing sheets created; schema seeded where needed.")
+                    st.success("Reconciled. Missing sheets created; schema seeded where needed.")
 
         # ---------- Client Modules ----------
         with tabs[8]:
@@ -1953,13 +1941,14 @@ def _render_masters_admin_page():
             with b1:
                 if st.button("Save Client Modules", type="primary", key="btn_save_client_modules"):
                     if _save_whole_sheet(MS_CLIENT_MODULES, ed, REQUIRED_HEADERS[MS_CLIENT_MODULES]):
-                        _clear_all_caches()
-                        flash("Client-module map saved.")
+                        _clear_all_caches(); st.success("Client-module map saved.")
             with b2:
                 if st.button("Auto-enable all catalog modules for this Client", key="btn_auto_enable_cm"):
                     cat = modules_catalog_df()
                     cur = _load_for_editor(MS_CLIENT_MODULES, REQUIRED_HEADERS[MS_CLIENT_MODULES])
-                    want = [{"ClientID": CLIENT_ID, "Module": m, "Enabled": True} for m in cat["Module"].astype(str)]
+                    want = []
+                    for m in cat["Module"].astype(str):
+                        want.append({"ClientID": CLIENT_ID, "Module": m, "Enabled": True})
                     base = pd.DataFrame(want)
                     if not cur.empty:
                         others = cur[cur["ClientID"] != CLIENT_ID]
@@ -1967,20 +1956,20 @@ def _render_masters_admin_page():
                     else:
                         out = base
                     if _save_whole_sheet(MS_CLIENT_MODULES, out, REQUIRED_HEADERS[MS_CLIENT_MODULES]):
-                        _clear_all_caches()
-                        flash("Enabled all modules for current client.")
+                        _clear_all_caches(); st.success("Enabled all modules for current client.")
 
         # ---------- Form Schema ----------
         with tabs[9]:
             st.subheader("Form Schema (fields editor)")
             sdf_all = _load_for_editor(MS_FORM_SCHEMA, REQUIRED_HEADERS[MS_FORM_SCHEMA])
 
+            # Filters to work on a subset (you still can Save-All variant too)
             clients = sorted(sdf_all["ClientID"].astype(str).unique().tolist() + ["ALL","DEFAULT"])
             mods = sorted(modules_catalog_df()["Module"].astype(str).unique().tolist())
             c1, c2, c3 = st.columns([1,1,1])
             with c1: sel_client = st.selectbox("ClientID", ["<All>"] + clients, index=(["<All>"]+clients).index(CLIENT_ID) if CLIENT_ID in clients else 0)
             with c2: sel_module = st.selectbox("Module", ["<All>"] + mods)
-            with c3: st.write("")
+            with c3: st.write("")  # spacer
 
             mask = pd.Series(True, index=sdf_all.index)
             if sel_client != "<All>": mask &= (sdf_all["ClientID"].astype(str) == sel_client)
@@ -2002,8 +1991,9 @@ def _render_masters_admin_page():
                 "ReadOnlyRoles":  st.column_config.TextColumn("ReadOnlyRoles", help="Roles read-only e.g. 'Admin|User'")
             }
             edited = _data_editor(subset, "ed_schema", column_config=colconf,
-                                  help_text="Use Options: MS:Insurance, MS:Status, L:One|Two, or JSON [\"A\",\"B\"].")
+                                  help_text="Add/remove/edit fields freely. Use Options: MS:Insurance, MS:Status, L:One|Two, or JSON [\"A\",\"B\"].")
 
+            # Validate subset
             problems = _validate_schema_block(edited)
             if problems:
                 st.error(" • " + "\n • ".join(problems))
@@ -2013,16 +2003,17 @@ def _render_masters_admin_page():
             s1, s2, s3 = st.columns([1,1,1])
             with s1:
                 if st.button("Save Edited Subset", type="primary", key="btn_save_schema_subset", disabled=bool(problems)):
+                    # merge with untouched rows
                     remainder = sdf_all[~mask].copy()
-                    merged = pd.concat([remainder, edited], ignore_index=True).sort_values(["ClientID","Module","Order","FieldKey"])
+                    merged = pd.concat([remainder, edited], ignore_index=True)
+                    # sort for determinism
+                    merged = merged.sort_values(["ClientID","Module","Order","FieldKey"])
                     if _save_whole_sheet(MS_FORM_SCHEMA, merged, REQUIRED_HEADERS[MS_FORM_SCHEMA]):
-                        _clear_all_caches()
-                        flash("Schema subset saved.")
+                        _clear_all_caches(); st.success("Schema subset saved.")
             with s2:
                 if st.button("Save ALL Schema", key="btn_save_schema_all"):
                     if _save_whole_sheet(MS_FORM_SCHEMA, edited if edited.shape[0]==sdf_all.shape[0] else sdf_all, REQUIRED_HEADERS[MS_FORM_SCHEMA]):
-                        _clear_all_caches()
-                        flash("Entire schema saved.")
+                        _clear_all_caches(); st.success("Entire schema saved.")
             with s3:
                 if st.button("Seed defaults for selected Module", key="btn_seed_schema_sel"):
                     target_client = (sel_client if sel_client != "<All>" else (CLIENT_ID or "DEFAULT"))
@@ -2032,8 +2023,7 @@ def _render_masters_admin_page():
                     else:
                         seed_form_schema_for_module(target_module, target_client or "DEFAULT")
                         schema_df.clear()
-                        flash("Seeded missing fields for selection.")
-
+                        st.success("Seeded missing fields for selection.")
 
 def _render_bulk_import_insurance_page():
     with intake_page("Bulk Import Insurance", "Upload CSV with Code,Name", badge=ROLE):
@@ -2050,28 +2040,32 @@ def _render_bulk_import_insurance_page():
             except Exception:
                 w.batch_clear(["A:Z"])
             w.update("A1", data)
+            st.success(f"Imported {len(df)} rows.")
             insurance_master.clear()
-            flash(f"Imported {len(df)} rows into Insurance.")
         except Exception as e:
             st.error(f"Import failed: {e}")
-
 
 def _render_summary_page():
     with intake_page("Summary", "Submission Mode → Date × Pharmacy (subtotals + grand total)", badge=ROLE):
         if not module_pairs:
             st.info("No modules enabled."); return
 
+        # 1) Pick module (Summary works per selected module/sheet)
         mod = st.selectbox("Module", [m for m,_ in module_pairs], index=0, key="sum_mod")
         sheet = dict(module_pairs)[mod]
 
+        # ---- Special summary for Clinic Purchase ----
         if str(mod).strip() == CLINIC_PURCHASE_MODULE_KEY:
             _render_clinic_purchase_summary(sheet)
             return
 
+        
+        # 2) Load + scope (client + pharmacies + per-user like Update Record)
         df = _apply_common_filters(load_module_df(sheet), scope_to_user=True)
         if df is None or df.empty:
             st.info("No data found for your scope."); return
 
+        # 3) Column resolver (tolerant to variants / missing headers)
         def _find_col(cands: list[str]) -> str | None:
             lowmap = {c.strip().lower(): c for c in df.columns}
             for c in cands:
@@ -2092,9 +2086,11 @@ def _render_summary_page():
         col_ins_name = _find_col(["InsuranceName","Insurance"])
         col_ins_code = _find_col(["InsuranceCode","Insurance Code"])
 
+        # safe defaults for pivot axes
         if not col_pharm: df["PharmacyName"] = "Unknown"; col_pharm = "PharmacyName"
         if not col_mode:  df["SubmissionMode"] = "Unknown"; col_mode = "SubmissionMode"
 
+        # 4) Filters UI (exactly like Update Record) + pharmacy + date + global search
         with st.expander("Filters", expanded=True):
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -2117,9 +2113,11 @@ def _render_summary_page():
                     opts = [""] + sorted([x for x in df[col_status].astype(str).unique() if x])
                     f_status = st.selectbox("Status", opts, index=0, key="sum_status")
 
+            # Pharmacy multi-select (from currently scoped df)
             ph_opts = sorted([x for x in df[col_pharm].astype(str).unique() if x]) if col_pharm else []
             sel_pharm = st.multiselect("Pharmacy", ph_opts, key="sum_pharm")
 
+        # 5) Apply filters safely (no KeyErrors if blank/missing)
         mask = pd.Series(True, index=df.index)
 
         def _and_contains(col: str | None, needle: str):
@@ -2133,6 +2131,7 @@ def _render_summary_page():
         _and_contains(col_approval, f_approval)
         _and_contains(col_member,   f_member)
 
+        # insurance contains (name OR code)
         if f_insurance and (col_ins_name or col_ins_code):
             ins_mask = pd.Series(False, index=df.index)
             if col_ins_name:
@@ -2153,13 +2152,13 @@ def _render_summary_page():
 
         if q.strip():
             esc = re.escape(q.strip())
-            hay = df.astype(str).agg(" ".join, axis=1)
-            mask &= hay.str_contains(esc, case=False, na=False)
+            mask &= df.apply(lambda r: r.astype(str).str.contains(esc, case=False, na=False).any(), axis=1)
 
         df = df[mask].copy()
         if df.empty:
             st.warning("No rows match the filters."); return
 
+        # 6) Quick metrics for the filtered set (keeps current Summary feel)
         total_rows = len(df)
         approved = int((df.get(col_status, "").astype(str).str.lower() == "approved").sum()) if col_status else 0
         pending  = int((df.get(col_status, "").astype(str).str.lower() == "pending").sum())  if col_status else 0
@@ -2168,6 +2167,8 @@ def _render_summary_page():
         m2.metric("Approved", approved)
         m3.metric("Pending", pending)
 
+        # 7) Choose what to summarize (Row count vs numeric field)
+        #    Prefer NetAmount, else Modules.NumericFieldsJSON, else auto-detect numeric columns
         value_options = ["Row count"]
         preferred = None
         cat = modules_catalog_df()
@@ -2183,8 +2184,9 @@ def _render_summary_page():
                         if preferred is None: preferred = c
             except Exception:
                 pass
+            # auto-detect other numeric-ish columns
             for c in df.columns:
-                if c in ("Timestamp", col_date, col_pharm, col_mode, col_status, col_claim, col_eid, col_patient, col_approval, col_member):
+                if c in ("Timestamp", col_date, col_pharm, col_mode, col_status, col_claim, col_eid, col_patient, col_approval, col_member): 
                     continue
                 ser = pd.to_numeric(df[c], errors="coerce")
                 if ser.notna().any() and c not in value_options:
@@ -2193,15 +2195,17 @@ def _render_summary_page():
 
         summarize_by = st.selectbox("Summarize by", value_options, index=(value_options.index(preferred) if preferred in value_options else 0), key="sum_value_by")
 
+        # 8) Normalize types needed for pivot
         if col_date:
             df["_Date"] = parse_date(df[col_date]).dt.date
         else:
-            df["_Date"] = date.today()
+            df["_Date"] = date.today()  # dummy single date if missing
         df["_Mode"]  = df[col_mode].replace("", "Unknown") if col_mode else "Unknown"
         df["_Pharm"] = df[col_pharm].replace("", "Unknown") if col_pharm else "Unknown"
 
+        # 9) Build pivot (SubmissionMode → SubmissionDate × PharmacyName) with per-mode subtotal + grand total
         def _build_pivot(values_col: str | None):
-            if values_col is None:
+            if values_col is None:  # row count
                 base = pd.pivot_table(
                     df, index=["_Mode","_Date"], columns="_Pharm",
                     aggfunc="size", fill_value=0
@@ -2213,8 +2217,10 @@ def _render_summary_page():
                     tmp, index=["_Mode","_Date"], columns="_Pharm",
                     values="_val", aggfunc="sum", fill_value=0.0
                 ).sort_index(level=[0,1])
+            # order columns alphabetically
             base = base.reindex(sorted(base.columns, key=lambda x: str(x)), axis=1)
 
+            # Per-mode subtotal
             blocks = []
             for mode, chunk in base.groupby(level=0, sort=False):
                 subtotal = pd.DataFrame([chunk.sum(numeric_only=True)])
@@ -2222,12 +2228,14 @@ def _render_summary_page():
                 blocks.append(pd.concat([subtotal, chunk]))
             combined = pd.concat(blocks) if blocks else base
 
+            # Grand total
             grand = pd.DataFrame([base.sum(numeric_only=True)])
             grand.index = pd.MultiIndex.from_tuples([("Grand Total","")], names=base.index.names)
             combined = pd.concat([combined, grand])
 
             combined = combined.reset_index().rename(columns={"_Mode":"SubmissionMode","_Date":"SubmissionDate"})
             num_cols = [c for c in combined.columns if c not in ("SubmissionMode","SubmissionDate")]
+            # nice rounding only for floats
             for c in num_cols:
                 if pd.api.types.is_float_dtype(combined[c]):
                     combined[c] = combined[c].round(2)
@@ -2239,6 +2247,7 @@ def _render_summary_page():
         st.caption("Rows: **Submission Mode → (— Total — then dates)** · Columns: **Pharmacy Name** · Values: **Row count** or **sum of selected field**. Grand Total at bottom.")
         st.dataframe(pvt, use_container_width=True, hide_index=True)
 
+        # 10) Excel download
         out = io.BytesIO()
         with pd.ExcelWriter(out, engine="openpyxl") as xw:
             pvt.to_excel(xw, sheet_name="Summary", index=False)
@@ -2248,7 +2257,6 @@ def _render_summary_page():
 
         if st.button("🔄 Refresh summary", key="sum_refresh"):
             load_module_df.clear(); st.rerun()
-
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _clinic_opening_map() -> dict:
@@ -2260,13 +2268,13 @@ def _clinic_opening_map() -> dict:
     except Exception:
         return {}
 
-
 def _render_clinic_purchase_summary(sheet_name: str):
     import numpy as np
     df = _apply_common_filters(load_module_df(sheet_name), scope_to_user=False)
     if df.empty:
         st.info("No Clinic Purchase data yet."); return
 
+    # Normalize
     for c in ("Clinic_Qty","SP_Qty","Util_Qty"):
         if c not in df.columns: df[c] = 0
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
@@ -2280,10 +2288,12 @@ def _render_clinic_purchase_summary(sheet_name: str):
     pm = _clinic_items_price_map()
     df["UnitPrice"] = df["Item"].map(pm).fillna(0.0)
 
+    # Values (derive even if sheet has old blanks)
     df["Clinic_Value"] = (df["Clinic_Qty"] * df["UnitPrice"]).round(2)
     df["SP_Value"]     = (df["SP_Qty"]     * df["UnitPrice"]).round(2)
     df["Util_Value"]   = (df["Util_Qty"]   * df["UnitPrice"]).round(2)
 
+    # Filters UI
     with st.expander("Filters — Clinic Purchase", expanded=True):
         dmin = df["Date"].min() if df["Date"].notna().any() else date.today()
         dmax = df["Date"].max() if df["Date"].notna().any() else date.today()
@@ -2297,6 +2307,7 @@ def _render_clinic_purchase_summary(sheet_name: str):
     if df.empty:
         st.warning("No rows after filters."); return
 
+    # Running Instock by item/date
     opening = _clinic_opening_map()
     rows = []
     for item, grp in df.groupby("Item"):
@@ -2316,10 +2327,12 @@ def _render_clinic_purchase_summary(sheet_name: str):
             prev = instock_qty
     out = pd.DataFrame(rows)
 
+    # Per-day total rows
     num_cols = ["Clinic_Qty","Clinic_Value","SP_Qty","SP_Value","Util_Qty","Util_Value","Instock_Qty","Instock_Value"]
     per_day = out.groupby("Date")[num_cols].sum().reset_index()
     per_day.insert(1, "Item", "Total")
 
+    # Grand Total row
     grand = {c: float(out[c].sum()) for c in num_cols}
     grand.update({"Date": "Grand Total", "Item": ""})
 
@@ -2327,9 +2340,8 @@ def _render_clinic_purchase_summary(sheet_name: str):
     final = pd.concat([pd.DataFrame([grand]), per_day[display_cols], out[display_cols]], ignore_index=True)
 
     st.dataframe(final, use_container_width=True, hide_index=True)
-    csv = final.to_csv(index=False).encode("utf-8-sig")
+    csv = final.to_csv(index=False).encode("utf-8")
     st.download_button("Download CSV (Clinic Purchase Summary)", csv, f"ClinicPurchase_Summary_{datetime.now():%Y%m%d_%H%M%S}.csv", "text/csv")
-
 
 def _render_update_record_page():
     with intake_page("Update Record", "Edit a single row", badge=ROLE):
@@ -2339,11 +2351,14 @@ def _render_update_record_page():
         mod = st.selectbox("Module", [m for m,_ in module_pairs], index=0, key="upd_mod")
         sheet = dict(module_pairs)[mod]
 
+        # Load and apply ACLs (client/pharmacy + per-user)
         df = load_module_df(sheet)
         df = _apply_common_filters(df, scope_to_user=True)
+
         if df.empty:
             st.info("No rows to edit for your scope."); return
 
+        # ------- Flexible filters (ClaimID, EID, Patient, Approval, Member, Insurance, Status)
         def _find_col(cands: list[str]) -> str | None:
             lowmap = {c.strip().lower(): c for c in df.columns}
             for c in cands:
@@ -2380,11 +2395,14 @@ def _render_update_record_page():
                 else:
                     f_status = ""
 
+        # ---------- Apply filters (safe even when EVERYTHING is blank) ----------
+        # Start with a True vector aligned to the dataframe index
         mask = pd.Series(True, index=df.index)
 
         def _and_contains(col: str | None, needle: str):
             nonlocal mask
             if col and needle and needle.strip():
+                # case-insensitive contains; escape to avoid regex surprises
                 mask &= df[col].astype(str).str.contains(re.escape(needle.strip()), case=False, na=False)
 
         _and_contains(col_claim,   f_claim)
@@ -2398,21 +2416,27 @@ def _render_update_record_page():
             mask &= (df[col_status].astype(str) == f_status)
 
         df = df[mask]
+        # -----------------------------------------------------------------------
 
+        # Show preview with TRUE sheet indices (Row# = sheet row index = dataframe index + 2)
         preview = df.copy()
-        preview.insert(0, "Row#", preview.index)
+        preview.insert(0, "Row#", preview.index)  # original DF index
         st.dataframe(preview, use_container_width=True, hide_index=True)
 
+        # Row selector uses the REAL index values, so updates hit the correct sheet row.
         row_choices = sorted(df.index.tolist())
         selected_row_index = st.selectbox("Row to edit (Row# from table above)", row_choices, format_func=str, key="upd_row_idx")
         row_current = df.loc[selected_row_index]
 
+        # Build editors for editable columns
         non_editable = {"Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module"}
         editable_cols = [c for c in df.columns if c not in non_editable]
 
+        # 3-column grid like other modules
         cols = st.columns(3, gap="large")
-
+        
         def _is_numbery(col_name: str) -> bool:
+            # Prefer explicit config from Modules.NumericFieldsJSON (case-insensitive match)
             try:
                 cat = modules_catalog_df()
                 row = cat[cat["Module"] == mod]
@@ -2421,12 +2445,13 @@ def _render_update_record_page():
                     return True
             except Exception:
                 pass
+            # Fallback: data-driven check
             if col_name not in df.columns:
                 return False
             s = pd.to_numeric(df[col_name], errors="coerce")
             nonblank = df[col_name].astype(str).str.strip().ne("").sum()
             return s.notna().sum() >= 0.7 * max(nonblank, 1)
-
+        
         edits = {}
         for i, c in enumerate(editable_cols):
             low = c.lower()
@@ -2446,6 +2471,7 @@ def _render_update_record_page():
                 elif low in {"remark","notes","note","comments","comment"}:
                     edits[c] = st.text_area(c, value=str(val), key=f"upd_{c}")
                 elif _is_numbery(c):
+
                     try:
                         num = float(str(val).replace(",", ""))
                     except Exception:
@@ -2457,10 +2483,13 @@ def _render_update_record_page():
         if st.button("Save changes", type="primary", key="upd_save"):
             w = ws(sheet)
             header = w.row_values(1)
+            # Convert date widgets back to yyyy-mm-dd
             for k, v in edits.items():
                 if isinstance(v, (date, datetime)):
                     edits[k] = pd.to_datetime(v).strftime("%d/%m/%Y")
-            sheet_row_num = int(selected_row_index) + 2
+
+            # Read current row from the sheet, merge edits, and update
+            sheet_row_num = int(selected_row_index) + 2  # header row + 1-based
             current_row_vals = w.row_values(sheet_row_num)
             current_row_vals += [""] * (len(header) - len(current_row_vals))
             cur_map = {h: (current_row_vals[i] if i < len(current_row_vals) else "") for i, h in enumerate(header)}
@@ -2471,10 +2500,11 @@ def _render_update_record_page():
                 if isinstance(val, str):
                     val = _sanitize_cell(val)
                 cur_map[c] = val
-            w.update(f"A{sheet_row_num}", [[cur_map.get(h, "") for h in header]])
-            load_module_df.clear()
-            flash("Row updated.")
 
+            w.update(f"A{sheet_row_num}", [[cur_map.get(h, "") for h in header]])
+            st.success("Row updated.")
+            load_module_df.clear()
+            st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Navigation (dynamic modules + static pages)
@@ -2490,14 +2520,13 @@ def nav_pages_for(role: str):
         return module_pairs, ["View / Export","Summary"]
     return module_pairs, ["Summary"]
 
-# Ensure Clinic Purchase assets exist; seed + cache clear ONCE per session (no unconditional clears)
-if not st.session_state.get("_seed_once_done"):
-    seed_clinic_purchase_assets_for_client(CLIENT_ID)
-    _clear_all_caches()  # single time right after potential seeding
-    st.session_state["_seed_once_done"] = True
+# One-time ensure Clinic Purchase module + sheets exist/enabled for this client
+seed_clinic_purchase_assets_for_client(CLIENT_ID)
+_clear_all_caches()  # make sure newly seeded rows are visible to this session
 
 module_pairs, static_pages = nav_pages_for(ROLE)
 
+# Remember what the user clicked last so we can switch views naturally
 st.session_state.setdefault("_nav_active", "module" if module_pairs else "static")
 
 def _pick_module():
@@ -2520,22 +2549,25 @@ module_choice = (
 
 st.sidebar.markdown("---")
 
+# Rename section and remove the dummy "—" option.
+# Use a selectbox with a placeholder (no default selection).
 try:
     static_choice = st.sidebar.selectbox(
         "Tools & Reports",
         static_pages,
-        index=None,
+        index=None,                         # show placeholder until user picks
         placeholder="Open a page…",
         key="nav_page",
         on_change=_pick_static,
     )
 except TypeError:
+    # Older Streamlit fallback (no index=None support)
     _items = ["<choose…>"] + static_pages
     pick = st.sidebar.selectbox("Tools & Reports", _items, index=0, key="nav_page_fallback", on_change=_pick_static)
     static_choice = None if pick == "<choose…>" else pick
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Navigation dispatcher (reliable View/Export)
+# Navigation dispatcher
 # ─────────────────────────────────────────────────────────────────────────────
 active = st.session_state.get("_nav_active", "module")
 
@@ -2553,6 +2585,7 @@ if active == "static" and static_choice:
     elif static_choice == "Update Record":
         _render_update_record_page()
 else:
+    # Show the selected module (default behavior)
     if module_choice:
         sheet_name = dict(module_pairs).get(module_choice)
         if module_choice.strip().lower() == "pharmacy":
@@ -2563,3 +2596,4 @@ else:
             _render_dynamic_form(module_choice, sheet_name, CLIENT_ID, ROLE)
     else:
         st.info("No modules enabled. Choose a page on the left.")
+
