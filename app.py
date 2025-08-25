@@ -1761,12 +1761,11 @@ def _render_masters_admin_page():
             # --- Per-user Module Access ---------------------------------------
             st.divider()
             available_users   = udf_view_edit["username"].astype(str).tolist() if not udf_view_edit.empty else []
-            available_modules = sorted(set(
-                modules_catalog_df()["Module"].astype(str).tolist()
-                + STATIC_PAGES  # <- adds Tools & Reports to the picker
-            ))
-
-        
+            # inside _render_masters_admin_page(), Users tab, “Per-user Module Access” block
+            available_modules = sorted(
+                set(modules_catalog_df()["Module"].astype(str).tolist() + STATIC_PAGES)
+            )
+      
             umdf = _load_for_editor(MS_USER_MODULES, REQUIRED_HEADERS[MS_USER_MODULES])
         
             colA, colB = st.columns([1,2])
