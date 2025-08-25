@@ -108,7 +108,7 @@ CP_COLS = [
 
 # --- Unified Look (theme + wrappers) ---
 def apply_intake_theme(page_title: str = "RCM Intake", page_icon: str = "🧾"):
-    st.set_page_config(page_title=page_title, page_icon=page_icon, layout="wide")
+    # DO NOT call st.set_page_config here
     st.markdown("""
     <style>
       :root{
