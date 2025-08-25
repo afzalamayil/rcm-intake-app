@@ -166,9 +166,16 @@ apply_intake_theme("RCM Intake")
 LOGO_PATH = "assets/logo.png"
 st.markdown("""
 <style>
-[data-testid="stToolbar"] { display:none !important; }
-header [data-testid="baseButton-header"] { display:none !important; }
+/* Keep header visible so the sidebar toggle is available */
+header { display:flex !important; }
+
+/* It’s fine to hide the “viewer badge” */
+.viewerBadge_link__1S137 { display:none !important; }
+
+/* If you still want a clean look, you can hide deploy/action buttons only */
 .stAppDeployButton, [data-testid="stActionMenu"] { display:none !important; }
+/* DO NOT hide [data-testid="stToolbar"] or the whole header */
+
 </style>
 """, unsafe_allow_html=True)
 
