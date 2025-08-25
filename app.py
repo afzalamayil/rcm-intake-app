@@ -1761,7 +1761,11 @@ def _render_masters_admin_page():
             # --- Per-user Module Access ---------------------------------------
             st.divider()
             available_users   = udf_view_edit["username"].astype(str).tolist() if not udf_view_edit.empty else []
-            available_modules = modules_catalog_df()["Module"].astype(str).tolist()
+            available_modules = sorted(set(
+                modules_catalog_df()["Module"].astype(str).tolist()
+                + STATIC_PAGES  # <- adds Tools & Reports to the picker
+            ))
+
         
             umdf = _load_for_editor(MS_USER_MODULES, REQUIRED_HEADERS[MS_USER_MODULES])
         
@@ -2516,13 +2520,13 @@ STATIC_PAGES = ["View / Export", "Email / WhatsApp", "Masters Admin",
 def nav_pages_for(role: str):
     module_pairs = modules_enabled_for(CLIENT_ID, role)  # dynamic modules
 
-    # default by role
+    # default by role (backwards compatible)
     r = (role or "").strip().lower()
     base_pages = (STATIC_PAGES if r in ("super admin","superadmin")
                   else ["View / Export","Summary"] if r == "admin"
                   else ["Summary"])
 
-    # NEW: allow per-user overrides via UserModules (treat tool names as modules)
+    # add any Tools granted in UserModules (treat tool names as modules)
     um = user_modules_df()
     extra = []
     if not um.empty:
