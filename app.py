@@ -30,6 +30,14 @@ from datetime import datetime, date, timedelta
 import uuid
 import pandas as pd
 import streamlit as st
+
+st.set_page_config(
+    page_title="RCM Intake",
+    page_icon="💊",
+    layout="wide",
+    initial_sidebar_state="expanded"  # 👈 this makes sidebar always visible
+)
+
 import gspread
 from google.oauth2.service_account import Credentials
 import requests
