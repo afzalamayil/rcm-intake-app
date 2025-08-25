@@ -1767,8 +1767,12 @@ def _render_masters_admin_page():
                                     _clear_all_caches(); st.success("Password updated.")
         
             # --- Per-user Module Access ---------------------------------------
-            st.divider()
-            available_users   = udf_view_edit["username"].astype(str).tolist() if not udf_view_edit.empty else []
+            # Build options safely: union of dynamic modules + static tools
+            cat = modules_catalog_df()
+            mods = cat["Module"].astype(str).tolist() if (cat is not None and not cat.empty and "Module" in cat.columns) else []
+            tools = list(globals().get("STATIC_PAGES", []))   # fallback-safe
+            available_modules = sorted(set(mods) | set(tools))
+
             # inside _render_masters_admin_page(), Users tab, “Per-user Module Access” block
             available_modules = sorted(
                 set(modules_catalog_df()["Module"].astype(str).tolist() + STATIC_PAGES)
@@ -1799,6 +1803,8 @@ def _render_masters_admin_page():
                     others = umdf[umdf["Username"].astype(str).str.lower() != str(sel_user).lower()].copy()
                     out = pd.concat([others, base], ignore_index=True)
                     if _save_whole_sheet(MS_USER_MODULES, out, REQUIRED_HEADERS[MS_USER_MODULES]):
+                        _clear_all_caches(); st.success("Per-user modules saved.")
+                        st.rerun()
                         _clear_all_caches(); st.success("Per-user modules saved.")
             with row2:
                 if st.button("Open raw editor (advanced)", key="btn_open_um_editor"):
