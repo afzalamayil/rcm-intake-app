@@ -2510,16 +2510,27 @@ def _render_update_record_page():
 # ─────────────────────────────────────────────────────────────────────────────
 # Navigation (dynamic modules + static pages)
 # ─────────────────────────────────────────────────────────────────────────────
-STATIC_PAGES = ["View / Export", "Email / WhatsApp", "Masters Admin", "Bulk Import Insurance", "Summary", "Update Record"]
+STATIC_PAGES = ["View / Export", "Email / WhatsApp", "Masters Admin",
+                "Bulk Import Insurance", "Summary", "Update Record"]
 
 def nav_pages_for(role: str):
-    module_pairs = modules_enabled_for(CLIENT_ID, role)  # [(Module, SheetName)]
-    r = role.strip().lower()
-    if r in ("super admin","superadmin"):
-        return module_pairs, STATIC_PAGES
-    if r == "admin":
-        return module_pairs, ["View / Export","Summary"]
-    return module_pairs, ["Summary"]
+    module_pairs = modules_enabled_for(CLIENT_ID, role)  # dynamic modules
+
+    # default by role
+    r = (role or "").strip().lower()
+    base_pages = (STATIC_PAGES if r in ("super admin","superadmin")
+                  else ["View / Export","Summary"] if r == "admin"
+                  else ["Summary"])
+
+    # NEW: allow per-user overrides via UserModules (treat tool names as modules)
+    um = user_modules_df()
+    extra = []
+    if not um.empty:
+        mine = um[(um["Username"].str.lower() == str(username).lower()) & (um["Enabled"])]
+        extra = [m for m in mine["Module"].astype(str).tolist() if m in STATIC_PAGES]
+
+    pages = sorted(set(base_pages) | set(extra))
+    return module_pairs, pages
 
 # One-time ensure Clinic Purchase module + sheets exist/enabled for this client
 seed_clinic_purchase_assets_for_client(CLIENT_ID)
