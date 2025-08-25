@@ -1721,17 +1721,23 @@ def _render_email_whatsapp_page():
         st.caption("Copy/paste into your mail/WhatsApp client.")
 
 def _render_masters_admin_page():
-    with intake_page("Masters Admin", "Everything editable here — no need to open Google Sheets", badge=ROLE):
+    with intake_page(
+        "Masters Admin",
+        "Everything editable here — no need to open Google Sheets",
+        badge=ROLE,
+    ):
         tabs = st.tabs([
-            "Users","Clients","Client Contacts","Pharmacies","Insurance","Doctors",
-            "Simple Lists","Modules","Client Modules","Form Schema"
+            "Users", "Clients", "Client Contacts", "Pharmacies",
+            "Insurance", "Doctors", "Simple Lists",
+            "Modules", "Client Modules", "Form Schema"
         ])
 
-        # ---------- Users (Super Admin UX: manage users & reset passwords) ----------
+        # ───────────────────────────── Users ─────────────────────────────
         with tabs[0]:
             st.subheader("Users")
+
             udf = _load_for_editor(USERS_TAB, REQUIRED_HEADERS[USERS_TAB])
-        
+
             # Show everything except password; keep password only for saving/merge
             view_cols = [c for c in udf.columns if c != "password"]
             colconf = {
@@ -1746,21 +1752,27 @@ def _render_masters_admin_page():
                 udf[view_cols], "ed_users", column_config=colconf,
                 help_text="Password hidden here; use Reset Password tool below.", height=None
             )
-        
-            rowA, rowB = st.columns([1,1])
+
+            rowA, rowB = st.columns([1, 1])
+
+            # Save edited user rows (merging back hidden password hashes)
             with rowA:
                 if st.button("Save Users", type="primary", key="btn_save_users"):
-                    # Merge edited non-password cols back into full df; preserve existing password hashes
                     to_save = udf.copy()
                     for col in view_cols:
                         to_save[col] = udf_view_edit[col]
                     if _save_whole_sheet(USERS_TAB, to_save, REQUIRED_HEADERS[USERS_TAB]):
-                        _clear_all_caches(); st.success("Users saved.")
-            
+                        _clear_all_caches()
+                        st.success("Users saved.")
+
+            # Reset password (writes bcrypt hash)
             with rowB:
                 with st.popover("Reset Password"):
                     st.caption("This stores a new bcrypt hash into the password field.")
-                    pick_user = st.selectbox("User", udf_view_edit["username"].astype(str).tolist() if not udf_view_edit.empty else [])
+                    pick_user = st.selectbox(
+                        "User",
+                        udf_view_edit["username"].astype(str).tolist() if not udf_view_edit.empty else []
+                    )
                     new_pwd = st.text_input("New password", type="password")
                     if st.button("Apply reset", key="btn_pwd_reset"):
                         if not pick_user or not new_pwd:
@@ -1771,64 +1783,95 @@ def _render_masters_admin_page():
                             if len(idx) > 0:
                                 udf.loc[idx[0], "password"] = hashed
                                 if _save_whole_sheet(USERS_TAB, udf, REQUIRED_HEADERS[USERS_TAB]):
-                                    _clear_all_caches(); st.success("Password updated.")
-        
-            # --- Per-user Module Access ---------------------------------------
-            # Build options safely: union of dynamic modules + static tools
-            cat = modules_catalog_df()
-            mods = cat["Module"].astype(str).tolist() if (cat is not None and not cat.empty and "Module" in cat.columns) else []
-            tools = list(globals().get("STATIC_PAGES", []))   # fallback-safe
+                                    _clear_all_caches()
+                                    st.success("Password updated.")
+
+            # Per-user Module Access — SAFETY PATCH APPLIED HERE
+            st.markdown("---")
+            st.subheader("Per-user Module Access")
+
+            # Build available modules = dynamic modules ∪ static tools
+            try:
+                cat = modules_catalog_df()
+                mods = cat["Module"].astype(str).tolist() if (cat is not None and not cat.empty and "Module" in cat.columns) else []
+            except Exception:
+                mods = []
+            tools = list(globals().get("STATIC_PAGES", []))
             available_modules = sorted(set(mods) | set(tools))
 
-            # inside _render_masters_admin_page(), Users tab, “Per-user Module Access” block
-            available_modules = sorted(
-                set(modules_catalog_df()["Module"].astype(str).tolist() + STATIC_PAGES)
-            )
-      
             umdf = _load_for_editor(MS_USER_MODULES, REQUIRED_HEADERS[MS_USER_MODULES])
-        
-            colA, colB = st.columns([1,2])
-            with colA:
-                sel_user = st.selectbox("User", available_users, key="um_sel_user")
-            with colB:
-                cur = []
-                if not umdf.empty and sel_user:
-                    cur = umdf[
-                        (umdf["Username"].astype(str).str.lower() == str(sel_user).lower()) &
-                        (_to_bool_series(umdf["Enabled"]))
-                    ]["Module"].astype(str).tolist()
-                chosen = st.multiselect("Enabled modules", options=available_modules, default=cur, key="um_chosen")
-        
-            row1, row2 = st.columns([1,1])
-            with row1:
-                if st.button("Save user module access", type="primary", key="btn_save_user_modules", disabled=not sel_user):
-                    base = pd.DataFrame({
-                        "Username": [sel_user]*len(available_modules),
-                        "Module":   available_modules,
-                        "Enabled":  [m in chosen for m in available_modules],
-                    })
-                    others = umdf[umdf["Username"].astype(str).str.lower() != str(sel_user).lower()].copy()
-                    out = pd.concat([others, base], ignore_index=True)
-                    if _save_whole_sheet(MS_USER_MODULES, out, REQUIRED_HEADERS[MS_USER_MODULES]):
-                        _clear_all_caches(); st.success("Per-user modules saved.")
-                        st.rerun()
-                        _clear_all_caches(); st.success("Per-user modules saved.")
-            with row2:
-                if st.button("Open raw editor (advanced)", key="btn_open_um_editor"):
-                    st.data_editor(
-                        umdf, key="ed_user_modules_raw", num_rows="dynamic",
-                        use_container_width=True, hide_index=True,
-                        column_config={
-                            "Username": st.column_config.TextColumn("Username", required=True),
-                            "Module":   st.column_config.TextColumn("Module", required=True),
-                            "Enabled":  st.column_config.CheckboxColumn("Enabled"),
-                        },
-                        height=260,
+
+            # ✅ Patch: always define available_users and guard when empty
+            if udf_view_edit is None or udf_view_edit.empty:
+                available_users = []
+                user_display_to_username = {}
+            else:
+                # You can switch to fancy labels if you want, but usernames keep it simple and exact
+                usernames = udf_view_edit["username"].astype(str).str.strip().tolist()
+                available_users = usernames
+                user_display_to_username = {u: u for u in usernames}
+
+            if not available_users:
+                st.info("No users found in **Users**. Add a user above and click **Save Users**.")
+            else:
+                colA, colB = st.columns([1, 2])
+                with colA:
+                    sel_user_label = st.selectbox("User", available_users, key="um_sel_user")
+                with colB:
+                    cur = []
+                    if not umdf.empty and sel_user_label:
+                        sel_user = user_display_to_username[sel_user_label]
+                        cur = umdf[
+                            (umdf["Username"].astype(str).str.lower() == str(sel_user).lower())
+                            & (_to_bool_series(umdf["Enabled"]))
+                        ]["Module"].astype(str).tolist()
+                    chosen = st.multiselect(
+                        "Enabled modules",
+                        options=available_modules,
+                        default=cur,
+                        key="um_chosen"
                     )
-                    if st.button("Save raw user-modules", key="btn_save_um_raw"):
-                        if _save_whole_sheet(MS_USER_MODULES, st.session_state["ed_user_modules_raw"], REQUIRED_HEADERS[MS_USER_MODULES]):
-                            _clear_all_caches(); st.success("UserModules sheet saved.")
-            
+
+                row1, row2 = st.columns([1, 1])
+                with row1:
+                    sel_user = user_display_to_username.get(sel_user_label, "")
+                    if st.button(
+                        "Save user module access",
+                        type="primary",
+                        key="btn_save_user_modules",
+                        disabled=not sel_user
+                    ):
+                        base = pd.DataFrame({
+                            "Username": [sel_user] * len(available_modules),
+                            "Module":   available_modules,
+                            "Enabled":  [m in chosen for m in available_modules],
+                        })
+                        others = umdf[umdf["Username"].astype(str).str.lower() != str(sel_user).lower()].copy()
+                        out = pd.concat([others, base], ignore_index=True)
+                        if _save_whole_sheet(MS_USER_MODULES, out, REQUIRED_HEADERS[MS_USER_MODULES]):
+                            _clear_all_caches()
+                            st.success("Per-user modules saved.")
+                            st.rerun()
+                with row2:
+                    if st.button("Open raw editor (advanced)", key="btn_open_um_editor"):
+                        st.data_editor(
+                            umdf, key="ed_user_modules_raw", num_rows="dynamic",
+                            use_container_width=True, hide_index=True,
+                            column_config={
+                                "Username": st.column_config.TextColumn("Username", required=True),
+                                "Module":   st.column_config.TextColumn("Module", required=True),
+                                "Enabled":  st.column_config.CheckboxColumn("Enabled"),
+                            },
+                            height=260,
+                        )
+                        if st.button("Save raw user-modules", key="btn_save_um_raw"):
+                            if _save_whole_sheet(
+                                MS_USER_MODULES,
+                                st.session_state["ed_user_modules_raw"],
+                                REQUIRED_HEADERS[MS_USER_MODULES]
+                            ):
+                                _clear_all_caches()
+                                st.success("UserModules sheet saved.")           
         # ---------- Clients ----------
         with tabs[1]:
             st.subheader("Clients")
