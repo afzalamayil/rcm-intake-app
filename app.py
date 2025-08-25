@@ -231,14 +231,20 @@ if not SPREADSHEET_ID and not SPREADSHEET_NAME:
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
           "https://www.googleapis.com/auth/drive"]
 
-def retry(fn, attempts=8, base=0.7):
+def retry(fn, attempts=12, base=1.0):
     for i in range(attempts):
         try:
             return fn()
         except Exception as e:
             msg = str(e).lower()
-            if any(x in msg for x in ["429","rate","quota","deadline","temporar","internal","backenderror","backend error"]):
-                time.sleep(min(base * (2**i), 6) + random.random()*0.5); continue
+            if any(x in msg for x in [
+                "429", "rate", "quota", "deadline", "temporar",
+                "internal", "backenderror", "backend error",
+                "service unavailable", "exceeded"
+            ]):
+                # exponential backoff with jitter, cap per-try sleep at 10s
+                time.sleep(min(base * (2 ** i), 10) + random.random() * 0.5)
+                continue
             raise
     raise RuntimeError("Exceeded retries due to rate limiting.")
 
@@ -248,6 +254,17 @@ def get_gspread_client():
     gs_info["private_key"] = gs_info.get("private_key","").replace("\\n","\n")
     creds = Credentials.from_service_account_info(gs_info, scopes=SCOPES)
     return gspread.authorize(creds)
+
+@st.cache_resource(show_spinner=False)
+def _seed_cp_once(client_id: str) -> bool:
+    # Best-effort: don't let rate limits crash the app
+    try:
+        seed_clinic_purchase_assets_for_client(client_id)
+        return True
+    except Exception as e:
+        st.warning("Clinic Purchase init deferred due to Sheets API rate limiting. "
+                   "You can continue using other pages and try again shortly.")
+        return False
 
 @st.cache_resource(show_spinner=False)
 def get_spreadsheet(_gc):
@@ -469,7 +486,10 @@ def _clinic_items_price_map() -> dict:
 
 def _ensure_ws_with_headers(title: str, headers: list[str]):
     w = ws(title)
-    head = retry(lambda: w.row_values(1))
+    try:
+        head = retry(lambda: w.row_values(1))
+    except Exception:
+        head = []  # tolerate read failures; we'll still try to write headers
     merged = list(dict.fromkeys((head or []) + headers))
     if (head or []) != merged:
         retry(lambda: w.update("A1", [merged]))
@@ -2602,6 +2622,10 @@ def nav_pages_for(role: str):
 # One-time ensure Clinic Purchase module + sheets exist/enabled for this client
 seed_clinic_purchase_assets_for_client(CLIENT_ID)
 _clear_all_caches()  # make sure newly seeded rows are visible to this session
+
+# One-time ensure Clinic Purchase module + sheets exist/enabled for this client
+_seed_cp_once(CLIENT_ID)     # was: seed_clinic_purchase_assets_for_client(CLIENT_ID)
+_clear_all_caches()
 
 module_pairs, static_pages = nav_pages_for(ROLE)
 
