@@ -1409,19 +1409,19 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                     if not _role_visible(r["RoleVisibility"], role):
                         continue
 
-                    fkey    = r["FieldKey"]
-                    label   = r["Label"]
-                    typ     = (r["Type"] or "").lower().strip()
-                    required= bool(r["Required"])
-                    default = r["Default"]
-                    opts    = _options_from_token(r["Options"])
-                    readonly= _is_readonly(r.get("ReadOnlyRoles",""), role)
+                    fkey     = r["FieldKey"]
+                    label    = r["Label"]
+                    typ      = (r["Type"] or "").lower().strip()
+                    required = bool(r["Required"])
+                    default  = r["Default"]
+                    opts     = _options_from_token(r["Options"])
+                    readonly = _is_readonly(r.get("ReadOnlyRoles",""), role)
 
                     # Override for Clinic Purchase: values are manual
                     if str(module_name).strip() == CLINIC_PURCHASE_MODULE_KEY and fkey in {"clinic_value","sp_value","util_value"}:
                         readonly = False
                     
-                    key        = f"{module_name}_{fkey}"
+                    key       = f"{module_name}_{fkey}"
                     label_req = label + ("*" if required else "")
                     target    = cols[i % 3]
                     container = target
