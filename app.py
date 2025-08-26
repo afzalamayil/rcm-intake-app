@@ -1417,16 +1417,14 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                     opts    = _options_from_token(r["Options"])
                     readonly= _is_readonly(r.get("ReadOnlyRoles",""), role)
 
-                    
                     # Override for Clinic Purchase: values are manual
                     if str(module_name).strip() == CLINIC_PURCHASE_MODULE_KEY and fkey in {"clinic_value","sp_value","util_value"}:
                         readonly = False
-                    
                     key       = f"{module_name}_{fkey}"
-                    label_req = label + ("*" if required else "")
+                label_req = label + ("*" if required else "")
                     target    = cols[i % 3]
                     container = target
-                
+
                     with container:
                         if readonly:
                             if typ in ("integer","int") or _is_int_field(fkey):
