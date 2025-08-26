@@ -547,18 +547,18 @@ def seed_clinic_purchase_assets_for_client(client_id: str) -> bool:
         add([C,M,"audit","Audit","text",False,"","SecondParty","All",60,"Audit",""])
         add([C,M,"comments","Comments","textarea",False,"","SecondParty","All",70,"Comments",""])
         # Value auto-computed (read-only for both)
-        add([C,M,"clinic_value","Clinic Value (auto)","number",False,"","Clinic|SecondParty","All",45,"Clinic_Value",""])
+        add([C,M,"clinic_value","Clinic Value","number",False,"","","All",45,"Clinic_Value",""])
 
         # Second Party band – Clinic cannot edit
         add([C,M,"sp_qty","SP Qty","number",False,"","Clinic","All",80,"SP_Qty",""])
         add([C,M,"sp_status","SP Status","select",False,"MS:Status","Clinic","All",90,"SP_Status",""])
         # Value auto-computed (read-only for both)
-        add([C,M,"sp_value","SP Value (auto)","number",False,"","Clinic|SecondParty","All",85,"SP_Value",""])
+        add([C,M,"sp_value","SP Value","number",False,"","","All",85,"SP_Value",""])
 
         # Utilization – SecondParty cannot edit
         add([C,M,"util_qty","Utilization Qty","number",False,"","SecondParty","All",100,"Util_Qty",""])
         # Value auto-computed (read-only for both)
-        add([C,M,"util_value","Utilization Value (auto)","number",False,"","Clinic|SecondParty","All",105,"Util_Value",""])
+        add([C,M,"util_value","Utilization Value","number",False,"","","All",105,"Util_Value",""])
 
         newfs = pd.DataFrame(rows, columns=REQUIRED_HEADERS[MS_FORM_SCHEMA])
         out = pd.concat([fs, newfs], ignore_index=True)
@@ -1401,34 +1401,31 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                 ph_disp = st.session_state.get(f"{module_name}_pharmacy_display", "")
                 st.session_state["_current_pharmacy_id"] = ph_disp.split(" - ", 1)[0].strip() if " - " in ph_disp else ""
 
-                # Clinic Purchase unit price hint (live)
-                if str(module_name).strip() == CLINIC_PURCHASE_MODULE_KEY:
-                    pm = _clinic_items_price_map()
-                    sel_item = st.session_state.get(f"{module_name}_item", "")
-                    unit = float(pm.get(str(sel_item).strip(), 0.0))
-                    st.caption(f"Unit price for selected Item: **{unit:.2f}**")
-
                 cols = st.columns(3, gap="large")
                 values = {}
 
                 # ----- Render fields from FormSchema (INSIDE THE FORM) -----
                 for i, (_, r) in enumerate(rows.iterrows()):
-                    if not _role_visible(r["RoleVisibility"], role):
-                        continue
-
-                    fkey    = r["FieldKey"]
-                    label   = r["Label"]
-                    typ     = (r["Type"] or "").lower().strip()
-                    required= bool(r["Required"])
-                    default = r["Default"]
-                    opts    = _options_from_token(r["Options"])
-                    readonly= _is_readonly(r.get("ReadOnlyRoles",""), role)
-
-                    key       = f"{module_name}_{fkey}"
-                    label_req = label + ("*" if required else "")
-                    target    = cols[i % 3]
-                    container = target
-
+                if not _role_visible(r["RoleVisibility"], role):
+                    continue
+            
+                fkey    = r["FieldKey"]
+                label   = r["Label"]
+                typ     = (r["Type"] or "").lower().strip()
+                required= bool(r["Required"])
+                default = r["Default"]
+                opts    = _options_from_token(r["Options"])
+                readonly= _is_readonly(r.get("ReadOnlyRoles",""), role)
+            
+                # Override for Clinic Purchase: values are manual
+                if str(module_name).strip() == CLINIC_PURCHASE_MODULE_KEY and fkey in {"clinic_value","sp_value","util_value"}:
+                    readonly = False
+                
+                key       = f"{module_name}_{fkey}"
+                label_req = label + ("*" if required else "")  # Ensure this line has exactly 4 spaces
+                target    = cols[i % 3]
+                container = target
+        
                     with container:
                         if readonly:
                             if typ in ("integer","int") or _is_int_field(fkey):
