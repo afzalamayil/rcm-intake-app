@@ -1422,7 +1422,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                         readonly = False
                     
                     key       = f"{module_name}_{fkey}"
-                    label_req = label + ("*" if required else "")
+                    label_req = label + ("*" if required else"")
                     target    = cols[i % 3]
                     container = target
                 
