@@ -38,6 +38,15 @@ st.set_page_config(
     initial_sidebar_state="expanded"  # 👈 this makes sidebar always visible
 )
 
+# --- Postgres switch (Neon) ---
+USE_POSTGRES = True  # set False to temporarily fall back to Google Sheets
+
+from pg_adapter import (
+    read_sheet_df as pg_read_sheet_df,
+    save_whole_sheet as pg_save_whole_sheet,
+    append_row as pg_append_row,
+)
+
 import gspread
 from google.oauth2.service_account import Credentials
 import requests
@@ -49,6 +58,70 @@ from email import encoders
 import streamlit_authenticator as stauth
 from contextlib import contextmanager
 import time
+
+# =========================
+# ADMIN UTILITIES (Cloud)
+# =========================
+import re, pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
+from sqlalchemy import text
+from pg_adapter import save_whole_sheet as pg_save_whole_sheet
+from pg_adapter import _engine  # used by the health check
+
+def run_cloud_migration_ui():
+    st.subheader("Admin ▸ One-time Migration: Google Sheets → Postgres")
+    st.caption("Runs inside Streamlit Cloud using secrets. Remove [gsheets] after success.")
+    if st.button("Run migration now", type="primary"):
+        try:
+            gs = st.secrets["gsheets"]
+
+            # Ensure multiline key
+            creds_info = dict(gs)
+            if "private_key" in creds_info:
+                creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
+
+            scopes = [
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ]
+            gc = gspread.authorize(Credentials.from_service_account_info(creds_info, scopes=scopes))
+
+            # Get spreadsheet id from sheet_url or spreadsheet_id
+            m = re.search(r"/spreadsheets/d/([A-Za-z0-9-_]+)", gs.get("sheet_url", ""))
+            spreadsheet_id = m.group(1) if m else gs.get("spreadsheet_id")
+            if not spreadsheet_id:
+                st.error("No sheet_url or spreadsheet_id found in [gsheets] secrets.")
+                return
+
+            sh = gc.open_by_key(spreadsheet_id)
+
+            moved = []
+            for ws in sh.worksheets():
+                vals = ws.get_all_values()
+                if not vals:
+                    continue
+                headers = [h.strip() or f"col_{i+1}" for i, h in enumerate(vals[0])]
+                rows = vals[1:] if len(vals) > 1 else []
+                df = pd.DataFrame(rows, columns=headers).fillna("")
+                pg_save_whole_sheet(ws.title, df, headers)   # truncates + inserts
+                moved.append(f"{ws.title} ({len(df)} rows)")
+
+            if moved:
+                st.success("Migration complete.")
+                st.write("Moved tabs:", moved)
+            else:
+                st.info("No tabs found or tabs were empty.")
+        except Exception as e:
+            st.error(f"Migration failed: {e}")
+
+def pg_health_check():
+    try:
+        with _engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        st.success("Postgres: connected")
+    except Exception as e:
+        st.warning(f"Postgres: not reachable — {e}")
 
 # --- Date helpers (single source of truth) ---
 DATE_FMT = "%d/%m/%Y"
@@ -201,6 +274,9 @@ with st.sidebar:
     if UI_BRAND:
         st.success(f"👋 {UI_BRAND}")
 
+with st.sidebar:
+    st.caption("DB Status")
+    pg_health_check()
 # Show any pending success/error from the last submit
 render_flash()
 
@@ -2651,11 +2727,22 @@ st.sidebar.markdown("---")
 
 # Rename section and remove the dummy "—" option.
 # Use a selectbox with a placeholder (no default selection).
+# --- Sidebar: Tools & Reports picker (+ Admin for SuperAdmin) ---
+# Make sure the list is mutable
+static_pages = list(static_pages)
+
+# Detect role from session (or global ROLE if you keep it)
+_role = str(st.session_state.get("role") or (globals().get("ROLE", ""))).strip().lower()
+
+# Add "Admin" option only for Super Admins
+if _role in ("super admin", "superadmin") and "Admin" not in static_pages:
+    static_pages.append("Admin")
+
 try:
     static_choice = st.sidebar.selectbox(
         "Tools & Reports",
         static_pages,
-        index=None,                         # show placeholder until user picks
+        index=None,                     # show placeholder until user picks
         placeholder="Open a page…",
         key="nav_page",
         on_change=_pick_static,
@@ -2663,8 +2750,32 @@ try:
 except TypeError:
     # Older Streamlit fallback (no index=None support)
     _items = ["<choose…>"] + static_pages
-    pick = st.sidebar.selectbox("Tools & Reports", _items, index=0, key="nav_page_fallback", on_change=_pick_static)
+    pick = st.sidebar.selectbox(
+        "Tools & Reports",
+        _items,
+        index=0,
+        key="nav_page_fallback",
+        on_change=_pick_static,
+    )
     static_choice = None if pick == "<choose…>" else pick
+
+# --- Router: Admin page (SuperAdmin only) ---
+if static_choice == "Admin":
+    st.header("Admin")
+
+    if _role not in ("super admin", "superadmin"):
+        st.error("Access denied")
+        st.stop()
+
+    # Optional: quick DB ping in sidebar (remove if you already call this elsewhere)
+    # with st.sidebar:
+    #     st.caption("DB Status")
+    #     pg_health_check()
+
+    # One-time Google Sheets → Postgres migration UI
+    run_cloud_migration_ui()
+
+    st.stop()  # prevent fall-through to other page renderers
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Navigation dispatcher
