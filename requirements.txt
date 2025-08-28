@@ -2,8 +2,8 @@ streamlit
 pandas
 SQLAlchemy==2.0.*
 psycopg2-binary
-toml
-gspread
+gspread           # keep until migration is done
 google-auth
-google-auth-oauthlib
 google-auth-httplib2
+google-auth-oauthlib
+toml
