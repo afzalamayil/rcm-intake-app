@@ -1482,90 +1482,91 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
 
                 # ----- Render fields from FormSchema (INSIDE THE FORM) -----
                 for i, (_, r) in enumerate(rows.iterrows()):
+                    # hide fields not visible to the current role
                     if not _role_visible(r["RoleVisibility"], role):
                         continue
-            
-                    fkey    = r["FieldKey"]
-                    label   = r["Label"]
-                    typ     = (r["Type"] or "").lower().strip()
-                    required= bool(r["Required"])
-                    default = r["Default"]
-                    opts    = _options_from_token(r["Options"])
-                    readonly= _is_readonly(r.get("ReadOnlyRoles",""), role)
-            
-                # Override for Clinic Purchase: values are manual
-                if str(module_name).strip() == CLINIC_PURCHASE_MODULE_KEY and fkey in {"clinic_value","sp_value","util_value"}:
-                    readonly = False
                 
-                key       = f"{module_name}_{fkey}"
-                label_req = label + ("*" if required else "")  # Ensure this line has exactly 4 spaces
-                target    = cols[i % 3]
-                container = target
-        
-                with container:
-                    if readonly:
-                        if typ in ("integer","int") or _is_int_field(fkey):
-                            try: dv = int(float(default)) if str(default).strip() else 0
-                            except Exception: dv = 0
-                            st.number_input(label_req, value=int(dv), step=1, min_value=0, key=key+"_ro", disabled=True)
-                            values[fkey] = dv
-                        elif typ in ("phone","tel") or _is_phone_field(fkey):
-                            st.text_input(label_req, value=str(default), key=key+"_ro", disabled=True)
-                            values[fkey] = str(default)
+                    fkey     = r["FieldKey"]
+                    label    = r["Label"]
+                    typ      = (r["Type"] or "").lower().strip()
+                    required = bool(r["Required"])
+                    default  = r["Default"]
+                    opts     = _options_from_token(r["Options"])
+                    readonly = _is_readonly(r.get("ReadOnlyRoles", ""), role)
+                
+                    # Clinic Purchase: force these as editable
+                    if str(module_name).strip() == CLINIC_PURCHASE_MODULE_KEY and fkey in {"clinic_value","sp_value","util_value"}:
+                        readonly = False
+                
+                    key       = f"{module_name}_{fkey}"
+                    label_req = label + ("*" if required else "")
+                    target    = cols[i % 3]
+                    container = target
+                
+                    with container:
+                        if readonly:
+                            # render disabled controls but still capture a value
+                            if typ in ("integer", "int") or _is_int_field(fkey):
+                                try:
+                                    dv = int(float(default)) if str(default).strip() else 0
+                                except Exception:
+                                    dv = 0
+                                st.number_input(label_req, value=int(dv), step=1, min_value=0, key=key+"_ro", disabled=True)
+                                values[fkey] = dv
+                            elif typ in ("phone", "tel") or _is_phone_field(fkey):
+                                st.text_input(label_req, value=str(default or ""), key=key+"_ro", disabled=True)
+                                values[fkey] = str(default or "")
+                            elif typ == "number":
+                                try:
+                                    dv = float(default) if str(default).strip() else 0.0
+                                except Exception:
+                                    dv = 0.0
+                                st.number_input(label_req, value=float(dv), key=key+"_ro", disabled=True)
+                                values[fkey] = dv
+                            elif typ == "date":
+                                d = parse_date(default)
+                                st.date_input(label_req, value=(d.date() if pd.notna(d) else date.today()), key=key+"_ro", disabled=True)
+                                values[fkey] = format_date(d) if pd.notna(d) else ""
+                            else:
+                                st.text_input(label_req, value=str(default or ""), key=key+"_ro", disabled=True)
+                                values[fkey] = str(default or "")
+                            continue  # ← safely continue inside the loop
+                
+                        # Editable controls
+                        if typ in ("integer", "int") or _is_int_field(fkey):
+                            try:
+                                dv = int(float(default)) if str(default).strip() else 0
+                            except Exception:
+                                dv = 0
+                            values[fkey] = st.number_input(label_req, value=int(dv), step=1, key=key)
+                
                         elif typ == "number":
-                            try: dv = float(default) if str(default).strip() else 0.0
-                            except Exception: dv = 0.0
-                            st.number_input(label_req, value=float(dv), step=0.01, format="%.2f", key=key+"_ro", disabled=True)
-                            values[fkey] = dv
+                            try:
+                                dv = float(default) if str(default).strip() else 0.0
+                            except Exception:
+                                dv = 0.0
+                            values[fkey] = st.number_input(label_req, value=float(dv), key=key)
+                
                         elif typ == "date":
-                            try: d = parse_date(default).date() if default else date.today()
-                            except Exception: d = date.today()
-                            st.date_input(label_req, value=d, key=key+"_ro", disabled=True)
-                            values[fkey] = d
+                            d = parse_date(default)
+                            values[fkey] = st.date_input(label_req, value=(d.date() if pd.notna(d) else date.today()), key=key)
+                
                         elif typ == "select":
-                            show = opts if opts else ["—"]
-                            idx  = show.index(default) if default in show else 0
-                            st.selectbox(label_req, options=show, index=idx, key=key+"_ro", disabled=True)
-                            values[fkey] = default if default in show else show[idx]
+                            values[fkey] = st.selectbox(label_req, opts, index=(opts.index(default) if default in opts else 0 if opts else None), key=key)
+                
                         elif typ == "multiselect":
-                            show = opts if opts else ["—"]
-                            st.multiselect(label_req, options=show, default=[default] if default else [], key=key+"_ro", disabled=True)
-                            values[fkey] = [default] if default else []
-                        elif typ == "checkbox":
-                            v = str(default).strip().lower() in ("true","1","yes")
-                            st.checkbox(label, value=v, key=key+"_ro", disabled=True)
-                            values[fkey] = v
-                        else:
-                            st.text_input(label_req, value=str(default), key=key+"_ro", disabled=True)
-                            values[fkey] = str(default)
-                        continue
-
-                        # Editable widgets
-                        if typ in ("integer","int") or _is_int_field(fkey):
-                            try: dv = int(float(default)) if str(default).strip() else 0
-                            except Exception: dv = 0
-                            values[fkey] = st.number_input(label_req, value=int(dv), step=1, min_value=0, key=key)
-                        elif typ in ("phone","tel") or _is_phone_field(fkey):
-                            values[fkey] = st.text_input(label_req, value=str(default), key=key, placeholder="+9715XXXXXXXX")
-                        elif typ == "number":
-                            try: dv = float(default) if str(default).strip() else 0.0
-                            except Exception: dv = 0.0
-                            values[fkey] = st.number_input(label_req, value=float(dv), step=0.01, format="%.2f", key=key)
-                        elif typ == "date":
-                            try: d = parse_date(default).date() if default else date.today()
-                            except Exception: d = date.today()
-                            values[fkey] = st.date_input(label_req, value=d, key=key)
-                        elif typ == "select":
-                            values[fkey] = st.selectbox(label_req, options=(opts or ["—"]), key=key)
-                        elif typ == "multiselect":
-                            values[fkey] = st.multiselect(label_req, options=(opts or ["—"]), key=key)
-                        elif typ == "checkbox":
-                            v = str(default).strip().lower() in ("true","1","yes")
-                            values[fkey] = st.checkbox(label, value=v, key=key)
+                            defaults = [o for o in opts if o in str(default or "").split(",")]
+                            values[fkey] = st.multiselect(label_req, opts, default=defaults, key=key)
+                
+                        elif typ in ("phone", "tel") or _is_phone_field(fkey):
+                            values[fkey] = st.text_input(label_req, value=str(default or ""), key=key)
+                
                         elif typ == "textarea":
-                            values[fkey] = st.text_area(label_req, value=str(default), key=key)
+                            values[fkey] = st.text_area(label_req, value=str(default or ""), key=key)
+                
                         else:
-                            values[fkey] = st.text_input(label_req, value=str(default), key=key)
+                            values[fkey] = st.text_input(label_req, value=str(default or ""), key=key)
+
                 # ----- end fields loop -----
 
             dup_override_key = f"{module_name}_dup_override"
@@ -1602,7 +1603,8 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
             if (isinstance(val, str) and not val.strip()) or val is None or (isinstance(val, list) and not val):
                 missing.append(r["Label"])
     if missing:
-        st.error("Missing required fields: " + ", ".join(missing)); return
+        st.error("Missing required fields: " + ", ".join(missing))
+        return
 
     # ACL check for pharmacy
     ph_id, ph_name = "", ""
