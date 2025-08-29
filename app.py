@@ -1642,9 +1642,28 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                         elif typ == "date":
                             d = parse_date(default)
                             values[fkey] = st.date_input(label_req, value=(d.date() if pd.notna(d) else date.today()), key=key)
-                
+                                        
                         elif typ == "select":
-                            values[fkey] = st.selectbox(label_req, opts, index=(opts.index(default) if default in opts else 0 if opts else None), key=key)
+                            # Use a namespaced widget key; special-case the 'type' field
+                            wkey = f"{module_name}_{fkey}"
+                            if fkey == "type":
+                                wkey = f"{module_name}_submission_type"
+                        
+                            # Set a default BEFORE rendering (only once)
+                            if wkey not in st.session_state:
+                                if default and default in opts:
+                                    st.session_state[wkey] = default
+                                elif opts:
+                                    st.session_state[wkey] = opts[0]
+                                else:
+                                    st.session_state[wkey] = ""
+                        
+                            values[fkey] = st.selectbox(
+                                label_req,
+                                opts,
+                                index=(opts.index(st.session_state[wkey]) if st.session_state[wkey] in opts else 0 if opts else None),
+                                key=wkey,
+                            )
                 
                         elif typ == "multiselect":
                             defaults = [o for o in opts if o in str(default or "").split(",")]
