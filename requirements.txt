@@ -7,3 +7,6 @@ google-auth
 google-auth-httplib2
 google-auth-oauthlib
 toml
+streamlit-authenticator
+extra-streamlit-components
+PyYAML
