@@ -1172,6 +1172,7 @@ def _save_whole_sheet(sheet_title: str, df: pd.DataFrame, headers: list[str]):
         try:
             w.clear()
         except Exception:
+        w.batch_clear(["A:ZZ"])
         arr = [headers] + out.astype(str).values.tolist()
         retry(lambda: w.update("A1", arr, value_input_option="USER_ENTERED"))
         return True
