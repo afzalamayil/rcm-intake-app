@@ -1502,43 +1502,43 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                 target    = cols[i % 3]
                 container = target
         
-                    with container:
-                        if readonly:
-                            if typ in ("integer","int") or _is_int_field(fkey):
-                                try: dv = int(float(default)) if str(default).strip() else 0
-                                except Exception: dv = 0
-                                st.number_input(label_req, value=int(dv), step=1, min_value=0, key=key+"_ro", disabled=True)
-                                values[fkey] = dv
-                            elif typ in ("phone","tel") or _is_phone_field(fkey):
-                                st.text_input(label_req, value=str(default), key=key+"_ro", disabled=True)
-                                values[fkey] = str(default)
-                            elif typ == "number":
-                                try: dv = float(default) if str(default).strip() else 0.0
-                                except Exception: dv = 0.0
-                                st.number_input(label_req, value=float(dv), step=0.01, format="%.2f", key=key+"_ro", disabled=True)
-                                values[fkey] = dv
-                            elif typ == "date":
-                                try: d = parse_date(default).date() if default else date.today()
-                                except Exception: d = date.today()
-                                st.date_input(label_req, value=d, key=key+"_ro", disabled=True)
-                                values[fkey] = d
-                            elif typ == "select":
-                                show = opts if opts else ["—"]
-                                idx  = show.index(default) if default in show else 0
-                                st.selectbox(label_req, options=show, index=idx, key=key+"_ro", disabled=True)
-                                values[fkey] = default if default in show else show[idx]
-                            elif typ == "multiselect":
-                                show = opts if opts else ["—"]
-                                st.multiselect(label_req, options=show, default=[default] if default else [], key=key+"_ro", disabled=True)
-                                values[fkey] = [default] if default else []
-                            elif typ == "checkbox":
-                                v = str(default).strip().lower() in ("true","1","yes")
-                                st.checkbox(label, value=v, key=key+"_ro", disabled=True)
-                                values[fkey] = v
-                            else:
-                                st.text_input(label_req, value=str(default), key=key+"_ro", disabled=True)
-                                values[fkey] = str(default)
-                            continue
+                with container:
+                    if readonly:
+                        if typ in ("integer","int") or _is_int_field(fkey):
+                            try: dv = int(float(default)) if str(default).strip() else 0
+                            except Exception: dv = 0
+                            st.number_input(label_req, value=int(dv), step=1, min_value=0, key=key+"_ro", disabled=True)
+                            values[fkey] = dv
+                        elif typ in ("phone","tel") or _is_phone_field(fkey):
+                            st.text_input(label_req, value=str(default), key=key+"_ro", disabled=True)
+                            values[fkey] = str(default)
+                        elif typ == "number":
+                            try: dv = float(default) if str(default).strip() else 0.0
+                            except Exception: dv = 0.0
+                            st.number_input(label_req, value=float(dv), step=0.01, format="%.2f", key=key+"_ro", disabled=True)
+                            values[fkey] = dv
+                        elif typ == "date":
+                            try: d = parse_date(default).date() if default else date.today()
+                            except Exception: d = date.today()
+                            st.date_input(label_req, value=d, key=key+"_ro", disabled=True)
+                            values[fkey] = d
+                        elif typ == "select":
+                            show = opts if opts else ["—"]
+                            idx  = show.index(default) if default in show else 0
+                            st.selectbox(label_req, options=show, index=idx, key=key+"_ro", disabled=True)
+                            values[fkey] = default if default in show else show[idx]
+                        elif typ == "multiselect":
+                            show = opts if opts else ["—"]
+                            st.multiselect(label_req, options=show, default=[default] if default else [], key=key+"_ro", disabled=True)
+                            values[fkey] = [default] if default else []
+                        elif typ == "checkbox":
+                            v = str(default).strip().lower() in ("true","1","yes")
+                            st.checkbox(label, value=v, key=key+"_ro", disabled=True)
+                            values[fkey] = v
+                        else:
+                            st.text_input(label_req, value=str(default), key=key+"_ro", disabled=True)
+                            values[fkey] = str(default)
+                        continue
 
                         # Editable widgets
                         if typ in ("integer","int") or _is_int_field(fkey):
@@ -1568,9 +1568,9 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                             values[fkey] = st.text_input(label_req, value=str(default), key=key)
                 # ----- end fields loop -----
 
-                dup_override_key = f"{module_name}_dup_override"
-                st.checkbox("Allow duplicate override", key=dup_override_key)
-                submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
+            dup_override_key = f"{module_name}_dup_override"
+            st.checkbox("Allow duplicate override", key=dup_override_key)
+            submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
 
     if not submitted:
         return
