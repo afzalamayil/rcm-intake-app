@@ -63,12 +63,9 @@ import time
 # =========================
 # ADMIN UTILITIES (Cloud)
 # =========================
-import re, pandas as pd
-import gspread
-from google.oauth2.service_account import Credentials
 from sqlalchemy import text
 from pg_adapter import save_whole_sheet as pg_save_whole_sheet
-from pg_adapter import _engine  # used by the health check
+from pg_adapter import _get_engine  # used by the health check
 
 def run_cloud_migration_ui():
     import re, pandas as pd, gspread, time
@@ -1175,7 +1172,6 @@ def _save_whole_sheet(sheet_title: str, df: pd.DataFrame, headers: list[str]):
         try:
             w.clear()
         except Exception:
-            w.batch_clear(["A:ZZ"])
         arr = [headers] + out.astype(str).values.tolist()
         retry(lambda: w.update("A1", arr, value_input_option="USER_ENTERED"))
         return True
@@ -1276,6 +1272,20 @@ def _cached_masters():
         "pharm_df":         pharm_master(),
         "ins_df":           insurance_master(),
     }
+
+# --- Helper: read the selected "Type" from session_state safely
+def get_submission_type(module_key: str | None = None) -> str:
+    # Try module-specific keys first, then generic fallbacks
+    keys = []
+    if module_key:
+        keys += [f"{module_key}_submission_type", f"{module_key}_type"]
+    keys += ["pharmacy_submission_type", "submission_type", "type"]
+
+    for k in keys:
+        v = st.session_state.get(k)
+        if v not in (None, ""):
+            return v
+    return ""
 
 def _render_legacy_pharmacy_intake(sheet_name: str):
     LEGACY_HEADERS = [
@@ -1434,7 +1444,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         "Submission Date": st.session_state.submission_date,
         "Pharmacy":        st.session_state.pharmacy_display,
         "Submission Mode": st.session_state.submission_mode,
-        "Type":            st.session_state[f"{module_name}_submission_type"],
+        "Type":             get_submission_type("pharmacy"),
         "Portal":          st.session_state.portal,
         "ERX Number":      st.session_state.erx_number,
         "Insurance":       st.session_state.insurance_display,
