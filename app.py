@@ -1434,7 +1434,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         "Submission Date": st.session_state.submission_date,
         "Pharmacy":        st.session_state.pharmacy_display,
         "Submission Mode": st.session_state.submission_mode,
-        "Type":            st.session_state.type,
+        "Type":            st.session_state[f"{module_name}_submission_type"],
         "Portal":          st.session_state.portal,
         "ERX Number":      st.session_state.erx_number,
         "Insurance":       st.session_state.insurance_display,
@@ -1500,7 +1500,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         st.session_state.employee_name.strip(),
         format_date(st.session_state.submission_date),
         st.session_state.submission_mode,
-        st.session_state.type,
+        st.session_state[f"{module_name}_submission_type"],
         st.session_state.portal,
         st.session_state.erx_number.strip(),
         ins_code, ins_name,
@@ -1521,7 +1521,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         except Exception: pass
 
         st.session_state["_clear_form"] = True
-        st.session_state["type"] = "Insurance"
+        st.session_state[f"{module_name}_submission_type"] = "Insurance"
         st.session_state["_was_cash"] = False
         flash("Saved ✔️", "success")
     except Exception as e:
@@ -1644,12 +1644,14 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                             values[fkey] = st.date_input(label_req, value=(d.date() if pd.notna(d) else date.today()), key=key)
                                         
                         elif typ == "select":
-                            # Use a namespaced widget key; special-case the 'type' field
+                            # namespaced widget key for all fields
                             wkey = f"{module_name}_{fkey}"
+                        
+                            # SPECIAL-CASE: avoid using the raw key "type"
                             if fkey == "type":
                                 wkey = f"{module_name}_submission_type"
                         
-                            # Set a default BEFORE rendering (only once)
+                            # set a default BEFORE rendering the widget (only once)
                             if wkey not in st.session_state:
                                 if default and default in opts:
                                     st.session_state[wkey] = default
@@ -1664,7 +1666,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                                 index=(opts.index(st.session_state[wkey]) if st.session_state[wkey] in opts else 0 if opts else None),
                                 key=wkey,
                             )
-                
+               
                         elif typ == "multiselect":
                             defaults = [o for o in opts if o in str(default or "").split(",")]
                             values[fkey] = st.multiselect(label_req, opts, default=defaults, key=key)
@@ -1703,6 +1705,9 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
         values["clinic_value"] = _val(values.get("clinic_qty"))
         values["sp_value"]     = _val(values.get("sp_qty"))
         values["util_value"]   = _val(values.get("util_qty"))
+
+    # ensure values["type"] reflects the select widget (namespaced key)
+    values["type"] = st.session_state.get(f"{module_name}_submission_type", values.get("type", ""))
 
     # Validate requireds
     missing = []
