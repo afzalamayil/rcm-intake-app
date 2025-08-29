@@ -168,6 +168,33 @@ def run_cloud_migration_ui():
             status.update(label="Migration failed", state="error")
             st.exception(e)
 
+# --- Admin: verify what's in Postgres right now ---
+def verify_neon_data():
+    import pandas as pd
+    from sqlalchemy import create_engine, text
+
+    eng = create_engine(st.secrets["postgres"]["url"], pool_pre_ping=True)
+
+    with eng.connect() as con:
+        tables = pd.read_sql(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = current_schema() ORDER BY table_name",
+            con,
+        )["table_name"].tolist()
+
+        results = []
+        for t in tables:
+            try:
+                cnt = con.execute(text(f'SELECT COUNT(*) FROM "{t}"')).scalar_one()
+            except Exception as e:
+                cnt = f"ERR: {e}"
+            results.append({"table": t, "rows": cnt})
+
+    st.subheader("Neon tables & row counts")
+    st.dataframe(pd.DataFrame(results), use_container_width=True)
+
+    st.caption("Tip: expected tables are your sheet/tab names, lowercased with spaces and punctuation replaced by underscores.")
+
 # --- DB health check: always read fresh URL from secrets ---
 def pg_health_check():
     from sqlalchemy import create_engine, text
@@ -2841,7 +2868,10 @@ if static_choice == "Admin":
 
     # One-time Google Sheets → Postgres migration UI
     run_cloud_migration_ui()
-
+    
+    # NEW: show what’s currently in Neon
+    verify_neon_data()
+    
     st.stop()  # prevent fall-through to other page renderers
 
 # ─────────────────────────────────────────────────────────────────────────────
