@@ -71,50 +71,102 @@ from pg_adapter import save_whole_sheet as pg_save_whole_sheet
 from pg_adapter import _engine  # used by the health check
 
 def run_cloud_migration_ui():
+    import re, pandas as pd, gspread, time
+    from google.oauth2.service_account import Credentials
+    from pg_adapter import save_whole_sheet as pg_save_whole_sheet
+
     st.subheader("Admin ▸ One-time Migration: Google Sheets → Postgres")
-    st.caption("Runs inside Streamlit Cloud using secrets. Remove [gsheets] after success.")
+    st.caption("Runs inside Streamlit Cloud using your Secrets. Keep [gsheets] only until this succeeds.")
+
+    # Small helper to auth and open the spreadsheet
+    def _open_sheet():
+        gs = st.secrets.get("gsheets")
+        if not gs:
+            raise RuntimeError("Missing [gsheets] block in Secrets (needed only for migration).")
+
+        # Ensure multiline key works even if pasted with escaped \n
+        creds_info = dict(gs)
+        if "private_key" in creds_info:
+            creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        gc = gspread.authorize(Credentials.from_service_account_info(creds_info, scopes=scopes))
+
+        m = re.search(r"/spreadsheets/d/([A-Za-z0-9-_]+)", gs.get("sheet_url", ""))
+        spreadsheet_id = m.group(1) if m else gs.get("spreadsheet_id")
+        if not spreadsheet_id:
+            raise RuntimeError("No sheet_url or spreadsheet_id provided in [gsheets].")
+        return gc.open_by_key(spreadsheet_id)
+
+    # Debug tools
+    with st.expander("Debug / Advanced", expanded=False):
+        if st.button("Ping Google Sheets"):
+            try:
+                sh = _open_sheet()
+                titles = [ws.title for ws in sh.worksheets()]
+                st.success(f"Connected. Found {len(titles)} tabs.")
+                st.write(titles)
+            except Exception as e:
+                st.error(f"Sheets connection failed: {e}")
+
+    # Main migrate-all button
     if st.button("Run migration now", type="primary"):
+        status = st.status("Preparing…", expanded=True)
+        progress = st.progress(0.0)
         try:
-            gs = st.secrets["gsheets"]
-
-            # Ensure multiline key
-            creds_info = dict(gs)
-            if "private_key" in creds_info:
-                creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
-
-            scopes = [
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive",
-            ]
-            gc = gspread.authorize(Credentials.from_service_account_info(creds_info, scopes=scopes))
-
-            # Get spreadsheet id from sheet_url or spreadsheet_id
-            m = re.search(r"/spreadsheets/d/([A-Za-z0-9-_]+)", gs.get("sheet_url", ""))
-            spreadsheet_id = m.group(1) if m else gs.get("spreadsheet_id")
-            if not spreadsheet_id:
-                st.error("No sheet_url or spreadsheet_id found in [gsheets] secrets.")
+            sh = _open_sheet()
+            wss = sh.worksheets()
+            total = len(wss)
+            if total == 0:
+                status.update(label="No tabs found.", state="error")
                 return
 
-            sh = gc.open_by_key(spreadsheet_id)
+            moved, skipped = [], []
+            status.update(label=f"Starting migration of {total} tabs…", state="running")
+            for idx, ws in enumerate(wss, start=1):
+                label = f"Migrating: {ws.title} ({idx}/{total})"
+                status.update(label=label, state="running")
+                progress.progress(idx / total)
 
-            moved = []
-            for ws in sh.worksheets():
-                vals = ws.get_all_values()
-                if not vals:
+                try:
+                    vals = ws.get_all_values()
+                except Exception as e:
+                    status.write(f"• {ws.title}: failed to read — {e}")
                     continue
+
+                if not vals or (len(vals) == 1 and all(not c for c in vals[0])):
+                    status.write(f"• {ws.title}: empty — skipped")
+                    skipped.append(ws.title)
+                    continue
+
                 headers = [h.strip() or f"col_{i+1}" for i, h in enumerate(vals[0])]
                 rows = vals[1:] if len(vals) > 1 else []
                 df = pd.DataFrame(rows, columns=headers).fillna("")
-                pg_save_whole_sheet(ws.title, df, headers)   # truncates + inserts
+
+                try:
+                    pg_save_whole_sheet(ws.title, df, headers)   # truncates + inserts
+                except Exception as e:
+                    status.write(f"• {ws.title}: failed to write — {e}")
+                    continue
+
                 moved.append(f"{ws.title} ({len(df)} rows)")
+                status.write(f"• {ws.title}: {len(df)} rows moved")
 
             if moved:
-                st.success("Migration complete.")
+                status.update(label="Migration complete", state="complete")
+                st.success("Done.")
                 st.write("Moved tabs:", moved)
+                if skipped:
+                    st.info("Skipped empty tabs: " + ", ".join(skipped))
             else:
-                st.info("No tabs found or tabs were empty.")
+                status.update(label="Nothing migrated (all empty or failed).", state="error")
+
         except Exception as e:
-            st.error(f"Migration failed: {e}")
+            status.update(label="Migration failed", state="error")
+            st.exception(e)
 
 # --- DB health check: always read fresh URL from secrets ---
 def pg_health_check():
