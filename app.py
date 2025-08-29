@@ -117,9 +117,9 @@ def run_cloud_migration_ui():
 
 def pg_health_check():
     try:
-        with _engine.connect() as conn:
+        with _get_engine().connect() as conn:
             conn.execute(text("SELECT 1"))
-        st.success("Postgres: connected")
+        st.success("Postgres connected")
     except Exception as e:
         st.warning(f"Postgres: not reachable — {e}")
 
