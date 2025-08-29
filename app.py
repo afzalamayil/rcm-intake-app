@@ -45,6 +45,7 @@ from pg_adapter import (
     read_sheet_df as pg_read_sheet_df,
     save_whole_sheet as pg_save_whole_sheet,
     append_row as pg_append_row,
+    _get_engine,  # ← add this line if you keep using it
 )
 
 import gspread
@@ -115,13 +116,25 @@ def run_cloud_migration_ui():
         except Exception as e:
             st.error(f"Migration failed: {e}")
 
+# --- DB health check: always read fresh URL from secrets ---
 def pg_health_check():
+    from sqlalchemy import create_engine, text
     try:
-        with _get_engine().connect() as conn:
+        eng = create_engine(st.secrets["postgres"]["url"], pool_pre_ping=True)
+        with eng.connect() as conn:
             conn.execute(text("SELECT 1"))
         st.success("Postgres connected")
     except Exception as e:
         st.warning(f"Postgres: not reachable — {e}")
+
+    # Optional: show what URL the app is actually using (host/db only)
+    try:
+        from urllib.parse import urlparse
+        u = st.secrets["postgres"]["url"]
+        p = urlparse(u)
+        st.caption(f"Host: {p.hostname} | DB: {(p.path or '').lstrip('/')}")
+    except Exception:
+        pass
 
 # --- Date helpers (single source of truth) ---
 DATE_FMT = "%d/%m/%Y"
