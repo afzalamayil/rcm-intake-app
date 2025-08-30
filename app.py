@@ -788,20 +788,52 @@ def _safe_users_df():
 
 USERS_DF = load_users_df()
 
+import json
+import streamlit_authenticator as stauth
+
 def build_authenticator(cookie_suffix: str = ""):
-    if USERS_DF is not None and not USERS_DF.empty:
-        names = USERS_DF.get('name', pd.Series([""]*len(USERS_DF))).tolist()
-        usernames = USERS_DF.get('username', pd.Series([""]*len(USERS_DF))).tolist()
-        passwords = USERS_DF.get('password', pd.Series([""]*len(USERS_DF))).tolist()  # bcrypt strings
-        creds = {"usernames": {u: {"name": n, "password": p} for n, u, p in zip(names, usernames, passwords)}}
+    auth_sec = st.secrets.get("auth", {})
+    demo_users = auth_sec.get("demo_users", "{}")
+
+    # Parse JSON string if needed
+    if isinstance(demo_users, str):
+        try:
+            users = json.loads(demo_users)
+        except Exception:
+            users = {}
+    elif isinstance(demo_users, dict):
+        users = demo_users
     else:
-        demo = json.loads(AUTH.get("demo_users", "{}")) or {"admin@example.com":{"name":"Admin","password":"admin123"}}
-        creds = {"usernames": {}}
-        for u, info in demo.items():
-            creds["usernames"][u] = {"name": info["name"], "password": stauth.Hasher([info["password"]]).generate()[0]}
-    base_cookie = AUTH.get("cookie_name", "rcm_intake_app")
-    cookie_name = f"{base_cookie}-{cookie_suffix}" if cookie_suffix else base_cookie
-    return stauth.Authenticate(creds, cookie_name, AUTH.get("cookie_key","super-secret-key"), int(AUTH.get("cookie_expiry_days",30)))
+        users = {}
+
+    creds = {"usernames": {}}
+
+    for username, info in users.items():
+        name = (info or {}).get("name", username)
+        pwd  = (info or {}).get("password", "")
+
+        # Ensure it’s a string
+        if not isinstance(pwd, str):
+            pwd = str(pwd or "")
+
+        # Keep bcrypt hashes as-is, otherwise hash
+        if pwd.startswith("$2a$") or pwd.startswith("$2b$") or pwd.startswith("$2y$"):
+            hashed = pwd
+        else:
+            hashed = stauth.Hasher([pwd]).generate()[0]
+
+        creds["usernames"][username] = {"name": name, "password": hashed}
+
+    cookie_name = (auth_sec.get("cookie_name") or "rcm_intake_app") + cookie_suffix
+    cookie_key  = auth_sec.get("cookie_key") or "CHANGE_ME_TO_A_RANDOM_LONG_VALUE"
+    cookie_days = int(auth_sec.get("cookie_expiry_days", 30))
+
+    return stauth.Authenticate(
+        credentials=creds,
+        cookie_name=cookie_name,
+        key=cookie_key,
+        cookie_expiry_days=cookie_days
+    )
 
 cookie_suffix = st.session_state.get("_cookie_suffix","")
 authenticator = build_authenticator(cookie_suffix)
