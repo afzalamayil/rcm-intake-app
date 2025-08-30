@@ -792,18 +792,31 @@ import json
 import streamlit_authenticator as stauth
 
 def _hash_password_compat(pwd: str) -> str:
-    """Hash password for both old and new streamlit-authenticator APIs."""
+    """Return a bcrypt hash. Works regardless of streamlit-authenticator version."""
+    # normalize & keep bcrypt as-is
     if not isinstance(pwd, str):
         pwd = str(pwd or "")
-    # keep bcrypt as-is
     if pwd.startswith("$2a$") or pwd.startswith("$2b$") or pwd.startswith("$2y$"):
         return pwd
-    # new API (0.3+): Hasher.hash([...])
+
+    # Prefer native bcrypt (most reliable)
     try:
+        import bcrypt
+        return bcrypt.hashpw(pwd.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    except Exception:
+        pass
+
+    # New streamlit-authenticator API (>=0.3.x)
+    try:
+        import streamlit_authenticator as stauth
         return stauth.Hasher.hash([pwd])[0]
     except Exception:
-        # old API: Hasher([...]).generate()
-        return stauth.Hasher([pwd]).generate()[0]
+        pass
+
+    # Old streamlit-authenticator API (<=0.2.x)
+    import streamlit_authenticator as stauth
+    return stauth.Hasher([pwd]).generate()[0]
+
 
 import json
 import streamlit_authenticator as stauth
