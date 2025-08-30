@@ -874,16 +874,17 @@ def build_authenticator(cookie_suffix: str = ""):
         cookie_expiry_days=cookie_days
     )
 
-cookie_suffix = st.session_state.get("_cookie_suffix","")
+# --- Build authenticator as you already do ---
+cookie_suffix = st.session_state.get("_cookie_suffix", "-v3")  # bump once to invalidate old cookie
 authenticator = build_authenticator(cookie_suffix)
 
-# --- Login (version-safe) ---
+# --- Login (works across streamlit-authenticator versions) ---
 res = authenticator.login(
     location="sidebar",
     fields={"Form name":"Login","Username":"Username","Password":"Password","Login":"Login"}
 )
 
-# Some versions return (name, authentication_status, username), others set session_state.
+# Some versions return a tuple; others only set session_state
 if isinstance(res, tuple) and len(res) == 3:
     name, authentication_status, username = res
 else:
@@ -896,17 +897,18 @@ if authentication_status is False:
 elif authentication_status is None:
     st.warning("Please enter your username and password"); st.stop()
 
-# Normalized identity
+# Normalize identity
 email = (username or "").strip().lower()
 st.session_state["name"] = name
 st.session_state["username"] = email
 
-# Super Admin from secrets
+# Super Admin list (comma separated) from secrets
 SUPER_ADMINS = {
     e.strip().lower()
     for e in (st.secrets.get("auth", {}).get("super_admins", "") or "").split(",")
     if e.strip()
 }
+
 ROLE = "Super Admin" if email in SUPER_ADMINS else "User"
 st.session_state["_role"] = ROLE
 
@@ -946,6 +948,15 @@ with st.sidebar:
     st.write(f"**Pharmacies:** {', '.join(ALLOWED_PHARM_IDS)}")
     try: authenticator.logout("Logout", "sidebar")
     except TypeError: authenticator.logout("Logout", "logout_sidebar_btn")
+
+with st.expander("Debug / Advanced"):
+    st.write({
+        "username": username,
+        "ROLE": ROLE,
+        "CLIENT_ID": CLIENT_ID,
+        "ALLOWED_PHARM_IDS": ALLOWED_PHARM_IDS,
+        "auth_status": st.session_state.get("authentication_status"),
+    })
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Dynamic modules engine
