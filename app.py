@@ -3148,7 +3148,9 @@ if not USE_POSTGRES:
 _clear_all_caches()  # make sure newly seeded rows are visible to this session
 
 # One-time ensure Clinic Purchase module + sheets exist/enabled for this client
-_seed_cp_once(CLIENT_ID)     # was: seed_clinic_purchase_assets_for_client(CLIENT_ID)
+# Only seed Sheets when not using Postgres/Neon
+if not USE_POSTGRES:
+    seed_clinic_purchase_assets_for_client(CLIENT_ID)
 _clear_all_caches()
 
 module_pairs, static_pages = nav_pages_for(ROLE)
