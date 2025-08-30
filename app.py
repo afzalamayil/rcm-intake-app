@@ -1456,6 +1456,13 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
 
             submitted = safe_submit_button("Submit", type="primary", use_container_width=True)
 
+    # Handle row delete after form submit of a delete button
+    del_idx = st.session_state.pop("_cp_delete_idx", None)
+    if del_idx is not None and isinstance(del_idx, int):
+        if 0 <= del_idx < len(st.session_state.get("_cp_rows", [])):
+            st.session_state["_cp_rows"].pop(del_idx)
+        st.rerun()
+
     if not submitted:
         return
 
@@ -1682,9 +1689,8 @@ def _render_clinic_purchase_unified():
             # Remove row?
             rc1, rc2 = st.columns([1,9])
             with rc1:
-                if st.button("🗑️", key=f"cp_del_{idx}") and len(rows)>1:
-                    rows.pop(idx)
-                    st.rerun()
+                if st.form_submit_button("🗑️", key=f"cp_del_{idx}") and len(rows)>1:
+                    st.session_state["_cp_delete_idx"] = idx
 
         st.write("")
         add, save = st.columns([1,6])
@@ -1699,6 +1705,13 @@ def _render_clinic_purchase_unified():
                 })
         with save:
             submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
+
+    # Handle row delete after form submit of a delete button
+    del_idx = st.session_state.pop("_cp_delete_idx", None)
+    if del_idx is not None and isinstance(del_idx, int):
+        if 0 <= del_idx < len(st.session_state.get("_cp_rows", [])):
+            st.session_state["_cp_rows"].pop(del_idx)
+        st.rerun()
 
     if not submitted:
         return
@@ -1904,6 +1917,13 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                 dup_override_key = f"{module_name}_dup_override"
                 st.checkbox("Allow duplicate override", key=dup_override_key)
                 submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
+
+    # Handle row delete after form submit of a delete button
+    del_idx = st.session_state.pop("_cp_delete_idx", None)
+    if del_idx is not None and isinstance(del_idx, int):
+        if 0 <= del_idx < len(st.session_state.get("_cp_rows", [])):
+            st.session_state["_cp_rows"].pop(del_idx)
+        st.rerun()
 
     if not submitted:
         return
