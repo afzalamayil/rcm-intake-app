@@ -639,15 +639,33 @@ def _clinic_items_price_map() -> dict:
             pm[name] = price
     return pm
 
-def _ensure_ws_with_headers(title: str, headers: list[str]):
+def _ensure_ws_with_headers(title, headers):
+    """
+    Ensure a storage surface with given headers.
+    - In Sheets mode: ensure worksheet + header row.
+    - In Postgres mode: create table if missing (empty with those columns), else do nothing.
+    """
+    if USE_POSTGRES:
+        # Try to read; if it fails or table missing, create empty table with headers
+        try:
+            _ = read_sheet_df(title, None)
+            return  # table exists; nothing to do
+        except Exception:
+            pass
+        import pandas as pd
+        empty = pd.DataFrame(columns=headers)
+        _save_whole_sheet(title, empty, headers)  # pg_* will create data_<title> if needed
+        return
+
+    # Google Sheets path
     w = ws(title)
-    try:
-        head = retry(lambda: w.row_values(1))
-    except Exception:
-        head = []  # tolerate read failures; we'll still try to write headers
-    merged = list(dict.fromkeys((head or []) + headers))
-    if (head or []) != merged:
-        retry(lambda: w.update("A1", [merged]))
+    head = retry(lambda: w.row_values(1))
+    if not head:
+        retry(lambda: w.update("A1", [headers]))
+    else:
+        merged = list(dict.fromkeys([*head, *headers]))
+        if [h.lower() for h in head] != [h.lower() for h in merged]:
+            retry(lambda: w.update("A1", [merged]))
     return w
 
 def seed_clinic_purchase_assets_for_client(client_id: str) -> bool:
@@ -3123,7 +3141,10 @@ def nav_pages_for(role: str):
     return module_pairs, pages
 
 # One-time ensure Clinic Purchase module + sheets exist/enabled for this client
-seed_clinic_purchase_assets_for_client(CLIENT_ID)
+# Only seed Sheets assets when not using Postgres/Neon
+if not USE_POSTGRES:
+    seed_clinic_purchase_assets_for_client(CLIENT_ID)
+
 _clear_all_caches()  # make sure newly seeded rows are visible to this session
 
 # One-time ensure Clinic Purchase module + sheets exist/enabled for this client
