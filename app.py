@@ -33,20 +33,10 @@ import streamlit as st
 
 # --- Safe submit button: works inside or outside a `st.form` ---
 def safe_submit_button(label="Submit", key=None, **kwargs):
-    """
-    Render a submit button that works both inside and outside st.form blocks.
-    - Inside a form: uses st.form_submit_button (returns True on submit)
-    - Outside a form: uses st.button (returns True on click)
-    """
-    # Streamlit raises an exception if form_submit_button is called outside a form.
+    """Render a submit button that works both inside and outside st.form."""
     try:
         return st.form_submit_button(label, **({} if key is None else {"key": key}) | kwargs)
     except Exception:
-        return st.button(label, **({} if key is None else {"key": key}) | kwargs)
-        # If we're in a form context, prefer the Streamlit submit button.
-        return safe_submit_button(label, **({} if key is None else {"key": key}) | kwargs)
-    except Exception:
-        # Fall back to a normal button when not within a form to avoid StreamlitAPIException.
         return st.button(label, **({} if key is None else {"key": key}) | kwargs)
 
 st.set_page_config(
@@ -288,7 +278,7 @@ CP_COLS = [
 
 # --- Unified Look (theme + wrappers) ---
 def apply_intake_theme(page_title: str = "RCM Intake", page_icon: str = "🧾"):
-st.caption(f"Backend: {'Postgres/Neon' if USE_POSTGRES else 'Google Sheets'}")
+    st.caption(f"Backend: {'Postgres/Neon' if USE_POSTGRES else 'Google Sheets'}")
     # DO NOT call st.set_page_config here
     st.markdown("""
     <style>
@@ -391,86 +381,66 @@ render_flash()
 # ─────────────────────────────────────────────────────────────────────────────
 # Google Sheets connect (retry + cache)
 # ─────────────────────────────────────────────────────────────────────────────
-REQUIRED_GS_KEYS = [
-    "type","project_id","private_key_id","private_key","client_email","client_id",
-    "auth_uri","token_uri","auth_provider_x509_cert_url","client_x509_cert_url"
-]
-missing = [k for k in REQUIRED_GS_KEYS if k not in GS]
-if missing:
-    st.error("Google Sheets credentials missing in secrets: " + ", ".join(missing)); st.stop()
+if not USE_POSTGRES:
+    REQUIRED_GS_KEYS = [
+        "type","project_id","private_key_id","private_key","client_email","client_id",
+        "auth_uri","token_uri","auth_provider_x509_cert_url","client_x509_cert_url"
+    ]
+    missing = [k for k in REQUIRED_GS_KEYS if k not in GS]
+    if missing:
+        st.error("Google Sheets credentials missing in secrets: " + ", ".join(missing)); st.stop()
 
-def _extract_spreadsheet_id(gs: dict) -> str:
-    url = (gs.get("sheet_url") or "").strip()
-    if url:
-        m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
-        if m: return m.group(1)
-    return (gs.get("spreadsheets_id") or gs.get("spreadsheet_id") or "").strip()
+    def _extract_spreadsheet_id(gs: dict) -> str:
+        url = (gs.get("sheet_url") or "").strip()
+        if url:
+            m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
+            if m: return m.group(1)
+        return (gs.get("spreadsheets_id") or gs.get("spreadsheet_id") or "").strip()
 
-SPREADSHEET_ID = _extract_spreadsheet_id(GS)
-SPREADSHEET_NAME = GS.get("spreadsheet_name", "RCM_Intake_DB").strip()
+    SPREADSHEET_ID = _extract_spreadsheet_id(GS)
+    SPREADSHEET_NAME = GS.get("spreadsheet_name", "RCM_Intake_DB").strip()
 
-if not SPREADSHEET_ID and not SPREADSHEET_NAME:
-    st.error("Provide either [gsheets].sheet_url OR spreadsheet_id OR spreadsheet_name in secrets."); st.stop()
+    if not SPREADSHEET_ID and not SPREADSHEET_NAME:
+        st.error("Provide either [gsheets].sheet_url OR spreadsheet_id OR spreadsheet_name in secrets."); st.stop()
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
-          "https://www.googleapis.com/auth/drive"]
+    SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
+              "https://www.googleapis.com/auth/drive"]
 
-def retry(fn, attempts=12, base=1.0):
-    for i in range(attempts):
+    @st.cache_resource(show_spinner=False)
+    def get_gspread_client():
+        gs_info = dict(GS)
+        gs_info["private_key"] = gs_info.get("private_key","").replace("\\n","\n")
+        creds = Credentials.from_service_account_info(gs_info, scopes=SCOPES)
+        return gspread.authorize(creds)
+
+    @st.cache_resource(show_spinner=False)
+    def get_spreadsheet(_gc):
         try:
-            return fn()
-        except Exception as e:
-            msg = str(e).lower()
-            if any(x in msg for x in [
-                "429", "rate", "quota", "deadline", "temporar",
-                "internal", "backenderror", "backend error",
-                "service unavailable", "exceeded"
-            ]):
-                # exponential backoff with jitter, cap per-try sleep at 10s
-                time.sleep(min(base * (2 ** i), 10) + random.random() * 0.5)
-                continue
-            raise
-    raise RuntimeError("Exceeded retries due to rate limiting.")
+            if SPREADSHEET_ID:
+                return retry(lambda: _gc.open_by_key(SPREADSHEET_ID))
+            return retry(lambda: _gc.open(SPREADSHEET_NAME))
+        except gspread.SpreadsheetNotFound:
+            if not SPREADSHEET_ID:
+                return retry(lambda: _gc.create(SPREADSHEET_NAME))
+            st.error("Spreadsheet ID not found or no access. Share the sheet with your service account email."); st.stop()
 
-@st.cache_resource(show_spinner=False)
-def get_gspread_client():
-    gs_info = dict(GS)
-    gs_info["private_key"] = gs_info.get("private_key","").replace("\\n","\n")
-    creds = Credentials.from_service_account_info(gs_info, scopes=SCOPES)
-    return gspread.authorize(creds)
+    gc = get_gspread_client()
+    sh = get_spreadsheet(gc)
 
-@st.cache_resource(show_spinner=False)
-def _seed_cp_once(client_id: str) -> bool:
-    # Best-effort: don't let rate limits crash the app
-    try:
-        seed_clinic_purchase_assets_for_client(client_id)
-        return True
-    except Exception as e:
-        st.warning("Clinic Purchase init deferred due to Sheets API rate limiting. "
-                   "You can continue using other pages and try again shortly.")
-        return False
+    def ws(name: str):
+        try: return retry(lambda: sh.worksheet(name))
+        except gspread.WorksheetNotFound: return retry(lambda: sh.add_worksheet(name, rows=2000, cols=120))
 
-@st.cache_resource(show_spinner=False)
-def get_spreadsheet(_gc):
-    try:
-        if SPREADSHEET_ID:
-            return retry(lambda: _gc.open_by_key(SPREADSHEET_ID))
-        return retry(lambda: _gc.open(SPREADSHEET_NAME))
-    except gspread.SpreadsheetNotFound:
-        if not SPREADSHEET_ID:
-            return retry(lambda: _gc.create(SPREADSHEET_NAME))
-        st.error("Spreadsheet ID not found or no access. Share the sheet with your service account email."); st.stop()
-
-gc = get_gspread_client()
-sh = get_spreadsheet(gc)
-
-def ws(name: str):
-    try: return retry(lambda: sh.worksheet(name))
-    except gspread.WorksheetNotFound: return retry(lambda: sh.add_worksheet(name, rows=2000, cols=120))
-
-@st.cache_data(ttl=60)
-def list_titles():
-    return {w.title for w in retry(lambda: sh.worksheets())}
+    @st.cache_data(ttl=60)
+    def list_titles():
+        return {w.title for w in retry(lambda: sh.worksheets())}
+else:
+    # Postgres mode: no Sheets; provide safe stubs to avoid accidental calls
+    def ws(name: str):
+        raise RuntimeError("ws() is not available in Postgres mode")
+    @st.cache_data(ttl=60)
+    def list_titles():
+        return set()
 
 # Robust reader: ALWAYS returns a DataFrame with the requested headers (even when sheet is empty/missing)
 def read_sheet_df(title: str, required_headers: list[str] | None = None) -> pd.DataFrame:
@@ -635,7 +605,8 @@ def _ensure_module_sheets_exist():
             meta = ["Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module","RecordID"]
             retry(lambda: wsx.update("A1", [meta]))
 
-_init_sheets_once()
+if not USE_POSTGRES:
+    _init_sheets_once()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Cached reads / masters
@@ -780,14 +751,16 @@ def doctors_master(client_id: str | None = None, pharmacy_id: str | None = None)
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _list_from_sheet(title, col_candidates=("Value","Name","Mode","Portal","Status")):
-    rows = retry(lambda: ws(title).get_all_values())
-    if not rows: return []
-    header = [h.strip() for h in rows[0]] if rows[0] else []
+    df = read_sheet_df(title, None).fillna("")
+    if df.empty:
+        return []
+    # pick first matching column, else the first non-empty column
     for c in col_candidates:
-        if c in header:
-            i = header.index(c)
-            return [r[i] for r in rows[1:] if len(r) > i and r[i]]
-    return [r[0] for r in rows[1:] if r and r[0]]
+        if c in df.columns:
+            ser = df[c].astype(str)
+            return [v for v in ser if v]
+    pick = next((c for c in df.columns if df[c].astype(str).str.strip().any()), df.columns[0])
+    return [v for v in df[pick].astype(str) if v]
 
 def safe_list(title, fallback):
     try:
@@ -1328,20 +1301,19 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
 
     module_key = "pharmacy"
 
-    # --- One-time header ensure per session ---
-    _hdr_flag = f"_headers_ok_{sheet_name}"
-    if not st.session_state.get(_hdr_flag, False):
-        wsx = ws(sheet_name)
-        head = retry(lambda: wsx.row_values(1))
-        if not head:
-            retry(lambda: wsx.update("A1", [LEGACY_HEADERS]))
-        else:
-            merged = list(dict.fromkeys([*head, *LEGACY_HEADERS]))
-            if [h.lower() for h in head] != [h.lower() for h in merged]:
-                retry(lambda: wsx.update("A1", [merged]))
-        st.session_state[_hdr_flag] = True
-    else:
-        wsx = ws(sheet_name)
+    # --- One-time header ensure per session (Sheets only) ---
+    if not USE_POSTGRES:
+        _hdr_flag = f"_headers_ok_{sheet_name}"
+        if not st.session_state.get(_hdr_flag, False):
+            wsx = ws(sheet_name)
+            head = retry(lambda: wsx.row_values(1))
+            if not head:
+                retry(lambda: wsx.update("A1", [LEGACY_HEADERS]))
+            else:
+                merged = list(dict.fromkeys([*head, *LEGACY_HEADERS]))
+                if [h.lower() for h in head] != [h.lower() for h in merged]:
+                    retry(lambda: wsx.update("A1", [merged]))
+            st.session_state[_hdr_flag] = True
 
     # --- masters (cached; no I/O on toggle) ---
     M = _cached_masters()
@@ -1506,14 +1478,12 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         # "Module":   "Pharmacy",
     }
 
-    # Append the row
+    # Persist to Neon (or Sheets if Postgres is off)
     if USE_POSTGRES:
-        # Write into the mapped table (pg_adapter resolves sheet_name -> table)
-        pg_append_row(sheet_name, row)
+        pg_append_row(sheet_name, row)   # "Data_Pharmacy" -> table data_pharmacy
     else:
-        # Fallback to Sheets
         ws(sheet_name).append_row(list(row.values()), value_input_option="USER_ENTERED")
-
+    
     flash("Saved to database.", "success")
    
     # --- Required checks ---
