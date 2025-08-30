@@ -2882,9 +2882,6 @@ if _role in ("super admin", "superadmin") and "Admin" not in static_pages:
 
 try:
     static_choice = st.sidebar.selectbox(
-if "Inventory" in (globals().get("STATIC_PAGES", []) or []) and static_choice == "Inventory":
-    _rt_render_inventory_page()
-
         "Tools & Reports",
         static_pages,
         index=None,                     # show placeholder until user picks
@@ -2907,6 +2904,12 @@ except TypeError:
 # --- Router: Admin page (SuperAdmin only) ---
 if static_choice == "Admin":
     st.header("Admin")
+
+# Inventory route (injected)
+if "Inventory" in (globals().get("STATIC_PAGES", []) or []) and static_choice == "Inventory":
+    _rt_render_inventory_page()
+    st.stop()
+
 
     if _role not in ("super admin", "superadmin"):
         st.error("Access denied")
@@ -3229,4 +3232,4 @@ def _rt_render_inventory_page():
     _st.download_button("Download inventory (.csv)", data=df.to_csv(index=False).encode("utf-8"), file_name=f"inventory_{int(time.time())}.csv", mime="text/csv", use_container_width=True)
 # ──────────────────────────────────────────────────────────────────────────────
 # End Injected
-# ──────────────────────────────────────────────────────────────────────────────    
+# ──────────────────────────────────────────────────────────────────────────────
