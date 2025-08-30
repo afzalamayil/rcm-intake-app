@@ -1298,6 +1298,8 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         "NetAmount","PatientShare","Remark","Status"
     ]
 
+    module_key = "pharmacy"
+
     # --- One-time header ensure per session ---
     _hdr_flag = f"_headers_ok_{sheet_name}"
     if not st.session_state.get(_hdr_flag, False):
@@ -1473,13 +1475,15 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
 
     # --- insurance split (Cash safe) ---
     ins_code, ins_name = "", ""
-    if str(st.session_state.insurance_display).strip().lower() == "cash":
-        ins_code = ins_name = "Cash"
-    elif " - " in st.session_state.insurance_display:
-        ins_code, ins_name = st.session_state.insurance_display.split(" - ", 1)
+    ins_disp = str(st.session_state.insurance_display).strip()
+    if ins_disp.lower() == "cash" or ins_disp == "":
+        ins_code, ins_name = "Cash", "Cash" if ins_disp.lower() == "cash" else ("", "")
+    elif " - " in ins_disp:
+        ins_code, ins_name = ins_disp.split(" - ", 1)
         ins_code, ins_name = ins_code.strip(), ins_name.strip()
     else:
-        ins_name = st.session_state.insurance_display
+        # If only a name was selected (no " - "), treat it as Name and leave Code blank
+        ins_code, ins_name = "", ins_disp
 
     # --- duplicate check (same-day ERX + Net) ---
     try:
@@ -1511,7 +1515,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         st.session_state.employee_name.strip(),
         format_date(st.session_state.submission_date),
         st.session_state.submission_mode,
-        st.session_state[f"{module_name}_submission_type"],
+        get_submission_type(module_key),
         st.session_state.portal,
         st.session_state.erx_number.strip(),
         ins_code, ins_name,
@@ -1532,7 +1536,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         except Exception: pass
 
         st.session_state["_clear_form"] = True
-        st.session_state[f"{module_name}_submission_type"] = "Insurance"
+        get_submission_type(module_key)] = "Insurance"
         st.session_state["_was_cash"] = False
         flash("Saved ✔️", "success")
     except Exception as e:
