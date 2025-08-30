@@ -791,11 +791,28 @@ USERS_DF = load_users_df()
 import json
 import streamlit_authenticator as stauth
 
+def _hash_password_compat(pwd: str) -> str:
+    """Hash password for both old and new streamlit-authenticator APIs."""
+    if not isinstance(pwd, str):
+        pwd = str(pwd or "")
+    # keep bcrypt as-is
+    if pwd.startswith("$2a$") or pwd.startswith("$2b$") or pwd.startswith("$2y$"):
+        return pwd
+    # new API (0.3+): Hasher.hash([...])
+    try:
+        return stauth.Hasher.hash([pwd])[0]
+    except Exception:
+        # old API: Hasher([...]).generate()
+        return stauth.Hasher([pwd]).generate()[0]
+
+import json
+import streamlit_authenticator as stauth
+
 def build_authenticator(cookie_suffix: str = ""):
     auth_sec = st.secrets.get("auth", {})
     demo_users = auth_sec.get("demo_users", "{}")
 
-    # Parse JSON string if needed
+    # Parse demo_users whether it's a JSON string or a dict
     if isinstance(demo_users, str):
         try:
             users = json.loads(demo_users)
@@ -807,21 +824,12 @@ def build_authenticator(cookie_suffix: str = ""):
         users = {}
 
     creds = {"usernames": {}}
-
     for username, info in users.items():
-        name = (info or {}).get("name", username)
-        pwd  = (info or {}).get("password", "")
+        info = info or {}
+        name = info.get("name", username)
+        pwd  = info.get("password", "")
 
-        # Ensure it’s a string
-        if not isinstance(pwd, str):
-            pwd = str(pwd or "")
-
-        # Keep bcrypt hashes as-is, otherwise hash
-        if pwd.startswith("$2a$") or pwd.startswith("$2b$") or pwd.startswith("$2y$"):
-            hashed = pwd
-        else:
-            hashed = stauth.Hasher([pwd]).generate()[0]
-
+        hashed = _hash_password_compat(pwd)
         creds["usernames"][username] = {"name": name, "password": hashed}
 
     cookie_name = (auth_sec.get("cookie_name") or "rcm_intake_app") + cookie_suffix
