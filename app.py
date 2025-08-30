@@ -1545,7 +1545,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         except Exception: pass
 
         st.session_state["_clear_form"] = True
-        get_submission_type(module_key) = "Insurance"
+        st.session_state[f"{module_key}_submission_type"] = "Insurance"
         st.session_state["_was_cash"] = False
         flash("Saved ✔️", "success")
     except Exception as e:
@@ -2813,7 +2813,7 @@ def _render_update_record_page():
 # Navigation (dynamic modules + static pages)
 # ─────────────────────────────────────────────────────────────────────────────
 STATIC_PAGES = ["View / Export", "Email / WhatsApp", "Masters Admin",
-                "Bulk Import Insurance", "Summary", "Update Record"]
+                "Bulk Import Insurance", "Summary", "Update Record", "Inventory"]
 
 def nav_pages_for(role: str):
     module_pairs = modules_enabled_for(CLIENT_ID, role)  # dynamic modules
@@ -2882,6 +2882,9 @@ if _role in ("super admin", "superadmin") and "Admin" not in static_pages:
 
 try:
     static_choice = st.sidebar.selectbox(
+if "Inventory" in (globals().get("STATIC_PAGES", []) or []) and static_choice == "Inventory":
+    _rt_render_inventory_page()
+
         "Tools & Reports",
         static_pages,
         index=None,                     # show placeholder until user picks
@@ -3123,3 +3126,107 @@ def _render_update_record_page():
                         st.error(f"Failed to save: {e}")
                 else:
                     st.error("Could not locate the selected row in the latest data; please refresh and try again.")
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# RITE: Inventory Module (Injected)
+# ──────────────────────────────────────────────────────────────────────────────
+def _rt_inv_items_price_map():
+    import pandas as _pd
+    import gspread as _gspread
+    from google.oauth2.service_account import Credentials as _Creds
+    import streamlit as _st
+    try:
+        df = _sheet_df("MS:Items", ["Sl.No.","Particulars","Value"]).copy()
+    except Exception:
+        GS = dict(_st.secrets.get("gsheets", {}))
+        if "private_key" in GS:
+            GS["private_key"] = GS["private_key"].replace("\\\\n","\\n").replace("\\n","\\n")
+        client = _gclient() if "_gclient" in globals() else _gspread.authorize(_Creds.from_service_account_info(GS))
+        sid = GS.get("spreadsheet_id") or GS.get("spreadsheets_id") or ""
+        if not sid and GS.get("sheet_url"):
+            import re as _re
+            m = _re.search(r"/spreadsheets/d/([A-Za-z0-9-_]+)", GS["sheet_url"])
+            if m: sid = m.group(1)
+        sh = client.open_by_key(sid)
+        ws = sh.worksheet("MS:Items")
+        vals = ws.get_all_values() or []
+        head = vals[0] if vals else ["Sl.No.","Particulars","Value"]
+        rows = vals[1:] if len(vals)>1 else []
+        df = _pd.DataFrame(rows, columns=head)
+    if df.empty: return {}
+    df["Value"] = _pd.to_numeric(df.get("Value", 0), errors="coerce").fillna(0.0)
+    return {str(r.get("Particulars","")).strip(): float(r.get("Value",0.0)) for _, r in df.iterrows() if str(r.get("Particulars","")).strip()}
+
+def _rt_inv_opening_stock_df():
+    import pandas as _pd
+    try:
+        df = _sheet_df("OpeningStock", ["Item","OpeningQty","OpeningValue"]).copy()
+    except Exception:
+        df = _pd.DataFrame(columns=["Item","OpeningQty","OpeningValue"])
+    df["OpeningQty"] = _pd.to_numeric(df.get("OpeningQty", 0), errors="coerce").fillna(0.0)
+    df["OpeningValue"] = _pd.to_numeric(df.get("OpeningValue", 0), errors="coerce").fillna(0.0)
+    return df
+
+def _rt_inv_clinic_purchase_df():
+    import pandas as _pd
+    cols = ["Timestamp","EnteredBy","PharmacyID","PharmacyName","Date","EmpName","Item","Clinic_Qty","Clinic_Value","Clinic_Status","Audit","Comments","SP_Qty","SP_Value","SP_Status","Util_Qty","Util_Value","Instock_Qty","Instock_Value","RecordID"]
+    try:
+        df = _sheet_df("ClinicPurchase", cols).copy()
+    except Exception:
+        df = _pd.DataFrame(columns=cols)
+    for c in ["Clinic_Qty","Clinic_Value","SP_Qty","SP_Value","Util_Qty","Util_Value","Instock_Qty","Instock_Value"]:
+        df[c] = _pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0.0)
+    return df
+
+def _rt_compute_inventory(pharmacy_id=None):
+    import pandas as _pd
+    cp = _rt_inv_clinic_purchase_df()
+    if pharmacy_id and "PharmacyID" in cp.columns:
+        cp = cp[cp["PharmacyID"].astype(str).str.strip() == str(pharmacy_id).strip()]
+    grp = (cp.groupby("Item", dropna=False)[["Clinic_Qty","Clinic_Value","SP_Qty","SP_Value","Util_Qty","Util_Value"]].sum().reset_index())
+    op = _rt_inv_opening_stock_df()
+    grp = grp.merge(op[["Item","OpeningQty","OpeningValue"]], on="Item", how="left")
+    grp["OpeningQty"] = _pd.to_numeric(grp.get("OpeningQty", 0), errors="coerce").fillna(0.0)
+    prices = _rt_inv_items_price_map()
+    grp["Price"] = grp["Item"].map(lambda x: float(prices.get(str(x).strip(), 0.0)))
+    grp["Available_Qty"] = grp["OpeningQty"] + grp["SP_Qty"] - grp["Util_Qty"]
+    grp["Available_Value"] = grp["Available_Qty"] * grp["Price"]
+    summary = {
+        "Total Requested (Qty)": float(grp["Clinic_Qty"].sum()),
+        "Total Received (Qty)": float(grp["SP_Qty"].sum()),
+        "Total Used (Qty)": float(grp["Util_Qty"].sum()),
+        "Total Available (Qty)": float(grp["Available_Qty"].sum()),
+        "Total Available (Value)": float(grp["Available_Value"].sum()),
+    }
+    disp = grp[["Item","Price","OpeningQty","Clinic_Qty","SP_Qty","Util_Qty","Available_Qty","Available_Value"]].copy().sort_values(by=["Item"]).reset_index(drop=True)
+    return disp, summary
+
+def _rt_render_inventory_page():
+    import streamlit as _st
+    _st.markdown("### Inventory & Summary")
+    try:
+        ph_df = _sheet_df("Pharmacies", ["ID","Name"]).copy()
+        ph_df["ID"] = ph_df["ID"].astype(str).str.strip()
+        ph_df["Name"] = ph_df["Name"].astype(str).str.strip()
+        ph_opts = ["All"] + (ph_df["ID"] + " - " + ph_df["Name"]).tolist()
+    except Exception:
+        ph_opts = ["All"]
+    ph_choice = _st.selectbox("Filter by Pharmacy (optional)", ph_opts)
+    ph_id = None
+    if ph_choice != "All" and " - " in ph_choice:
+        ph_id = ph_choice.split(" - ", 1)[0]
+    df, summary = _rt_compute_inventory(pharmacy_id=ph_id)
+    k1,k2,k3,k4 = _st.columns(4)
+    k1.metric("Total Requested (Qty)", f"{summary['Total Requested (Qty)']:,.2f}")
+    k2.metric("Total Received (Qty)", f"{summary['Total Received (Qty)']:,.2f}")
+    k3.metric("Total Used (Qty)", f"{summary['Total Used (Qty)']:,.2f}")
+    k4.metric("Total Available (Qty)", f"{summary['Total Available (Qty)']:,.2f}")
+    _st.metric("Total Available (Value)", f"{summary['Total Available (Value)']:,.2f}")
+    _st.divider()
+    _st.dataframe(df, use_container_width=True, hide_index=True)
+    _st.download_button("Download inventory (.csv)", data=df.to_csv(index=False).encode("utf-8"), file_name=f"inventory_{int(time.time())}.csv", mime="text/csv", use_container_width=True)
+# ──────────────────────────────────────────────────────────────────────────────
+# End Injected
+# ──────────────────────────────────────────────────────────────────────────────    
