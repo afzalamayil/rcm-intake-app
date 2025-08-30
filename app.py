@@ -68,6 +68,18 @@ import streamlit_authenticator as stauth
 from contextlib import contextmanager
 import time
 
+# Simple retry helper used by Sheets code
+def retry(fn, tries: int = 3, delay: float = 0.3):
+    last = None
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if i == tries - 1:
+                raise
+            time.sleep(delay)
+
 # =========================
 # ADMIN UTILITIES (Cloud)
 # =========================
@@ -1281,6 +1293,98 @@ def _save_whole_sheet(sheet_title: str, df: pd.DataFrame, headers: list[str]):
     except Exception as e:
         st.error(f"Save failed: {e}")
         return False
+# ─────────────────────────────────────────────────────────────────────────────
+# Postgres (Neon) adapters: sheet-like API (pg_*)
+# ─────────────────────────────────────────────────────────────────────────────
+import re
+import pandas as pd
+from sqlalchemy import create_engine, text
+import streamlit as st
+
+@st.cache_resource(show_spinner=False)
+def _get_engine():
+    url = st.secrets["postgres"]["url"]
+    # Neon needs sslmode=require in the URL (you already have it)
+    return create_engine(url, pool_pre_ping=True, future=True)
+
+def _sheet_title_to_table(title: str) -> str:
+    """Map 'Data_Pharmacy' -> 'data_pharmacy', 'Clients' -> 'clients'."""
+    t = (title or "").strip().lower()
+    t = re.sub(r"[^a-z0-9_]+", "_", t)      # non-alnum → _
+    t = re.sub(r"_{2,}", "_", t).strip("_") # collapse __
+    return t
+
+def _table_exists(table: str) -> bool:
+    eng = _get_engine()
+    q = text("""
+        SELECT EXISTS (
+          SELECT FROM information_schema.tables
+          WHERE table_schema = 'public' AND table_name = :t
+        )
+    """)
+    with eng.connect() as con:
+        return bool(con.execute(q, {"t": table}).scalar())
+
+def pg_read_sheet_df(title: str, required_headers=None) -> pd.DataFrame:
+    """
+    Read a 'sheet' as a table from Postgres.
+    Returns empty DF with required_headers if table doesn't exist yet.
+    """
+    table = _sheet_title_to_table(title)
+    eng = _get_engine()
+
+    if not _table_exists(table):
+        cols = list(required_headers or [])
+        return pd.DataFrame(columns=cols)
+
+    # Select all columns; keep order if required_headers provided
+    if required_headers:
+        cols_sql = ", ".join(f'"{c}"' for c in required_headers)
+        sql = f'SELECT {cols_sql} FROM "{table}"'
+    else:
+        sql = f'SELECT * FROM "{table}"'
+
+    with eng.begin() as con:
+        df = pd.read_sql(sql, con)
+    return df
+
+def pg_save_whole_sheet(title: str, df: pd.DataFrame, headers: list[str]):
+    """
+    Replace entire table with df (matching 'headers' order).
+    Creates the table if it doesn't exist.
+    """
+    table = _sheet_title_to_table(title)
+    eng = _get_engine()
+
+    # Ensure dataframe has exactly the requested columns & order
+    headers = list(headers or [])
+    if headers:
+        for h in headers:
+            if h not in df.columns:
+                df[h] = ""
+        df = df[headers]
+    df = df.fillna("")
+
+    # Replace table contents
+    with eng.begin() as con:
+        con.exec_driver_sql(f'DROP TABLE IF EXISTS "{table}" CASCADE;')
+        # use to_sql to create table with inferred types (mostly TEXT)
+        df.to_sql(table, con, if_exists="replace", index=False, method="multi", chunksize=1000)
+
+def pg_append_row(title: str, row: dict):
+    """
+    Append a single row (dict) to the table.
+    Creates the table with those columns if missing.
+    """
+    table = _sheet_title_to_table(title)
+    eng = _get_engine()
+    df = pd.DataFrame([row]).fillna("")
+
+    with eng.begin() as con:
+        if not _table_exists(table):
+            df.to_sql(table, con, if_exists="replace", index=False)
+        else:
+            df.to_sql(table, con, if_exists="append", index=False)
 
 # --- Switch generic helpers to Postgres when enabled ---
 if USE_POSTGRES:
