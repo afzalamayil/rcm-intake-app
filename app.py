@@ -1563,9 +1563,151 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
 # ─────────────────────────────────────────────────────────────────────────────
 # Dynamic form engine (non-Pharmacy modules)
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Custom multi‑row Clinic Purchase Intake (as per new layout)
+# ──────────────────────────────────────────────────────────────────────────────
+def _render_clinic_purchase_unified():
+    st.markdown("### Clinic Purchase")
+    st.caption("Create / update entry")
+    st.markdown('<div class="intake-topbar"><small>Intake · Unified Layout</small></div>', unsafe_allow_html=True)
+
+    # Masters
+    ph_df = pharmacies_list_df() if "pharmacies_list_df" in globals() else pharm_master()
+    if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"]:
+        ph_df = ph_df[ph_df["ID"].isin(ALLOWED_PHARM_IDS)]
+    pharm_choices = ph_df["Display"].tolist() if not ph_df.empty else ["—"]
+
+    status_opts = _sheet_df(TAB_STATUS, ["Value"])["Value"].tolist() if "TAB_STATUS" in globals() else ["Submitted","Approved","Rejected","Pending","RA Pending"]
+    prices = items_price_map() if "items_price_map" in globals() else {}
+
+    with st.form("clinic_purchase_multirow", clear_on_submit=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            ph_display = st.selectbox("Pharmacy (ID - Name)*", pharm_choices, key="cp_pharmacy_display")
+        with c2:
+            d = st.date_input("Date*", value=date.today(), key="cp_date")
+        with c3:
+            emp = st.text_input("Emp Name*", key="cp_emp")
+
+        # rows in session
+        if "_cp_rows" not in st.session_state:
+            st.session_state["_cp_rows"] = [{
+                "item":"",
+                "clinic_qty":0.0,
+                "sp_qty":0.0,
+                "sp_status":"Submitted",
+                "clinic_status":"Submitted",
+                "remark":"",
+                "util_qty":0.0,
+            }]
+
+        rows = st.session_state["_cp_rows"]
+
+        st.write("")
+
+        # Header row
+        st.markdown("**Clinic Employee**  →  **Next Employee (Received)**  →  **Clinic Employee (Status/Remark & Used)**")
+        for idx, r in enumerate(rows):
+            st.divider() if idx==0 else None
+            c1,c2,c3,c4,c5,c6,c7 = st.columns((3,1,1,1.4,1.4,2,1))
+            with c1:
+                item_keys = list(prices.keys())
+                default_idx = item_keys.index(r["item"]) if r["item"] in item_keys else (0 if item_keys else 0)
+                item = st.selectbox(f"Item {idx+1}", item_keys, index=default_idx if item_keys else 0, key=f"cp_item_{idx}")
+            with c2:
+                r["clinic_qty"] = st.number_input("Clinic Qty", min_value=0.0, step=1.0, format="%.2f", key=f"cp_cqty_{idx}")
+            with c3:
+                r["sp_qty"] = st.number_input("Received Qty", min_value=0.0, step=1.0, format="%.2f", key=f"cp_spqty_{idx}")
+            with c4:
+                r["sp_status"] = st.selectbox("Received Status", status_opts, index=(status_opts.index(r["sp_status"]) if r["sp_status"] in status_opts else 0), key=f"cp_spst_{idx}")
+            with c5:
+                r["clinic_status"] = st.selectbox("Clinic Status", status_opts, index=(status_opts.index(r["clinic_status"]) if r["clinic_status"] in status_opts else 0), key=f"cp_clst_{idx}")
+            with c6:
+                r["remark"] = st.text_input("Remark", value=r.get("remark",""), key=f"cp_rem_{idx}")
+            with c7:
+                r["util_qty"] = st.number_input("Used Qty", min_value=0.0, step=1.0, format="%.2f", key=f"cp_util_{idx}")
+
+            # second row with computed amounts and pending
+            u = float(prices.get(st.session_state.get(f"cp_item_{idx}", ""), 0.0) or 0.0)
+            clinic_val = float(st.session_state.get(f"cp_cqty_{idx}", 0.0)) * u
+            sp_val = float(st.session_state.get(f"cp_spqty_{idx}", 0.0)) * u
+            pending = float(st.session_state.get(f"cp_spqty_{idx}", 0.0)) - float(st.session_state.get(f"cp_util_{idx}", 0.0))
+
+            cc1, cc2, cc3, cc4 = st.columns((2,2,2,2))
+            with cc1: st.write(f"**Unit Price:** {u:,.2f}")
+            with cc2: st.write(f"**Clinic Amount:** {clinic_val:,.2f}")
+            with cc3: st.write(f"**Received Amount:** {sp_val:,.2f}")
+            with cc4: st.write(f"**Pending (Rec - Used):** {pending:,.2f}")
+
+            # Remove row?
+            rc1, rc2 = st.columns([1,9])
+            with rc1:
+                if st.button("🗑️", key=f"cp_del_{idx}") and len(rows)>1:
+                    rows.pop(idx)
+                    st.rerun()
+
+        st.write("")
+        add, save = st.columns([1,6])
+        with add:
+            if st.button("+ Add item", key="cp_add"):
+                item_keys = list(prices.keys())
+                rows.append({
+                    "item": item_keys[0] if item_keys else "",
+                    "clinic_qty": 0.0, "sp_qty": 0.0, "sp_status": status_opts[0] if status_opts else "Submitted",
+                    "clinic_status": status_opts[0] if status_opts else "Submitted",
+                    "remark":"", "util_qty":0.0,
+                })
+        with save:
+            submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
+
+    if not submitted:
+        return
+
+    # Save each row as an entry in ClinicPurchase (one row per item)
+    ph_id, ph_name = ("","")
+    ph_disp = st.session_state.get("cp_pharmacy_display", "")
+    if " - " in ph_disp: ph_id, ph_name = ph_disp.split(" - ", 1)
+
+    _ensure_headers(TAB_CP, CP_HEADERS)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for idx, _ in enumerate(st.session_state["_cp_rows"]):
+        item = st.session_state.get(f"cp_item_{idx}", "")
+        unit = float(prices.get(item, 0.0) or 0.0)
+        cqty = float(st.session_state.get(f"cp_cqty_{idx}", 0.0) or 0.0)
+        spq  = float(st.session_state.get(f"cp_spqty_{idx}", 0.0) or 0.0)
+        util = float(st.session_state.get(f"cp_util_{idx}", 0.0) or 0.0)
+        if not item or (cqty<=0 and spq<=0 and util<=0):
+            continue  # skip completely empty lines
+
+        row = [
+            now, (st.session_state.get("username") or st.session_state.get("name") or ""),
+            ph_id, ph_name,
+            st.session_state.get("cp_date").strftime("%Y-%m-%d") if st.session_state.get("cp_date") else "",
+            st.session_state.get("cp_emp",""),
+            item,
+            cqty, cqty*unit, st.session_state.get(f"cp_clst_{idx}", "Submitted"), "SecondParty",
+            st.session_state.get(f"cp_rem_{idx}", ""),
+            spq, spq*unit, st.session_state.get(f"cp_spst_{idx}", "Submitted"),
+            util, util*unit,
+            "", "",  # instock fields not captured here
+            str(uuid.uuid4())
+        ]
+        _append_row(TAB_CP, [str(x) for x in row])
+
+    st.success("Saved.")
+
+
 def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role: str):
     # Pharmacy uses the exact screenshot layout
     if str(module_name).strip().lower() == "pharmacy":
+        _render_legacy_pharmacy_intake(sheet_name)
+        return
+    # Custom handler for Clinic Purchase
+    if str(module_name).strip().lower().replace(" ", "") in ("clinicpurchase","clinic_purchase"):
+        _render_clinic_purchase_unified()
+        return
         _render_legacy_pharmacy_intake(sheet_name)
         return
 
