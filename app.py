@@ -1567,6 +1567,45 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
 # ──────────────────────────────────────────────────────────────────────────────
 # Custom multi‑row Clinic Purchase Intake (as per new layout)
 # ──────────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OpeningStock running-balance helpers (adjustment model)
+# ──────────────────────────────────────────────────────────────────────────────
+def _rt_opening_qty_for_item(item_name: str) -> float:
+    try:
+        df = _sheet_df(TAB_OPENING, ["Item","OpeningQty","OpeningValue"]).copy()
+    except Exception:
+        return 0.0
+    if df.empty or "Item" not in df.columns:
+        return 0.0
+    m = df["Item"].astype(str).str.strip() == str(item_name).strip()
+    if not m.any():
+        return 0.0
+    import pandas as _pd
+    return float(_pd.to_numeric(df.loc[m, "OpeningQty"], errors="coerce").fillna(0.0).iloc[0])
+
+def _rt_update_opening_stock_delta(item_name: str, delta_qty: float, unit_price: float):
+    """Increase/decrease OpeningStock for an item by delta, and recompute value."""
+    w = _ws(TAB_OPENING)
+    df = _sheet_df(TAB_OPENING, ["Item","OpeningQty","OpeningValue"]).copy()
+    item = str(item_name).strip()
+    if df.empty or "Item" not in df.columns or not (df["Item"].astype(str).str.strip()==item).any():
+        new_qty = float(delta_qty)
+        new_val = new_qty * float(unit_price)
+        # ensure header row exists before append
+        _ensure_headers(TAB_OPENING, ["Item","OpeningQty","OpeningValue"])
+        w.append_row([item, new_qty, new_val], value_input_option="USER_ENTERED")
+        return new_qty, new_val
+    # update first matching row
+    idx = df.index[df["Item"].astype(str).str.strip()==item][0]
+    import pandas as _pd
+    prev_qty = float(_pd.to_numeric(df.loc[idx, "OpeningQty"], errors="coerce") or 0.0)
+    new_qty = prev_qty + float(delta_qty)
+    new_val = new_qty * float(unit_price)
+    row_num = int(idx) + 2  # +1 header, +1 to convert 0-index → 1-index
+    w.update(f"B{row_num}:C{row_num}", [[new_qty, new_val]])
+    return new_qty, new_val
+
 def _render_clinic_purchase_unified():
     st.markdown("### Clinic Purchase")
     st.caption("Create / update entry")
@@ -1681,6 +1720,8 @@ def _render_clinic_purchase_unified():
         if not item or (cqty<=0 and spq<=0 and util<=0):
             continue  # skip completely empty lines
 
+        prev_opening_qty = _rt_opening_qty_for_item(item)
+        new_instock_qty = prev_opening_qty + spq - util
         row = [
             now, (st.session_state.get("username") or st.session_state.get("name") or ""),
             ph_id, ph_name,
@@ -1691,10 +1732,12 @@ def _render_clinic_purchase_unified():
             st.session_state.get(f"cp_rem_{idx}", ""),
             spq, spq*unit, st.session_state.get(f"cp_spst_{idx}", "Submitted"),
             util, util*unit,
-            "", "",  # instock fields not captured here
+            new_instock_qty, new_instock_qty*unit,
             str(uuid.uuid4())
         ]
         _append_row(TAB_CP, [str(x) for x in row])
+        # Apply delta to OpeningStock (running balance)
+        _rt_update_opening_stock_delta(item, spq - util, unit)
 
     st.success("Saved.")
 
