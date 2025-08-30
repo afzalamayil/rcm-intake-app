@@ -928,7 +928,8 @@ def get_user_role_pharms_client(u):
             return role, (pharms or ["ALL"]), client_id
     return "User", ["ALL"], "DEFAULT"
 
-ROLE, ALLOWED_PHARM_IDS, CLIENT_ID = get_user_role_pharms_client(username)
+role_from_sheet, ALLOWED_PHARM_IDS, CLIENT_ID = get_user_role_pharms_client(username)
+ROLE = "Super Admin" if st.session_state.get("_role") == "Super Admin" else role_from_sheet
 
 def _show_toolbar_for_superadmin(role: str):
     if str(role).strip().lower() in ("super admin","superadmin"):
