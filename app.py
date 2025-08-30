@@ -33,7 +33,16 @@ import streamlit as st
 
 # --- Safe submit button: works inside or outside a `st.form` ---
 def safe_submit_button(label="Submit", key=None, **kwargs):
+    """
+    Render a submit button that works both inside and outside st.form blocks.
+    - Inside a form: uses st.form_submit_button (returns True on submit)
+    - Outside a form: uses st.button (returns True on click)
+    """
+    # Streamlit raises an exception if form_submit_button is called outside a form.
     try:
+        return st.form_submit_button(label, **({} if key is None else {"key": key}) | kwargs)
+    except Exception:
+        return st.button(label, **({} if key is None else {"key": key}) | kwargs)
         # If we're in a form context, prefer the Streamlit submit button.
         return safe_submit_button(label, **({} if key is None else {"key": key}) | kwargs)
     except Exception:
