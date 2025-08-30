@@ -288,6 +288,7 @@ CP_COLS = [
 
 # --- Unified Look (theme + wrappers) ---
 def apply_intake_theme(page_title: str = "RCM Intake", page_icon: str = "🧾"):
+st.caption(f"Backend: {'Postgres/Neon' if USE_POSTGRES else 'Google Sheets'}")
     # DO NOT call st.set_page_config here
     st.markdown("""
     <style>
@@ -1078,6 +1079,8 @@ def _is_phone_field(key: str) -> bool:
     return any(tag in k for tag in PHONE_KEYS)
 
 def _check_duplicate_if_needed(sheet_name: str, module_name: str, data_map: dict) -> bool:
+    if USE_POSTGRES:
+        return False  # TODO: implement SQL-based duplicate check later
     cat = modules_catalog_df()
     row = cat[cat["Module"]==module_name]
     if row.empty: return False
@@ -1197,6 +1200,13 @@ def _save_whole_sheet(sheet_title: str, df: pd.DataFrame, headers: list[str]):
     except Exception as e:
         st.error(f"Save failed: {e}")
         return False
+
+# --- Switch generic helpers to Postgres when enabled ---
+if USE_POSTGRES:
+    # These were imported from pg_adapter at the top
+    read_sheet_df     = pg_read_sheet_df
+    _save_whole_sheet = pg_save_whole_sheet
+    append_row        = pg_append_row  # (only if you call append_row anywhere)
 
 def _load_for_editor(title: str, headers: list[str]) -> pd.DataFrame:
     df = read_sheet_df(title, headers).copy()
@@ -1466,6 +1476,46 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
     if not submitted:
         return
 
+    # ---------- SAVE to storage ----------
+    # Build the row dict in the exact column order your sheet/table expects
+    # (Adjust keys if your headers differ)
+    row = {
+        "Timestamp":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "SubmittedBy":   username or name or "",
+        "Role":          ROLE,
+        "PharmacyID":    (st.session_state.get("pharmacy_display","").split(" - ",1)[0].strip() if st.session_state.get("pharmacy_display") else ""),
+        "PharmacyName":  (st.session_state.get("pharmacy_display","").split(" - ",1)[1].strip() if st.session_state.get("pharmacy_display") and " - " in st.session_state.get("pharmacy_display") else ""),
+        "EmployeeName":  st.session_state.get("employee_name",""),
+        "SubmissionDate": (st.session_state.get("submission_date") or date.today()).strftime("%Y-%m-%d"),
+        "SubmissionMode": st.session_state.get("submission_mode",""),
+        "Type":           get_submission_type("pharmacy") or st.session_state.get("type",""),
+        "Portal":         st.session_state.get("portal",""),
+        "ERXNumber":      st.session_state.get("erx_number",""),
+        "InsuranceCode":  (st.session_state.get("insurance_display","").split(" - ",1)[0].strip() if st.session_state.get("insurance_display") and " - " in st.session_state.get("insurance_display") else ""),
+        "InsuranceName":  (st.session_state.get("insurance_display","").split(" - ",1)[1].strip() if st.session_state.get("insurance_display") and " - " in st.session_state.get("insurance_display") else st.session_state.get("insurance_display","")),
+        "MemberID":       st.session_state.get("member_id",""),
+        "EID":            st.session_state.get("eid",""),
+        "ClaimID":        st.session_state.get("claim_id",""),
+        "ApprovalCode":   st.session_state.get("approval_code",""),
+        "NetAmount":      f"{float(st.session_state.get('net_amount',0.0)):.2f}",
+        "PatientShare":   f"{float(st.session_state.get('patient_share',0.0)):.2f}",
+        "Remark":         st.session_state.get("remark",""),
+        "Status":         st.session_state.get("status",""),
+        # Optional: include ClientID/PharmacyName/Module if your table has these meta columns
+        # "ClientID": CLIENT_ID,
+        # "Module":   "Pharmacy",
+    }
+
+    # Append the row
+    if USE_POSTGRES:
+        # Write into the mapped table (pg_adapter resolves sheet_name -> table)
+        pg_append_row(sheet_name, row)
+    else:
+        # Fallback to Sheets
+        ws(sheet_name).append_row(list(row.values()), value_input_option="USER_ENTERED")
+
+    flash("Saved to database.", "success")
+   
     # --- Required checks ---
     required = {
         "Employee Name":   st.session_state.employee_name,
