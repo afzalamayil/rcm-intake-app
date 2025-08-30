@@ -31,6 +31,15 @@ import uuid
 import pandas as pd
 import streamlit as st
 
+# --- Safe submit button: works inside or outside a `st.form` ---
+def safe_submit_button(label="Submit", key=None, **kwargs):
+    try:
+        # If we're in a form context, prefer the Streamlit submit button.
+        return safe_submit_button(label, **({} if key is None else {"key": key}) | kwargs)
+    except Exception:
+        # Fall back to a normal button when not within a form to avoid StreamlitAPIException.
+        return st.button(label, **({} if key is None else {"key": key}) | kwargs)
+
 st.set_page_config(
     page_title="RCM Intake",
     page_icon="💊",
@@ -1436,7 +1445,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
             st.text_area("Remark (optional)", key="remark")
             st.checkbox("Allow duplicate override", key="allow_dup_override")
 
-            submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
+            submitted = safe_submit_button("Submit", type="primary", use_container_width=True)
 
     if not submitted:
         return
@@ -1536,7 +1545,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         except Exception: pass
 
         st.session_state["_clear_form"] = True
-        get_submission_type(module_key) or "Insurance"
+        get_submission_type(module_key)] = "Insurance"
         st.session_state["_was_cash"] = False
         flash("Saved ✔️", "success")
     except Exception as e:
@@ -1699,7 +1708,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
 
             dup_override_key = f"{module_name}_dup_override"
             st.checkbox("Allow duplicate override", key=dup_override_key)
-            submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
+            submitted = safe_submit_button("Submit", type="primary", use_container_width=True)
 
     if not submitted:
         return
@@ -2543,7 +2552,7 @@ def _render_summary_page():
 
         # 10) Excel download
         out = io.BytesIO()
-        with pd.ExcelWriter(out, engine="openpyxl") as xw:
+        with pd.ExcelWriter(out, engine="xlsxwriter") as xw:
             pvt.to_excel(xw, sheet_name="Summary", index=False)
         st.download_button("⬇️ Download Summary (Excel)", data=out.getvalue(),
                            file_name=f"{mod}_Summary_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
@@ -2943,3 +2952,174 @@ else:
             _render_dynamic_form(module_choice, sheet_name, CLIENT_ID, ROLE)
     else:
         st.info("No modules enabled. Choose a page on the left.")
+
+# --- Override: Summary page (fast, resilient, xlsxwriter; stays on page after download) ---
+def _render_summary_page():
+    with intake_page("Summary", "Pivot by Submission Mode and Date; per-pharmacy columns", badge=ROLE):
+        # Picker
+        if not module_pairs:
+            st.info("No modules enabled."); return
+        mod = st.selectbox("Module", [m for m,_ in module_pairs], index=0, key="sum_mod_v2")
+        sheet = dict(module_pairs)[mod]
+
+        # Load & scope
+        df = _apply_common_filters(load_module_df(sheet), scope_to_user=False)
+        if df.empty:
+            st.info("No data for the selected scope."); return
+
+        # Normalize fields commonly present in legacy intake
+        for c in ("SubmissionMode","SubmissionDate","PharmacyName"):
+            if c not in df.columns: df[c] = ""
+        df["_Mode"]  = df["SubmissionMode"].astype(str)
+        df["_Date"]  = parse_date(df["SubmissionDate"]).dt.date
+        df["_Pharm"] = df["PharmacyName"].astype(str)
+
+        # Controls
+        summarize_by = st.selectbox("Summarize by", ["Row count"] + [c for c in df.columns if c not in ["_Mode","_Date","_Pharm"]],
+                                    index=0, key="sum_metric_v2")
+
+        def _build_pivot(values_col: str | None):
+            if values_col is None:
+                base = pd.pivot_table(df, index=["_Mode","_Date"], columns="_Pharm", aggfunc="size", fill_value=0)
+            else:
+                vals = pd.to_numeric(df[values_col], errors="coerce").fillna(0.0)
+                tmp = df.copy(); tmp["_val"] = vals
+                base = pd.pivot_table(tmp, index=["_Mode","_Date"], columns="_Pharm", values="_val", aggfunc="sum", fill_value=0.0)
+            base = base.sort_index(level=[0,1])
+            # alpha order columns
+            base = base.reindex(sorted(base.columns, key=lambda x: str(x)), axis=1)
+
+            # Per-mode subtotal + grand total
+            blocks = []
+            for mode, chunk in base.groupby(level=0, sort=False):
+                subtotal = pd.DataFrame([chunk.sum(numeric_only=True)])
+                subtotal.index = pd.MultiIndex.from_tuples([(mode, "— Total —")], names=base.index.names)
+                blocks.append(pd.concat([subtotal, chunk]))
+            combined = pd.concat(blocks) if blocks else base
+            grand = pd.DataFrame([base.sum(numeric_only=True)])
+            grand.index = pd.MultiIndex.from_tuples([("Grand Total","")], names=base.index.names)
+            combined = pd.concat([combined, grand])
+
+            combined = combined.reset_index().rename(columns={"_Mode":"SubmissionMode","_Date":"SubmissionDate"})
+            for c in combined.columns:
+                if pd.api.types.is_float_dtype(combined[c]):
+                    combined[c] = combined[c].round(2)
+            return combined
+
+        pvt = _build_pivot(None if summarize_by == "Row count" else summarize_by)
+        st.caption("Rows: **Submission Mode → (— Total — then dates)** · Columns: **Pharmacy Name** · Values: **Row count** or **sum of selected field**. Grand Total at bottom.")
+        st.dataframe(pvt, use_container_width=True, hide_index=True)
+
+        # Excel download — keep nav state; do not rerun into another page
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine="xlsxwriter") as xw:
+            pvt.to_excel(xw, sheet_name="Summary", index=False)
+        st.download_button(
+            "⬇️ Download Summary (Excel)",
+            data=out.getvalue(),
+            file_name=f"{mod}_Summary_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="sum_dl_v2"
+        )
+
+        st.button("🔄 Refresh summary", key="sum_refresh_v2", on_click=lambda: load_module_df.clear())
+
+
+# --- Override: Update Record with click-to-select row and safe editing ---
+def _render_update_record_page():
+    with intake_page("Update Record", "Edit a single row", badge=ROLE):
+        if not module_pairs:
+            st.info("No modules enabled."); return
+
+        mod = st.selectbox("Module", [m for m,_ in module_pairs], index=0, key="upd_mod_v2")
+        sheet = dict(module_pairs)[mod]
+
+        df = load_module_df(sheet)
+        df = _apply_common_filters(df, scope_to_user=True)
+        if df.empty:
+            st.info("No rows to edit for your scope."); return
+
+        # Ensure an index column so the user can tell row numbers (1-based for UI)
+        df = df.reset_index(drop=False).rename(columns={"index":"_Row"})
+        df["_Row"] = df["_Row"].astype(int) + 1
+
+        with st.expander("Pick a row to edit (tick one)", expanded=True):
+            # Add a checkbox column for selection
+            preview = df.copy()
+            preview.insert(0, "Select", False)
+            # Keep table manageable
+            max_cols = 25
+            if preview.shape[1] > max_cols:
+                keep = ["Select","_Row"] + preview.columns.tolist()[1:max_cols]
+                preview = preview[keep]
+            edited = st.data_editor(
+                preview,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                key="upd_grid_v2"
+            )
+            # determine selected row
+            sel_rows = [i for i, r in edited.iterrows() if bool(r.get("Select"))]
+            if len(sel_rows) > 1:
+                st.warning("Please select only one row.")
+                return
+            selected_idx = sel_rows[0] if sel_rows else None
+
+        # Load selection into session to persist across reruns
+        if selected_idx is not None:
+            st.session_state["upd_selected_row_num"] = int(edited.iloc[selected_idx]["_Row"])
+
+        picked = st.session_state.get("upd_selected_row_num")
+        if not picked:
+            st.info("Select a row above and then scroll down to edit.")
+            return
+
+        st.subheader(f"Editing row #{picked}")
+
+        # Pull the true row from original df (1-based -> 0-based)
+        row0 = df[df["_Row"] == picked].iloc[0].drop(labels=["_Row"])
+        # Build an edit form dynamically
+        with st.form("upd_form_v2", clear_on_submit=False):
+            widgets = {}
+            for col, val in row0.items():
+                # Skip audit/protected columns if any
+                if col in ("Timestamp", ):
+                    st.text_input(col, str(val), disabled=True, key=f"upd_{col}")
+                    continue
+                # Choose widget based on dtype
+                if str(val).isdigit():
+                    try:
+                        num = float(val)
+                        widgets[col] = st.number_input(col, value=num, step=1.0, key=f"upd_{col}")
+                    except Exception:
+                        widgets[col] = st.text_input(col, str(val), key=f"upd_{col}")
+                else:
+                    widgets[col] = st.text_input(col, str(val), key=f"upd_{col}")
+
+            submitted = safe_submit_button("Save changes", type="primary", key="upd_save_v2")
+            if submitted:
+                # Build new row values
+                new_vals = {c: st.session_state.get(f"upd_{c}", row0[c]) for c in row0.index}
+                # write back to storage
+                new_df = load_module_df(sheet)  # reload latest
+                # find the same row index based on 1-based picked
+                ix0 = int(picked) - 1
+                if 0 <= ix0 < len(new_df):
+                    for k,v in new_vals.items():
+                        new_df.at[ix0, k] = v
+                    # persist using Postgres or Sheets
+                    try:
+                        if USE_POSTGRES:
+                            pg_save_whole_sheet(sheet, new_df, list(new_df.columns))
+                        else:
+                            # Google Sheets path
+                            headers = list(new_df.columns)
+                            import gspread
+                            ws(sheet).update("A1", [headers] + new_df.fillna("").astype(str).values.tolist())
+                        load_module_df.clear()
+                        st.success("Row updated.")
+                    except Exception as e:
+                        st.error(f"Failed to save: {e}")
+                else:
+                    st.error("Could not locate the selected row in the latest data; please refresh and try again.")
