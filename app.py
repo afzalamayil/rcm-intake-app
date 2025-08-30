@@ -1715,9 +1715,10 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
 
                 # ----- end fields loop -----
 
-            dup_override_key = f"{module_name}_dup_override"
-            st.checkbox("Allow duplicate override", key=dup_override_key)
-            submitted = safe_submit_button("Submit", type="primary", use_container_width=True)
+                # Submit controls (INSIDE the form)
+                dup_override_key = f"{module_name}_dup_override"
+                st.checkbox("Allow duplicate override", key=dup_override_key)
+                submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
 
     if not submitted:
         return
