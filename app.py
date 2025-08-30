@@ -31,11 +31,30 @@ import uuid
 import pandas as pd
 import streamlit as st
 
+# --- Safe submit button: works inside or outside a `st.form` ---
+def safe_submit_button(label="Submit", key=None, **kwargs):
+    try:
+        # If we're in a form context, prefer the Streamlit submit button.
+        return safe_submit_button(label, **({} if key is None else {"key": key}) | kwargs)
+    except Exception:
+        # Fall back to a normal button when not within a form to avoid StreamlitAPIException.
+        return st.button(label, **({} if key is None else {"key": key}) | kwargs)
+
 st.set_page_config(
     page_title="RCM Intake",
     page_icon="💊",
     layout="wide",
     initial_sidebar_state="expanded"  # 👈 this makes sidebar always visible
+)
+
+# --- Postgres switch (Neon) ---
+USE_POSTGRES = True  # set False to temporarily fall back to Google Sheets
+
+from pg_adapter import (
+    read_sheet_df as pg_read_sheet_df,
+    save_whole_sheet as pg_save_whole_sheet,
+    append_row as pg_append_row,
+    _get_engine,  # ← add this line if you keep using it
 )
 
 import gspread
@@ -49,6 +68,158 @@ from email import encoders
 import streamlit_authenticator as stauth
 from contextlib import contextmanager
 import time
+
+# =========================
+# ADMIN UTILITIES (Cloud)
+# =========================
+from sqlalchemy import text
+from pg_adapter import save_whole_sheet as pg_save_whole_sheet
+from pg_adapter import _get_engine  # used by the health check
+
+def run_cloud_migration_ui():
+    import re, pandas as pd, gspread, time
+    from google.oauth2.service_account import Credentials
+    from pg_adapter import save_whole_sheet as pg_save_whole_sheet
+
+    st.subheader("Admin ▸ One-time Migration: Google Sheets → Postgres")
+    st.caption("Runs inside Streamlit Cloud using your Secrets. Keep [gsheets] only until this succeeds.")
+
+    # Small helper to auth and open the spreadsheet
+    def _open_sheet():
+        gs = st.secrets.get("gsheets")
+        if not gs:
+            raise RuntimeError("Missing [gsheets] block in Secrets (needed only for migration).")
+
+        # Ensure multiline key works even if pasted with escaped \n
+        creds_info = dict(gs)
+        if "private_key" in creds_info:
+            creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        gc = gspread.authorize(Credentials.from_service_account_info(creds_info, scopes=scopes))
+
+        m = re.search(r"/spreadsheets/d/([A-Za-z0-9-_]+)", gs.get("sheet_url", ""))
+        spreadsheet_id = m.group(1) if m else gs.get("spreadsheet_id")
+        if not spreadsheet_id:
+            raise RuntimeError("No sheet_url or spreadsheet_id provided in [gsheets].")
+        return gc.open_by_key(spreadsheet_id)
+
+    # Debug tools
+    with st.expander("Debug / Advanced", expanded=False):
+        if st.button("Ping Google Sheets"):
+            try:
+                sh = _open_sheet()
+                titles = [ws.title for ws in sh.worksheets()]
+                st.success(f"Connected. Found {len(titles)} tabs.")
+                st.write(titles)
+            except Exception as e:
+                st.error(f"Sheets connection failed: {e}")
+
+    # Main migrate-all button
+    if st.button("Run migration now", type="primary"):
+        status = st.status("Preparing…", expanded=True)
+        progress = st.progress(0.0)
+        try:
+            sh = _open_sheet()
+            wss = sh.worksheets()
+            total = len(wss)
+            if total == 0:
+                status.update(label="No tabs found.", state="error")
+                return
+
+            moved, skipped = [], []
+            status.update(label=f"Starting migration of {total} tabs…", state="running")
+            for idx, ws in enumerate(wss, start=1):
+                label = f"Migrating: {ws.title} ({idx}/{total})"
+                status.update(label=label, state="running")
+                progress.progress(idx / total)
+
+                try:
+                    vals = ws.get_all_values()
+                except Exception as e:
+                    status.write(f"• {ws.title}: failed to read — {e}")
+                    continue
+
+                if not vals or (len(vals) == 1 and all(not c for c in vals[0])):
+                    status.write(f"• {ws.title}: empty — skipped")
+                    skipped.append(ws.title)
+                    continue
+
+                headers = [h.strip() or f"col_{i+1}" for i, h in enumerate(vals[0])]
+                rows = vals[1:] if len(vals) > 1 else []
+                df = pd.DataFrame(rows, columns=headers).fillna("")
+
+                try:
+                    pg_save_whole_sheet(ws.title, df, headers)   # truncates + inserts
+                except Exception as e:
+                    status.write(f"• {ws.title}: failed to write — {e}")
+                    continue
+
+                moved.append(f"{ws.title} ({len(df)} rows)")
+                status.write(f"• {ws.title}: {len(df)} rows moved")
+
+            if moved:
+                status.update(label="Migration complete", state="complete")
+                st.success("Done.")
+                st.write("Moved tabs:", moved)
+                if skipped:
+                    st.info("Skipped empty tabs: " + ", ".join(skipped))
+            else:
+                status.update(label="Nothing migrated (all empty or failed).", state="error")
+
+        except Exception as e:
+            status.update(label="Migration failed", state="error")
+            st.exception(e)
+
+# --- Admin: verify what's in Postgres right now ---
+def verify_neon_data():
+    import pandas as pd
+    from sqlalchemy import create_engine, text
+
+    eng = create_engine(st.secrets["postgres"]["url"], pool_pre_ping=True)
+
+    with eng.connect() as con:
+        tables = pd.read_sql(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = current_schema() ORDER BY table_name",
+            con,
+        )["table_name"].tolist()
+
+        results = []
+        for t in tables:
+            try:
+                cnt = con.execute(text(f'SELECT COUNT(*) FROM "{t}"')).scalar_one()
+            except Exception as e:
+                cnt = f"ERR: {e}"
+            results.append({"table": t, "rows": cnt})
+
+    st.subheader("Neon tables & row counts")
+    st.dataframe(pd.DataFrame(results), use_container_width=True)
+
+    st.caption("Tip: expected tables are your sheet/tab names, lowercased with spaces and punctuation replaced by underscores.")
+
+# --- DB health check: always read fresh URL from secrets ---
+def pg_health_check():
+    from sqlalchemy import create_engine, text
+    try:
+        eng = create_engine(st.secrets["postgres"]["url"], pool_pre_ping=True)
+        with eng.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        st.success("Postgres connected")
+    except Exception as e:
+        st.warning(f"Postgres: not reachable — {e}")
+
+    # Optional: show what URL the app is actually using (host/db only)
+    try:
+        from urllib.parse import urlparse
+        u = st.secrets["postgres"]["url"]
+        p = urlparse(u)
+        st.caption(f"Host: {p.hostname} | DB: {(p.path or '').lstrip('/')}")
+    except Exception:
+        pass
 
 # --- Date helpers (single source of truth) ---
 DATE_FMT = "%d/%m/%Y"
@@ -201,6 +372,9 @@ with st.sidebar:
     if UI_BRAND:
         st.success(f"👋 {UI_BRAND}")
 
+with st.sidebar:
+    st.caption("DB Status")
+    pg_health_check()
 # Show any pending success/error from the last submit
 render_flash()
 
@@ -1109,6 +1283,20 @@ def _cached_masters():
         "ins_df":           insurance_master(),
     }
 
+# --- Helper: read the selected "Type" from session_state safely
+def get_submission_type(module_key: str | None = None) -> str:
+    # Try module-specific keys first, then generic fallbacks
+    keys = []
+    if module_key:
+        keys += [f"{module_key}_submission_type", f"{module_key}_type"]
+    keys += ["pharmacy_submission_type", "submission_type", "type"]
+
+    for k in keys:
+        v = st.session_state.get(k)
+        if v not in (None, ""):
+            return v
+    return ""
+
 def _render_legacy_pharmacy_intake(sheet_name: str):
     LEGACY_HEADERS = [
         "Timestamp","SubmittedBy","Role",
@@ -1118,6 +1306,8 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         "MemberID","EID","ClaimID","ApprovalCode",
         "NetAmount","PatientShare","Remark","Status"
     ]
+
+    module_key = "pharmacy"
 
     # --- One-time header ensure per session ---
     _hdr_flag = f"_headers_ok_{sheet_name}"
@@ -1255,7 +1445,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
             st.text_area("Remark (optional)", key="remark")
             st.checkbox("Allow duplicate override", key="allow_dup_override")
 
-            submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
+            submitted = safe_submit_button("Submit", type="primary", use_container_width=True)
 
     if not submitted:
         return
@@ -1266,7 +1456,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         "Submission Date": st.session_state.submission_date,
         "Pharmacy":        st.session_state.pharmacy_display,
         "Submission Mode": st.session_state.submission_mode,
-        "Type":            st.session_state.type,
+        "Type":             get_submission_type("pharmacy"),
         "Portal":          st.session_state.portal,
         "ERX Number":      st.session_state.erx_number,
         "Insurance":       st.session_state.insurance_display,
@@ -1294,13 +1484,15 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
 
     # --- insurance split (Cash safe) ---
     ins_code, ins_name = "", ""
-    if str(st.session_state.insurance_display).strip().lower() == "cash":
-        ins_code = ins_name = "Cash"
-    elif " - " in st.session_state.insurance_display:
-        ins_code, ins_name = st.session_state.insurance_display.split(" - ", 1)
+    ins_disp = str(st.session_state.insurance_display).strip()
+    if ins_disp.lower() == "cash" or ins_disp == "":
+        ins_code, ins_name = "Cash", "Cash" if ins_disp.lower() == "cash" else ("", "")
+    elif " - " in ins_disp:
+        ins_code, ins_name = ins_disp.split(" - ", 1)
         ins_code, ins_name = ins_code.strip(), ins_name.strip()
     else:
-        ins_name = st.session_state.insurance_display
+        # If only a name was selected (no " - "), treat it as Name and leave Code blank
+        ins_code, ins_name = "", ins_disp
 
     # --- duplicate check (same-day ERX + Net) ---
     try:
@@ -1332,7 +1524,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         st.session_state.employee_name.strip(),
         format_date(st.session_state.submission_date),
         st.session_state.submission_mode,
-        st.session_state.type,
+        get_submission_type(module_key),
         st.session_state.portal,
         st.session_state.erx_number.strip(),
         ins_code, ins_name,
@@ -1353,7 +1545,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         except Exception: pass
 
         st.session_state["_clear_form"] = True
-        st.session_state["type"] = "Insurance"
+        get_submission_type(module_key)] = "Insurance"
         st.session_state["_was_cash"] = False
         flash("Saved ✔️", "success")
     except Exception as e:
@@ -1406,95 +1598,117 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
 
                 # ----- Render fields from FormSchema (INSIDE THE FORM) -----
                 for i, (_, r) in enumerate(rows.iterrows()):
-                if not _role_visible(r["RoleVisibility"], role):
-                    continue
-            
-                fkey    = r["FieldKey"]
-                label   = r["Label"]
-                typ     = (r["Type"] or "").lower().strip()
-                required= bool(r["Required"])
-                default = r["Default"]
-                opts    = _options_from_token(r["Options"])
-                readonly= _is_readonly(r.get("ReadOnlyRoles",""), role)
-            
-                # Override for Clinic Purchase: values are manual
-                if str(module_name).strip() == CLINIC_PURCHASE_MODULE_KEY and fkey in {"clinic_value","sp_value","util_value"}:
-                    readonly = False
+                    # hide fields not visible to the current role
+                    if not _role_visible(r["RoleVisibility"], role):
+                        continue
                 
-                key       = f"{module_name}_{fkey}"
-                label_req = label + ("*" if required else "")  # Ensure this line has exactly 4 spaces
-                target    = cols[i % 3]
-                container = target
-        
+                    fkey     = r["FieldKey"]
+                    label    = r["Label"]
+                    typ      = (r["Type"] or "").lower().strip()
+                    required = bool(r["Required"])
+                    default  = r["Default"]
+                    opts     = _options_from_token(r["Options"])
+                    readonly = _is_readonly(r.get("ReadOnlyRoles", ""), role)
+                
+                    # Clinic Purchase: force these as editable
+                    if str(module_name).strip() == CLINIC_PURCHASE_MODULE_KEY and fkey in {"clinic_value","sp_value","util_value"}:
+                        readonly = False
+                
+                    key       = f"{module_name}_{fkey}"
+                    label_req = label + ("*" if required else "")
+                    target    = cols[i % 3]
+                    container = target
+                
                     with container:
                         if readonly:
-                            if typ in ("integer","int") or _is_int_field(fkey):
-                                try: dv = int(float(default)) if str(default).strip() else 0
-                                except Exception: dv = 0
+                            # render disabled controls but still capture a value
+                            if typ in ("integer", "int") or _is_int_field(fkey):
+                                try:
+                                    dv = int(float(default)) if str(default).strip() else 0
+                                except Exception:
+                                    dv = 0
                                 st.number_input(label_req, value=int(dv), step=1, min_value=0, key=key+"_ro", disabled=True)
                                 values[fkey] = dv
-                            elif typ in ("phone","tel") or _is_phone_field(fkey):
-                                st.text_input(label_req, value=str(default), key=key+"_ro", disabled=True)
-                                values[fkey] = str(default)
+                            elif typ in ("phone", "tel") or _is_phone_field(fkey):
+                                st.text_input(label_req, value=str(default or ""), key=key+"_ro", disabled=True)
+                                values[fkey] = str(default or "")
                             elif typ == "number":
-                                try: dv = float(default) if str(default).strip() else 0.0
-                                except Exception: dv = 0.0
-                                st.number_input(label_req, value=float(dv), step=0.01, format="%.2f", key=key+"_ro", disabled=True)
+                                try:
+                                    dv = float(default) if str(default).strip() else 0.0
+                                except Exception:
+                                    dv = 0.0
+                                st.number_input(label_req, value=float(dv), key=key+"_ro", disabled=True)
                                 values[fkey] = dv
                             elif typ == "date":
-                                try: d = parse_date(default).date() if default else date.today()
-                                except Exception: d = date.today()
-                                st.date_input(label_req, value=d, key=key+"_ro", disabled=True)
-                                values[fkey] = d
-                            elif typ == "select":
-                                show = opts if opts else ["—"]
-                                idx  = show.index(default) if default in show else 0
-                                st.selectbox(label_req, options=show, index=idx, key=key+"_ro", disabled=True)
-                                values[fkey] = default if default in show else show[idx]
-                            elif typ == "multiselect":
-                                show = opts if opts else ["—"]
-                                st.multiselect(label_req, options=show, default=[default] if default else [], key=key+"_ro", disabled=True)
-                                values[fkey] = [default] if default else []
-                            elif typ == "checkbox":
-                                v = str(default).strip().lower() in ("true","1","yes")
-                                st.checkbox(label, value=v, key=key+"_ro", disabled=True)
-                                values[fkey] = v
+                                d = parse_date(default)
+                                st.date_input(label_req, value=(d.date() if pd.notna(d) else date.today()), key=key+"_ro", disabled=True)
+                                values[fkey] = format_date(d) if pd.notna(d) else ""
                             else:
-                                st.text_input(label_req, value=str(default), key=key+"_ro", disabled=True)
-                                values[fkey] = str(default)
-                            continue
-
-                        # Editable widgets
-                        if typ in ("integer","int") or _is_int_field(fkey):
-                            try: dv = int(float(default)) if str(default).strip() else 0
-                            except Exception: dv = 0
-                            values[fkey] = st.number_input(label_req, value=int(dv), step=1, min_value=0, key=key)
-                        elif typ in ("phone","tel") or _is_phone_field(fkey):
-                            values[fkey] = st.text_input(label_req, value=str(default), key=key, placeholder="+9715XXXXXXXX")
+                                st.text_input(label_req, value=str(default or ""), key=key+"_ro", disabled=True)
+                                values[fkey] = str(default or "")
+                            continue  # ← safely continue inside the loop
+                
+                        # Editable controls
+                        if typ in ("integer", "int") or _is_int_field(fkey):
+                            try:
+                                dv = int(float(default)) if str(default).strip() else 0
+                            except Exception:
+                                dv = 0
+                            values[fkey] = st.number_input(label_req, value=int(dv), step=1, key=key)
+                
                         elif typ == "number":
-                            try: dv = float(default) if str(default).strip() else 0.0
-                            except Exception: dv = 0.0
-                            values[fkey] = st.number_input(label_req, value=float(dv), step=0.01, format="%.2f", key=key)
+                            try:
+                                dv = float(default) if str(default).strip() else 0.0
+                            except Exception:
+                                dv = 0.0
+                            values[fkey] = st.number_input(label_req, value=float(dv), key=key)
+                
                         elif typ == "date":
-                            try: d = parse_date(default).date() if default else date.today()
-                            except Exception: d = date.today()
-                            values[fkey] = st.date_input(label_req, value=d, key=key)
+                            d = parse_date(default)
+                            values[fkey] = st.date_input(label_req, value=(d.date() if pd.notna(d) else date.today()), key=key)
+                                        
                         elif typ == "select":
-                            values[fkey] = st.selectbox(label_req, options=(opts or ["—"]), key=key)
+                            # namespaced widget key for all fields
+                            wkey = f"{module_name}_{fkey}"
+                        
+                            # SPECIAL-CASE: avoid using the raw key "type"
+                            if fkey == "type":
+                                wkey = f"{module_name}_submission_type"
+                        
+                            # set a default BEFORE rendering the widget (only once)
+                            if wkey not in st.session_state:
+                                if default and default in opts:
+                                    st.session_state[wkey] = default
+                                elif opts:
+                                    st.session_state[wkey] = opts[0]
+                                else:
+                                    st.session_state[wkey] = ""
+                        
+                            values[fkey] = st.selectbox(
+                                label_req,
+                                opts,
+                                index=(opts.index(st.session_state[wkey]) if st.session_state[wkey] in opts else 0 if opts else None),
+                                key=wkey,
+                            )
+               
                         elif typ == "multiselect":
-                            values[fkey] = st.multiselect(label_req, options=(opts or ["—"]), key=key)
-                        elif typ == "checkbox":
-                            v = str(default).strip().lower() in ("true","1","yes")
-                            values[fkey] = st.checkbox(label, value=v, key=key)
+                            defaults = [o for o in opts if o in str(default or "").split(",")]
+                            values[fkey] = st.multiselect(label_req, opts, default=defaults, key=key)
+                
+                        elif typ in ("phone", "tel") or _is_phone_field(fkey):
+                            values[fkey] = st.text_input(label_req, value=str(default or ""), key=key)
+                
                         elif typ == "textarea":
-                            values[fkey] = st.text_area(label_req, value=str(default), key=key)
+                            values[fkey] = st.text_area(label_req, value=str(default or ""), key=key)
+                
                         else:
-                            values[fkey] = st.text_input(label_req, value=str(default), key=key)
+                            values[fkey] = st.text_input(label_req, value=str(default or ""), key=key)
+
                 # ----- end fields loop -----
 
-                dup_override_key = f"{module_name}_dup_override"
-                st.checkbox("Allow duplicate override", key=dup_override_key)
-                submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
+            dup_override_key = f"{module_name}_dup_override"
+            st.checkbox("Allow duplicate override", key=dup_override_key)
+            submitted = safe_submit_button("Submit", type="primary", use_container_width=True)
 
     if not submitted:
         return
@@ -1516,6 +1730,9 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
         values["sp_value"]     = _val(values.get("sp_qty"))
         values["util_value"]   = _val(values.get("util_qty"))
 
+    # ensure values["type"] reflects the select widget (namespaced key)
+    values["type"] = st.session_state.get(f"{module_name}_submission_type", values.get("type", ""))
+
     # Validate requireds
     missing = []
     for _, r in rows.iterrows():
@@ -1526,7 +1743,8 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
             if (isinstance(val, str) and not val.strip()) or val is None or (isinstance(val, list) and not val):
                 missing.append(r["Label"])
     if missing:
-        st.error("Missing required fields: " + ", ".join(missing)); return
+        st.error("Missing required fields: " + ", ".join(missing))
+        return
 
     # ACL check for pharmacy
     ph_id, ph_name = "", ""
@@ -2334,7 +2552,7 @@ def _render_summary_page():
 
         # 10) Excel download
         out = io.BytesIO()
-        with pd.ExcelWriter(out, engine="openpyxl") as xw:
+        with pd.ExcelWriter(out, engine="xlsxwriter") as xw:
             pvt.to_excel(xw, sheet_name="Summary", index=False)
         st.download_button("⬇️ Download Summary (Excel)", data=out.getvalue(),
                            file_name=f"{mod}_Summary_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
@@ -2595,7 +2813,7 @@ def _render_update_record_page():
 # Navigation (dynamic modules + static pages)
 # ─────────────────────────────────────────────────────────────────────────────
 STATIC_PAGES = ["View / Export", "Email / WhatsApp", "Masters Admin",
-                "Bulk Import Insurance", "Summary", "Update Record"]
+                "Bulk Import Insurance", "Summary", "Update Record", "Inventory"]
 
 def nav_pages_for(role: str):
     module_pairs = modules_enabled_for(CLIENT_ID, role)  # dynamic modules
@@ -2651,11 +2869,25 @@ st.sidebar.markdown("---")
 
 # Rename section and remove the dummy "—" option.
 # Use a selectbox with a placeholder (no default selection).
+# --- Sidebar: Tools & Reports picker (+ Admin for SuperAdmin) ---
+# Make sure the list is mutable
+static_pages = list(static_pages)
+
+# Detect role from session (or global ROLE if you keep it)
+_role = str(st.session_state.get("role") or (globals().get("ROLE", ""))).strip().lower()
+
+# Add "Admin" option only for Super Admins
+if _role in ("super admin", "superadmin") and "Admin" not in static_pages:
+    static_pages.append("Admin")
+
 try:
     static_choice = st.sidebar.selectbox(
+if "Inventory" in (globals().get("STATIC_PAGES", []) or []) and static_choice == "Inventory":
+    _rt_render_inventory_page()
+
         "Tools & Reports",
         static_pages,
-        index=None,                         # show placeholder until user picks
+        index=None,                     # show placeholder until user picks
         placeholder="Open a page…",
         key="nav_page",
         on_change=_pick_static,
@@ -2663,8 +2895,35 @@ try:
 except TypeError:
     # Older Streamlit fallback (no index=None support)
     _items = ["<choose…>"] + static_pages
-    pick = st.sidebar.selectbox("Tools & Reports", _items, index=0, key="nav_page_fallback", on_change=_pick_static)
+    pick = st.sidebar.selectbox(
+        "Tools & Reports",
+        _items,
+        index=0,
+        key="nav_page_fallback",
+        on_change=_pick_static,
+    )
     static_choice = None if pick == "<choose…>" else pick
+
+# --- Router: Admin page (SuperAdmin only) ---
+if static_choice == "Admin":
+    st.header("Admin")
+
+    if _role not in ("super admin", "superadmin"):
+        st.error("Access denied")
+        st.stop()
+
+    # Optional: quick DB ping in sidebar (remove if you already call this elsewhere)
+    # with st.sidebar:
+    #     st.caption("DB Status")
+    #     pg_health_check()
+
+    # One-time Google Sheets → Postgres migration UI
+    run_cloud_migration_ui()
+    
+    # NEW: show what’s currently in Neon
+    verify_neon_data()
+    
+    st.stop()  # prevent fall-through to other page renderers
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Navigation dispatcher
@@ -2696,3 +2955,278 @@ else:
             _render_dynamic_form(module_choice, sheet_name, CLIENT_ID, ROLE)
     else:
         st.info("No modules enabled. Choose a page on the left.")
+
+# --- Override: Summary page (fast, resilient, xlsxwriter; stays on page after download) ---
+def _render_summary_page():
+    with intake_page("Summary", "Pivot by Submission Mode and Date; per-pharmacy columns", badge=ROLE):
+        # Picker
+        if not module_pairs:
+            st.info("No modules enabled."); return
+        mod = st.selectbox("Module", [m for m,_ in module_pairs], index=0, key="sum_mod_v2")
+        sheet = dict(module_pairs)[mod]
+
+        # Load & scope
+        df = _apply_common_filters(load_module_df(sheet), scope_to_user=False)
+        if df.empty:
+            st.info("No data for the selected scope."); return
+
+        # Normalize fields commonly present in legacy intake
+        for c in ("SubmissionMode","SubmissionDate","PharmacyName"):
+            if c not in df.columns: df[c] = ""
+        df["_Mode"]  = df["SubmissionMode"].astype(str)
+        df["_Date"]  = parse_date(df["SubmissionDate"]).dt.date
+        df["_Pharm"] = df["PharmacyName"].astype(str)
+
+        # Controls
+        summarize_by = st.selectbox("Summarize by", ["Row count"] + [c for c in df.columns if c not in ["_Mode","_Date","_Pharm"]],
+                                    index=0, key="sum_metric_v2")
+
+        def _build_pivot(values_col: str | None):
+            if values_col is None:
+                base = pd.pivot_table(df, index=["_Mode","_Date"], columns="_Pharm", aggfunc="size", fill_value=0)
+            else:
+                vals = pd.to_numeric(df[values_col], errors="coerce").fillna(0.0)
+                tmp = df.copy(); tmp["_val"] = vals
+                base = pd.pivot_table(tmp, index=["_Mode","_Date"], columns="_Pharm", values="_val", aggfunc="sum", fill_value=0.0)
+            base = base.sort_index(level=[0,1])
+            # alpha order columns
+            base = base.reindex(sorted(base.columns, key=lambda x: str(x)), axis=1)
+
+            # Per-mode subtotal + grand total
+            blocks = []
+            for mode, chunk in base.groupby(level=0, sort=False):
+                subtotal = pd.DataFrame([chunk.sum(numeric_only=True)])
+                subtotal.index = pd.MultiIndex.from_tuples([(mode, "— Total —")], names=base.index.names)
+                blocks.append(pd.concat([subtotal, chunk]))
+            combined = pd.concat(blocks) if blocks else base
+            grand = pd.DataFrame([base.sum(numeric_only=True)])
+            grand.index = pd.MultiIndex.from_tuples([("Grand Total","")], names=base.index.names)
+            combined = pd.concat([combined, grand])
+
+            combined = combined.reset_index().rename(columns={"_Mode":"SubmissionMode","_Date":"SubmissionDate"})
+            for c in combined.columns:
+                if pd.api.types.is_float_dtype(combined[c]):
+                    combined[c] = combined[c].round(2)
+            return combined
+
+        pvt = _build_pivot(None if summarize_by == "Row count" else summarize_by)
+        st.caption("Rows: **Submission Mode → (— Total — then dates)** · Columns: **Pharmacy Name** · Values: **Row count** or **sum of selected field**. Grand Total at bottom.")
+        st.dataframe(pvt, use_container_width=True, hide_index=True)
+
+        # Excel download — keep nav state; do not rerun into another page
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine="xlsxwriter") as xw:
+            pvt.to_excel(xw, sheet_name="Summary", index=False)
+        st.download_button(
+            "⬇️ Download Summary (Excel)",
+            data=out.getvalue(),
+            file_name=f"{mod}_Summary_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="sum_dl_v2"
+        )
+
+        st.button("🔄 Refresh summary", key="sum_refresh_v2", on_click=lambda: load_module_df.clear())
+
+
+# --- Override: Update Record with click-to-select row and safe editing ---
+def _render_update_record_page():
+    with intake_page("Update Record", "Edit a single row", badge=ROLE):
+        if not module_pairs:
+            st.info("No modules enabled."); return
+
+        mod = st.selectbox("Module", [m for m,_ in module_pairs], index=0, key="upd_mod_v2")
+        sheet = dict(module_pairs)[mod]
+
+        df = load_module_df(sheet)
+        df = _apply_common_filters(df, scope_to_user=True)
+        if df.empty:
+            st.info("No rows to edit for your scope."); return
+
+        # Ensure an index column so the user can tell row numbers (1-based for UI)
+        df = df.reset_index(drop=False).rename(columns={"index":"_Row"})
+        df["_Row"] = df["_Row"].astype(int) + 1
+
+        with st.expander("Pick a row to edit (tick one)", expanded=True):
+            # Add a checkbox column for selection
+            preview = df.copy()
+            preview.insert(0, "Select", False)
+            # Keep table manageable
+            max_cols = 25
+            if preview.shape[1] > max_cols:
+                keep = ["Select","_Row"] + preview.columns.tolist()[1:max_cols]
+                preview = preview[keep]
+            edited = st.data_editor(
+                preview,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                key="upd_grid_v2"
+            )
+            # determine selected row
+            sel_rows = [i for i, r in edited.iterrows() if bool(r.get("Select"))]
+            if len(sel_rows) > 1:
+                st.warning("Please select only one row.")
+                return
+            selected_idx = sel_rows[0] if sel_rows else None
+
+        # Load selection into session to persist across reruns
+        if selected_idx is not None:
+            st.session_state["upd_selected_row_num"] = int(edited.iloc[selected_idx]["_Row"])
+
+        picked = st.session_state.get("upd_selected_row_num")
+        if not picked:
+            st.info("Select a row above and then scroll down to edit.")
+            return
+
+        st.subheader(f"Editing row #{picked}")
+
+        # Pull the true row from original df (1-based -> 0-based)
+        row0 = df[df["_Row"] == picked].iloc[0].drop(labels=["_Row"])
+        # Build an edit form dynamically
+        with st.form("upd_form_v2", clear_on_submit=False):
+            widgets = {}
+            for col, val in row0.items():
+                # Skip audit/protected columns if any
+                if col in ("Timestamp", ):
+                    st.text_input(col, str(val), disabled=True, key=f"upd_{col}")
+                    continue
+                # Choose widget based on dtype
+                if str(val).isdigit():
+                    try:
+                        num = float(val)
+                        widgets[col] = st.number_input(col, value=num, step=1.0, key=f"upd_{col}")
+                    except Exception:
+                        widgets[col] = st.text_input(col, str(val), key=f"upd_{col}")
+                else:
+                    widgets[col] = st.text_input(col, str(val), key=f"upd_{col}")
+
+            submitted = safe_submit_button("Save changes", type="primary", key="upd_save_v2")
+            if submitted:
+                # Build new row values
+                new_vals = {c: st.session_state.get(f"upd_{c}", row0[c]) for c in row0.index}
+                # write back to storage
+                new_df = load_module_df(sheet)  # reload latest
+                # find the same row index based on 1-based picked
+                ix0 = int(picked) - 1
+                if 0 <= ix0 < len(new_df):
+                    for k,v in new_vals.items():
+                        new_df.at[ix0, k] = v
+                    # persist using Postgres or Sheets
+                    try:
+                        if USE_POSTGRES:
+                            pg_save_whole_sheet(sheet, new_df, list(new_df.columns))
+                        else:
+                            # Google Sheets path
+                            headers = list(new_df.columns)
+                            import gspread
+                            ws(sheet).update("A1", [headers] + new_df.fillna("").astype(str).values.tolist())
+                        load_module_df.clear()
+                        st.success("Row updated.")
+                    except Exception as e:
+                        st.error(f"Failed to save: {e}")
+                else:
+                    st.error("Could not locate the selected row in the latest data; please refresh and try again.")
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# RITE: Inventory Module (Injected)
+# ──────────────────────────────────────────────────────────────────────────────
+def _rt_inv_items_price_map():
+    import pandas as _pd
+    import gspread as _gspread
+    from google.oauth2.service_account import Credentials as _Creds
+    import streamlit as _st
+    try:
+        df = _sheet_df("MS:Items", ["Sl.No.","Particulars","Value"]).copy()
+    except Exception:
+        GS = dict(_st.secrets.get("gsheets", {}))
+        if "private_key" in GS:
+            GS["private_key"] = GS["private_key"].replace("\\\\n","\\n").replace("\\n","\\n")
+        client = _gclient() if "_gclient" in globals() else _gspread.authorize(_Creds.from_service_account_info(GS))
+        sid = GS.get("spreadsheet_id") or GS.get("spreadsheets_id") or ""
+        if not sid and GS.get("sheet_url"):
+            import re as _re
+            m = _re.search(r"/spreadsheets/d/([A-Za-z0-9-_]+)", GS["sheet_url"])
+            if m: sid = m.group(1)
+        sh = client.open_by_key(sid)
+        ws = sh.worksheet("MS:Items")
+        vals = ws.get_all_values() or []
+        head = vals[0] if vals else ["Sl.No.","Particulars","Value"]
+        rows = vals[1:] if len(vals)>1 else []
+        df = _pd.DataFrame(rows, columns=head)
+    if df.empty: return {}
+    df["Value"] = _pd.to_numeric(df.get("Value", 0), errors="coerce").fillna(0.0)
+    return {str(r.get("Particulars","")).strip(): float(r.get("Value",0.0)) for _, r in df.iterrows() if str(r.get("Particulars","")).strip()}
+
+def _rt_inv_opening_stock_df():
+    import pandas as _pd
+    try:
+        df = _sheet_df("OpeningStock", ["Item","OpeningQty","OpeningValue"]).copy()
+    except Exception:
+        df = _pd.DataFrame(columns=["Item","OpeningQty","OpeningValue"])
+    df["OpeningQty"] = _pd.to_numeric(df.get("OpeningQty", 0), errors="coerce").fillna(0.0)
+    df["OpeningValue"] = _pd.to_numeric(df.get("OpeningValue", 0), errors="coerce").fillna(0.0)
+    return df
+
+def _rt_inv_clinic_purchase_df():
+    import pandas as _pd
+    cols = ["Timestamp","EnteredBy","PharmacyID","PharmacyName","Date","EmpName","Item","Clinic_Qty","Clinic_Value","Clinic_Status","Audit","Comments","SP_Qty","SP_Value","SP_Status","Util_Qty","Util_Value","Instock_Qty","Instock_Value","RecordID"]
+    try:
+        df = _sheet_df("ClinicPurchase", cols).copy()
+    except Exception:
+        df = _pd.DataFrame(columns=cols)
+    for c in ["Clinic_Qty","Clinic_Value","SP_Qty","SP_Value","Util_Qty","Util_Value","Instock_Qty","Instock_Value"]:
+        df[c] = _pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0.0)
+    return df
+
+def _rt_compute_inventory(pharmacy_id=None):
+    import pandas as _pd
+    cp = _rt_inv_clinic_purchase_df()
+    if pharmacy_id and "PharmacyID" in cp.columns:
+        cp = cp[cp["PharmacyID"].astype(str).str.strip() == str(pharmacy_id).strip()]
+    grp = (cp.groupby("Item", dropna=False)[["Clinic_Qty","Clinic_Value","SP_Qty","SP_Value","Util_Qty","Util_Value"]].sum().reset_index())
+    op = _rt_inv_opening_stock_df()
+    grp = grp.merge(op[["Item","OpeningQty","OpeningValue"]], on="Item", how="left")
+    grp["OpeningQty"] = _pd.to_numeric(grp.get("OpeningQty", 0), errors="coerce").fillna(0.0)
+    prices = _rt_inv_items_price_map()
+    grp["Price"] = grp["Item"].map(lambda x: float(prices.get(str(x).strip(), 0.0)))
+    grp["Available_Qty"] = grp["OpeningQty"] + grp["SP_Qty"] - grp["Util_Qty"]
+    grp["Available_Value"] = grp["Available_Qty"] * grp["Price"]
+    summary = {
+        "Total Requested (Qty)": float(grp["Clinic_Qty"].sum()),
+        "Total Received (Qty)": float(grp["SP_Qty"].sum()),
+        "Total Used (Qty)": float(grp["Util_Qty"].sum()),
+        "Total Available (Qty)": float(grp["Available_Qty"].sum()),
+        "Total Available (Value)": float(grp["Available_Value"].sum()),
+    }
+    disp = grp[["Item","Price","OpeningQty","Clinic_Qty","SP_Qty","Util_Qty","Available_Qty","Available_Value"]].copy().sort_values(by=["Item"]).reset_index(drop=True)
+    return disp, summary
+
+def _rt_render_inventory_page():
+    import streamlit as _st
+    _st.markdown("### Inventory & Summary")
+    try:
+        ph_df = _sheet_df("Pharmacies", ["ID","Name"]).copy()
+        ph_df["ID"] = ph_df["ID"].astype(str).str.strip()
+        ph_df["Name"] = ph_df["Name"].astype(str).str.strip()
+        ph_opts = ["All"] + (ph_df["ID"] + " - " + ph_df["Name"]).tolist()
+    except Exception:
+        ph_opts = ["All"]
+    ph_choice = _st.selectbox("Filter by Pharmacy (optional)", ph_opts)
+    ph_id = None
+    if ph_choice != "All" and " - " in ph_choice:
+        ph_id = ph_choice.split(" - ", 1)[0]
+    df, summary = _rt_compute_inventory(pharmacy_id=ph_id)
+    k1,k2,k3,k4 = _st.columns(4)
+    k1.metric("Total Requested (Qty)", f"{summary['Total Requested (Qty)']:,.2f}")
+    k2.metric("Total Received (Qty)", f"{summary['Total Received (Qty)']:,.2f}")
+    k3.metric("Total Used (Qty)", f"{summary['Total Used (Qty)']:,.2f}")
+    k4.metric("Total Available (Qty)", f"{summary['Total Available (Qty)']:,.2f}")
+    _st.metric("Total Available (Value)", f"{summary['Total Available (Value)']:,.2f}")
+    _st.divider()
+    _st.dataframe(df, use_container_width=True, hide_index=True)
+    _st.download_button("Download inventory (.csv)", data=df.to_csv(index=False).encode("utf-8"), file_name=f"inventory_{int(time.time())}.csv", mime="text/csv", use_container_width=True)
+# ──────────────────────────────────────────────────────────────────────────────
+# End Injected
+# ──────────────────────────────────────────────────────────────────────────────
