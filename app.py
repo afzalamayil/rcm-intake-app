@@ -877,13 +877,33 @@ def build_authenticator(cookie_suffix: str = ""):
 cookie_suffix = st.session_state.get("_cookie_suffix","")
 authenticator = build_authenticator(cookie_suffix)
 
-try:
-    authenticator.login(location="sidebar",
-                        fields={"Form name":"Login","Username":"Username","Password":"Password","Login":"Login"})
-except KeyError:
-    st.warning("Resetting your old cookie…"); st.session_state["_cookie_suffix"]=str(int(time.time())); st.rerun()
-except Exception as e:
-    st.error(f"Sign-in error: {e}"); st.stop()
+# --- Login ---
+name, authentication_status, username = authenticator.login(
+    location="sidebar",
+    fields={"Form name":"Login","Username":"Username","Password":"Password","Login":"Login"}
+)
+
+if authentication_status is False:
+    st.error("Username/password is incorrect")
+    st.stop()
+elif authentication_status is None:
+    st.warning("Please enter your username and password")
+    st.stop()
+
+# If we’re here, user is authenticated.
+email = (username or "").strip().lower()
+st.session_state["name"] = name
+st.session_state["username"] = email
+
+# Super Admin list from secrets (comma-separated)
+SUPER_ADMINS = {
+    e.strip().lower()
+    for e in (st.secrets.get("auth", {}).get("super_admins", "") or "").split(",")
+    if e.strip()
+}
+
+ROLE = "Super Admin" if email in SUPER_ADMINS else "User"
+st.session_state["_role"] = ROLE
 
 authentication_status = st.session_state.get("authentication_status")
 name = st.session_state.get("name"); username = st.session_state.get("username")
