@@ -3118,30 +3118,21 @@ except TypeError:
 
 # --- Router: Admin page (SuperAdmin only) ---
 if static_choice == "Admin":
-    st.header("Admin")
-
-# Inventory route (injected)
-if "Inventory" in (globals().get("STATIC_PAGES", []) or []) and static_choice == "Inventory":
-    _rt_render_inventory_page()
-    st.stop()
-
-
-    if _role not in ("super admin", "superadmin"):
+    if ROLE.lower() not in ("super admin", "superadmin"):
         st.error("Access denied")
         st.stop()
 
-    # Optional: quick DB ping in sidebar (remove if you already call this elsewhere)
-    # with st.sidebar:
-    #     st.caption("DB Status")
-    #     pg_health_check()
+    st.header("Admin")
 
-    # One-time Google Sheets → Postgres migration UI
+    # One-time Migration UI
     run_cloud_migration_ui()
-    
-    # NEW: show what’s currently in Neon
+
+    st.divider()
+
+    # Neon verification
     verify_neon_data()
-    
-    st.stop()  # prevent fall-through to other page renderers
+
+    st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Navigation dispatcher
