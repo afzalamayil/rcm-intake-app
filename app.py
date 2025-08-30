@@ -1536,7 +1536,7 @@ def _render_legacy_pharmacy_intake(sheet_name: str):
         except Exception: pass
 
         st.session_state["_clear_form"] = True
-        get_submission_type(module_key)] = "Insurance"
+        get_submission_type(module_key) or "Insurance"
         st.session_state["_was_cash"] = False
         flash("Saved ✔️", "success")
     except Exception as e:
