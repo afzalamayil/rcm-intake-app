@@ -30,6 +30,7 @@ from datetime import datetime, date, timedelta
 import uuid
 import pandas as pd
 import streamlit as st
+import pg_adapter as db
 
 # --- Safe submit button: works inside or outside a `st.form` ---
 def safe_submit_button(label="Submit", key=None, **kwargs):
