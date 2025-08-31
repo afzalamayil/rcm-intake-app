@@ -378,9 +378,10 @@ SMTP = st.secrets.get("smtp", {})
 GS    = st.secrets.get("gsheets", {})
 UI_BRAND = st.secrets.get("ui", {}).get("brand", "")
 
+auth_sec = st.secrets.get("auth", {})
 SUPER_ADMINS = {
     x.strip().lower()
-    for x in (auth.get("super_admins", "").split(","))
+    for x in (auth_sec.get("super_admins", "") or "").split(",")
     if x.strip()
 }
 
@@ -464,7 +465,7 @@ else:
 def read_sheet_df(title: str, required_headers: list[str] | None = None) -> pd.DataFrame:
     if USE_POSTGRES:
         return pg_read_sheet_df(title, required_headers)
-        vals = retry(lambda: ws(title).get_all_values())
+    vals = retry(lambda: ws(title).get_all_values())
     if not vals:
         if required_headers:
             retry(lambda: ws(title).update("A1", [required_headers]))
