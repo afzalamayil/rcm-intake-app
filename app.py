@@ -2002,34 +2002,46 @@ def _render_clinic_purchase_unified():
 
     st.success("Saved.")
 
-
 def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role: str):
-    # Pharmacy uses the exact screenshot layout
+    """
+    Dynamic form renderer (fixed):
+      - No st.button() inside forms (only st.form_submit_button)
+      - Does not return the form/DeltaGenerator (prevents docs printing)
+      - Handlers run outside the form block
+    """
+    # Fast routes
     if str(module_name).strip().lower() == "pharmacy":
         _render_legacy_pharmacy_intake(sheet_name)
         return
-    # Custom handler for Clinic Purchase
-    if str(module_name).strip().lower().replace(" ", "") in ("clinicpurchase","clinic_purchase"):
+
+    if str(module_name).strip().lower().replace(" ", "") in ("clinicpurchase", "clinic_purchase"):
         _render_clinic_purchase_unified()
         return
-        _render_legacy_pharmacy_intake(sheet_name)
-        return
 
+    # Load schema
     sdf = schema_df()
-    rows = sdf[(sdf["Module"] == module_name) & (sdf["ClientID"].isin([client_id, "DEFAULT", "ALL"]))].sort_values("Order")
+    rows = (
+        sdf[(sdf["Module"] == module_name) & (sdf["ClientID"].isin([client_id, "DEFAULT", "ALL"]))]
+        .sort_values("Order")
+    )
     if rows.empty:
         seed_form_schema_for_module(module_name, client_id if client_id else "DEFAULT")
         schema_df.clear()
         sdf = schema_df()
-        rows = sdf[(sdf["Module"] == module_name) & (sdf["ClientID"].isin([client_id, "DEFAULT", "ALL"]))].sort_values("Order")
+        rows = (
+            sdf[(sdf["Module"] == module_name) & (sdf["ClientID"].isin([client_id, "DEFAULT", "ALL"]))]
+            .sort_values("Order")
+        )
         if rows.empty:
             st.info("No schema configured for this module (add rows in FormSchema).")
             return
-    # Reload schema on demand
+
+    # Optional: reload schema (this is outside any form, so st.button is fine)
     if st.button("Reload schema", key=f"reload_schema_{module_name}"):
         schema_df.clear()
         st.rerun()
 
+    # ---------------- UI ----------------
     with intake_page(module_name, "Create / update entry", badge=role):
         try:
             frame = st.container(border=True)
@@ -2037,26 +2049,30 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
             frame = st.container()
 
         with frame:
+            # ---- FORM BODY ----
             with st.form(f"dyn_form_{module_name}", clear_on_submit=True):
-                # Pharmacy at the top for consistency
+                # Pharmacy selector (common header)
                 ph_df = pharm_master()
                 if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"]:
                     ph_df = ph_df[ph_df["ID"].isin(ALLOWED_PHARM_IDS)]
                 pharm_choices = ph_df["Display"].tolist() if not ph_df.empty else ["—"]
+
                 st.selectbox("Pharmacy (ID - Name)*", pharm_choices, key=f"{module_name}_pharmacy_display")
                 st.session_state["_current_module"] = module_name
+
                 ph_disp = st.session_state.get(f"{module_name}_pharmacy_display", "")
-                st.session_state["_current_pharmacy_id"] = ph_disp.split(" - ", 1)[0].strip() if " - " in ph_disp else ""
+                st.session_state["_current_pharmacy_id"] = (
+                    ph_disp.split(" - ", 1)[0].strip() if " - " in ph_disp else ""
+                )
 
                 cols = st.columns(3, gap="large")
-                values = {}
+                values: dict[str, Any] = {}
 
                 # ----- Render fields from FormSchema (INSIDE THE FORM) -----
                 for i, (_, r) in enumerate(rows.iterrows()):
-                    # hide fields not visible to the current role
                     if not _role_visible(r["RoleVisibility"], role):
                         continue
-                
+
                     fkey     = r["FieldKey"]
                     label    = r["Label"]
                     typ      = (r["Type"] or "").lower().strip()
@@ -2064,73 +2080,81 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                     default  = r["Default"]
                     opts     = _options_from_token(r["Options"])
                     readonly = _is_readonly(r.get("ReadOnlyRoles", ""), role)
-                
-                    # Clinic Purchase: force these as editable
-                    if str(module_name).strip() == CLINIC_PURCHASE_MODULE_KEY and fkey in {"clinic_value","sp_value","util_value"}:
+
+                    # Clinic Purchase: force certain fields editable even if schema says RO
+                    if str(module_name).strip() == CLINIC_PURCHASE_MODULE_KEY and fkey in {
+                        "clinic_value", "sp_value", "util_value"
+                    }:
                         readonly = False
-                
+
                     key       = f"{module_name}_{fkey}"
                     label_req = label + ("*" if required else "")
                     target    = cols[i % 3]
-                    container = target
-                
-                    with container:
+
+                    with target:
                         if readonly:
-                            # render disabled controls but still capture a value
+                            # Render disabled controls but capture their values
                             if typ in ("integer", "int") or _is_int_field(fkey):
                                 try:
                                     dv = int(float(default)) if str(default).strip() else 0
                                 except Exception:
                                     dv = 0
-                                st.number_input(label_req, value=int(dv), step=1, min_value=0, key=key+"_ro", disabled=True)
+                                st.number_input(label_req, value=int(dv), step=1, min_value=0, key=key + "_ro", disabled=True)
                                 values[fkey] = dv
+
                             elif typ in ("phone", "tel") or _is_phone_field(fkey):
-                                st.text_input(label_req, value=str(default or ""), key=key+"_ro", disabled=True)
+                                st.text_input(label_req, value=str(default or ""), key=key + "_ro", disabled=True)
                                 values[fkey] = str(default or "")
+
                             elif typ == "number":
                                 try:
                                     dv = float(default) if str(default).strip() else 0.0
                                 except Exception:
                                     dv = 0.0
-                                st.number_input(label_req, value=float(dv), key=key+"_ro", disabled=True)
+                                st.number_input(label_req, value=float(dv), key=key + "_ro", disabled=True)
                                 values[fkey] = dv
+
                             elif typ == "date":
                                 d = parse_date(default)
-                                st.date_input(label_req, value=(d.date() if pd.notna(d) else date.today()), key=key+"_ro", disabled=True)
+                                st.date_input(
+                                    label_req,
+                                    value=(d.date() if pd.notna(d) else date.today()),
+                                    key=key + "_ro",
+                                    disabled=True,
+                                )
                                 values[fkey] = format_date(d) if pd.notna(d) else ""
                             else:
-                                st.text_input(label_req, value=str(default or ""), key=key+"_ro", disabled=True)
+                                st.text_input(label_req, value=str(default or ""), key=key + "_ro", disabled=True)
                                 values[fkey] = str(default or "")
-                            continue  # ← safely continue inside the loop
-                
-                        # Editable controls
+
+                            continue  # next schema field
+
+                        # Editable widgets
                         if typ in ("integer", "int") or _is_int_field(fkey):
                             try:
                                 dv = int(float(default)) if str(default).strip() else 0
                             except Exception:
                                 dv = 0
                             values[fkey] = st.number_input(label_req, value=int(dv), step=1, key=key)
-                
+
                         elif typ == "number":
                             try:
                                 dv = float(default) if str(default).strip() else 0.0
                             except Exception:
                                 dv = 0.0
                             values[fkey] = st.number_input(label_req, value=float(dv), key=key)
-                
+
                         elif typ == "date":
                             d = parse_date(default)
-                            values[fkey] = st.date_input(label_req, value=(d.date() if pd.notna(d) else date.today()), key=key)
-                                        
+                            values[fkey] = st.date_input(
+                                label_req, value=(d.date() if pd.notna(d) else date.today()), key=key
+                            )
+
                         elif typ == "select":
-                            # namespaced widget key for all fields
-                            wkey = f"{module_name}_{fkey}"
-                        
-                            # SPECIAL-CASE: avoid using the raw key "type"
-                            if fkey == "type":
-                                wkey = f"{module_name}_submission_type"
-                        
-                            # set a default BEFORE rendering the widget (only once)
+                            # Namespaced key for 'type' to avoid collisions
+                            wkey = f"{module_name}_{fkey}" if fkey != "type" else f"{module_name}_submission_type"
+
+                            # Set a default once
                             if wkey not in st.session_state:
                                 if default and default in opts:
                                     st.session_state[wkey] = default
@@ -2138,164 +2162,175 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                                     st.session_state[wkey] = opts[0]
                                 else:
                                     st.session_state[wkey] = ""
-                        
+
                             values[fkey] = st.selectbox(
                                 label_req,
                                 opts,
                                 index=(opts.index(st.session_state[wkey]) if st.session_state[wkey] in opts else 0 if opts else None),
                                 key=wkey,
                             )
-               
+
                         elif typ == "multiselect":
                             defaults = [o for o in opts if o in str(default or "").split(",")]
                             values[fkey] = st.multiselect(label_req, opts, default=defaults, key=key)
-                
+
                         elif typ in ("phone", "tel") or _is_phone_field(fkey):
                             values[fkey] = st.text_input(label_req, value=str(default or ""), key=key)
-                
+
                         elif typ == "textarea":
                             values[fkey] = st.text_area(label_req, value=str(default or ""), key=key)
-                
+
                         else:
                             values[fkey] = st.text_input(label_req, value=str(default or ""), key=key)
 
-                # ----- end fields loop -----
-
-                # Submit controls (INSIDE the form)
+                # Submit controls (INSIDE the form; no st.button here)
                 dup_override_key = f"{module_name}_dup_override"
                 st.checkbox("Allow duplicate override", key=dup_override_key)
                 submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
 
-    # Handle row delete after form submit of a delete button
-    del_idx = st.session_state.pop("_cp_delete_idx", None)
-    if del_idx is not None and isinstance(del_idx, int):
-        if 0 <= del_idx < len(st.session_state.get("_cp_rows", [])):
-            st.session_state["_cp_rows"].pop(del_idx)
-        st.rerun()
+        # --------- Handlers (OUTSIDE the form) ---------
+        # If nothing submitted, we’re done
+        if not submitted:
+            return
 
-    if not submitted:
-        return
-    # Require pharmacy selection
-    ph_disp = st.session_state.get(f"{module_name}_pharmacy_display","")
-    if " - " not in ph_disp:
-        st.error("Please select a Pharmacy before submitting.")
-        return
+        # Require pharmacy selection
+        ph_disp = st.session_state.get(f"{module_name}_pharmacy_display", "")
+        if " - " not in ph_disp:
+            st.error("Please select a Pharmacy before submitting.")
+            return
 
-    # ---- Auto-compute price-based values for Clinic Purchase ----
-    if str(module_name).strip() == CLINIC_PURCHASE_MODULE_KEY:
-        pm = _clinic_items_price_map()
-        item_name = str(values.get("item","")).strip()
-        unit = float(pm.get(item_name, 0.0))
-        def _val(q):
-            try: return round(float(q or 0) * unit, 2)
-            except Exception: return 0.0
-        values["clinic_value"] = _val(values.get("clinic_qty"))
-        values["sp_value"]     = _val(values.get("sp_qty"))
-        values["util_value"]   = _val(values.get("util_qty"))
+        # Auto-compute value fields for Clinic Purchase
+        if str(module_name).strip() == CLINIC_PURCHASE_MODULE_KEY:
+            pm = _clinic_items_price_map()
+            item_name = str(values.get("item", "")).strip()
+            unit = float(pm.get(item_name, 0.0))
 
-    # ensure values["type"] reflects the select widget (namespaced key)
-    values["type"] = st.session_state.get(f"{module_name}_submission_type", values.get("type", ""))
+            def _val(q):
+                try:
+                    return round(float(q or 0) * unit, 2)
+                except Exception:
+                    return 0.0
 
-    # Validate requireds
-    missing = []
-    for _, r in rows.iterrows():
-        if not _role_visible(r["RoleVisibility"], role):
-            continue
-        if bool(r["Required"]):
-            val = values.get(r["FieldKey"])
-            if (isinstance(val, str) and not val.strip()) or val is None or (isinstance(val, list) and not val):
-                missing.append(r["Label"])
-    if missing:
-        st.error("Missing required fields: " + ", ".join(missing))
-        return
+            values["clinic_value"] = _val(values.get("clinic_qty"))
+            values["sp_value"]     = _val(values.get("sp_qty"))
+            values["util_value"]   = _val(values.get("util_qty"))
 
-    # ACL check for pharmacy
-    ph_id, ph_name = "", ""
-    ph_disp = st.session_state.get(f"{module_name}_pharmacy_display","")
-    if " - " in ph_disp:
-        ph_id, ph_name = [x.strip() for x in ph_disp.split(" - ",1)]
-    if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"] and ph_id not in ALLOWED_PHARM_IDS:
-        st.error("You are not allowed to submit for this pharmacy."); return
+        # Ensure values["type"] reflects the select widget (namespaced key)
+        values["type"] = st.session_state.get(f"{module_name}_submission_type", values.get("type", ""))
 
-    # Ensure headers exist
-    meta = ["Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module","RecordID"]
-    save_map = {r["FieldKey"]: (r["SaveTo"] or r["FieldKey"]) for _, r in rows.iterrows()
-                if _role_visible(r["RoleVisibility"], role)}
-    target_headers = meta + list(dict.fromkeys(save_map.values()))
-    wsx = ws(sheet_name)
-    head = retry(lambda: wsx.row_values(1))
-    if [h.lower() for h in head] != [h.lower() for h in target_headers]:
-        existing = [h for h in head if h]
-        merged = list(dict.fromkeys((existing or []) + target_headers))
-        retry(lambda: wsx.update("A1", [merged]))
-        target_headers = merged
+        # Validate requireds
+        missing = []
+        for _, r in rows.iterrows():
+            if not _role_visible(r["RoleVisibility"], role):
+                continue
+            if bool(r["Required"]):
+                val = values.get(r["FieldKey"])
+                if (isinstance(val, str) and not val.strip()) or val is None or (isinstance(val, list) and not val):
+                    missing.append(r["Label"])
+        if missing:
+            st.error("Missing required fields: " + ", ".join(missing))
+            return
 
-    # Build row data
-    data_map = {
-        "Timestamp": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-        "SubmittedBy": username or name,
-        "Role": ROLE,
-        "ClientID": CLIENT_ID,
-        "PharmacyID": ph_id,
-        "PharmacyName": ph_name,
-        "Module": module_name,
-        "RecordID": str(uuid.uuid4()),
-    }
-    typ_map = { rr["FieldKey"]: str(rr["Type"]).lower().strip() for _, rr in rows.iterrows() }
+        # ACL check for pharmacy
+        ph_id, ph_name = "", ""
+        if " - " in ph_disp:
+            ph_id, ph_name = [x.strip() for x in ph_disp.split(" - ", 1)]
+        if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"] and ph_id not in ALLOWED_PHARM_IDS:
+            st.error("You are not allowed to submit for this pharmacy.")
+            return
 
-    for fk, col in save_map.items():
-        val = values.get(fk)
+        # Ensure headers exist
+        meta = ["Timestamp", "SubmittedBy", "Role", "ClientID", "PharmacyID", "PharmacyName", "Module", "RecordID"]
+        save_map = {
+            r["FieldKey"]: (r["SaveTo"] or r["FieldKey"])
+            for _, r in rows.iterrows()
+            if _role_visible(r["RoleVisibility"], role)
+        }
+        target_headers = meta + list(dict.fromkeys(save_map.values()))
+        wsx = ws(sheet_name)
+        head = retry(lambda: wsx.row_values(1))
+        if [h.lower() for h in head] != [h.lower() for h in target_headers]:
+            existing = [h for h in head if h]
+            merged = list(dict.fromkeys((existing or []) + target_headers))
+            retry(lambda: wsx.update("A1", [merged]))
+            target_headers = merged
 
-        # normalize dates/lists
-        if isinstance(val, (date, datetime)):
-            val = format_date(val)
-        if isinstance(val, list):
-            val = ", ".join([str(x) for x in val])
+        # Build row data
+        username = st.session_state.get("username")
+        name     = st.session_state.get("name")
 
-        # money-style fields keep 2 decimals
-        if isinstance(val, float) and fk in {"net_amount","patient_share","clinic_value","sp_value","util_value"}:
-            try: val = f"{float(val):.2f}"
-            except Exception: pass
+        data_map = {
+            "Timestamp":  datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+            "SubmittedBy": username or name or "",
+            "Role":       role,
+            "ClientID":   client_id,
+            "PharmacyID": ph_id,
+            "PharmacyName": ph_name,
+            "Module":     module_name,
+            "RecordID":   str(uuid.uuid4()),
+        }
+        typ_map = {rr["FieldKey"]: str(rr["Type"]).lower().strip() for _, rr in rows.iterrows()}
 
-        # integer (by schema type OR by common key names)
-        if typ_map.get(fk) in ("integer","int") or _is_int_field(fk):
-            if str(val).strip() != "":
-                try: val = str(int(float(val)))
-                except Exception: val = ""
+        for fk, col in save_map.items():
+            val = values.get(fk)
 
-        # phone (by schema type OR by common key names)
-        if typ_map.get(fk) in ("phone","tel") or _is_phone_field(fk):
-            phone = re.sub(r"[^0-9+]", "", str(val))
-            val = f"'{phone}" if phone else ""
+            # normalize dates/lists
+            if isinstance(val, (date, datetime)):
+                val = format_date(val)
+            if isinstance(val, list):
+                val = ", ".join([str(x) for x in val])
 
-        data_map[col] = val
+            # money-style fields keep 2 decimals
+            if isinstance(val, float) and fk in {"net_amount", "patient_share", "clinic_value", "sp_value", "util_value"}:
+                try:
+                    val = f"{float(val):.2f}"
+                except Exception:
+                    pass
 
-    # Duplicate check if configured
-    try:
-        if _check_duplicate_if_needed(sheet_name, module_name, data_map):
-            allow_override = st.session_state.get(dup_override_key, False)
-            is_superadmin = str(role).strip().lower() in ("super admin","superadmin")
-            if not (allow_override or is_superadmin):
-                st.warning("Possible duplicate detected. Tick 'Allow duplicate override' or ask Super Admin.")
-                return
-    except Exception as e:
-        st.info(f"Duplicate check skipped: {e}")
+            # integer (by schema type OR by common key names)
+            if typ_map.get(fk) in ("integer", "int") or _is_int_field(fk):
+                if str(val).strip() != "":
+                    try:
+                        val = str(int(float(val)))
+                    except Exception:
+                        val = ""
 
-    # Save
-    for k in list(data_map.keys()):
-        if isinstance(data_map[k], str):
-            data_map[k] = _sanitize_cell(data_map[k])
-    row = [data_map.get(h, "") for h in target_headers]
-    try:
-        retry(lambda: wsx.append_row(row, value_input_option="USER_ENTERED"))
-        flash("Saved ✔️", "success")
-        _clear_module_form_state(module_name, rows)
+            # phone (by schema type OR by common key names)
+            if typ_map.get(fk) in ("phone", "tel") or _is_phone_field(fk):
+                phone = re.sub(r"[^0-9+]", "", str(val))
+                val = f"'{phone}" if phone else ""
+
+            data_map[col] = val
+
+        # Duplicate check if configured
         try:
-            load_module_df.clear()
-        except Exception:
-            pass
-    except Exception as e:
-        st.error(f"Save failed: {e}")
+            if _check_duplicate_if_needed(sheet_name, module_name, data_map):
+                allow_override = st.session_state.get(dup_override_key, False)
+                is_superadmin = str(role).strip().lower() in ("super admin", "superadmin")
+                if not (allow_override or is_superadmin):
+                    st.warning("Possible duplicate detected. Tick 'Allow duplicate override' or ask Super Admin.")
+                    return
+        except Exception as e:
+            st.info(f"Duplicate check skipped: {e}")
+
+        # Save
+        for k in list(data_map.keys()):
+            if isinstance(data_map[k], str):
+                data_map[k] = _sanitize_cell(data_map[k])
+
+        row = [data_map.get(h, "") for h in target_headers]
+        try:
+            retry(lambda: wsx.append_row(row, value_input_option="USER_ENTERED"))
+            flash("Saved ✔️", "success")
+            _clear_module_form_state(module_name, rows)
+            try:
+                load_module_df.clear()
+            except Exception:
+                pass
+        except Exception as e:
+            st.error(f"Save failed: {e}")
+    # No return (avoid printing DeltaGenerator)
+    return
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Static pages (View/Export, Email/WhatsApp, Masters Admin, Bulk Import, Summary, Update)
