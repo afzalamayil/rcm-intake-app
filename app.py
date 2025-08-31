@@ -3385,17 +3385,23 @@ if active == "static" and static_choice:
         _render_update_record_page()
 else:
     # Show the selected module (default behavior)
-    if module_choice.strip().lower() == "pharmacy":
-        st.subheader("New Submission")
-        _render_legacy_pharmacy_intake(sheet_name)
-    
-    elif module_choice.strip().lower().replace(" ", "") in ("clinicpurchase", "clinic_purchase"):
-        st.subheader("Clinic Purchase — Unified Intake")
-        _render_clinic_purchase_unified()
-    
-    else:
-        st.subheader(f"{module_choice} — Dynamic Intake")
-        _render_dynamic_form(module_choice, sheet_name, CLIENT_ID, ROLE)
+    if module_choice:
+        sheet_name = dict(module_pairs).get(module_choice)
+
+        # normalize once
+        mod_norm = module_choice.strip().lower().replace(" ", "")
+
+        if mod_norm == "pharmacy":
+            st.subheader("New Submission")
+            _render_legacy_pharmacy_intake(sheet_name)
+
+        elif mod_norm in ("clinicpurchase", "clinic_purchase"):
+            st.subheader("Clinic Purchase — Unified Intake")
+            _render_clinic_purchase_unified()
+
+        else:
+            st.subheader(f"{module_choice} — Dynamic Intake")
+            _render_dynamic_form(module_choice, sheet_name, CLIENT_ID, ROLE)
     else:
         st.info("No modules enabled. Choose a page on the left.")
 
