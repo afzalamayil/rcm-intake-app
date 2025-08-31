@@ -1893,7 +1893,7 @@ def _render_clinic_purchase_unified():
 
         rows = st.session_state["_cp_rows"]
 
-        st.write("")
+        
 
         # Header row
         st.markdown("**Clinic Employee**  →  **Next Employee (Received)**  →  **Clinic Employee (Status/Remark & Used)**")
@@ -1935,12 +1935,14 @@ def _render_clinic_purchase_unified():
                 if st.form_submit_button("🗑️", key=f"cp_del_{idx}") and len(rows)>1:
                     st.session_state["_cp_delete_idx"] = idx
 
+        # AFTER (still inside the with st.form(...): block)
         st.write("")
         add, save = st.columns([1,6])
         with add:
-            add_clicked = st.form_submit_button("+ Add item", key="cp_add_submit", use_container_width=True)
-            submitted   = st.form_submit_button("Submit",     type="primary",     use_container_width=True)
-     
+            add_clicked = st.form_submit_button("+ Add item")
+        with save:
+            submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
+    
         if add_clicked:
             item_keys = list(prices.keys())
             rows.append({
