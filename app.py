@@ -1942,17 +1942,17 @@ def _render_clinic_purchase_unified():
             submitted   = st.form_submit_button("Submit",     type="primary",     use_container_width=True)
      
         if add_clicked:
-        item_keys = list(prices.keys())
-        rows.append({
-            "item": item_keys[0] if item_keys else "",
-            "clinic_qty": 0.0,
-            "sp_qty": 0.0,
-            "sp_status": status_opts[0] if status_opts else "Submitted",
-            "clinic_status": status_opts[0] if status_opts else "Submitted",
-            "remark": "",
-            "util_qty": 0.0,
-        })
-        st.rerun()  # refresh to show the new row
+            item_keys = list(prices.keys())
+            rows.append({
+                "item": item_keys[0] if item_keys else "",
+                "clinic_qty": 0.0,
+                "sp_qty": 0.0,
+                "sp_status": status_opts[0] if status_opts else "Submitted",
+                "clinic_status": status_opts[0] if status_opts else "Submitted",
+                "remark": "",
+                "util_qty": 0.0,
+            })
+            st.rerun()  # refresh to show the new row
     
     # Handle row delete after form submit of a delete button
     del_idx = st.session_state.pop("_cp_delete_idx", None)
