@@ -1941,6 +1941,57 @@ def _render_clinic_purchase_unified():
                     st.session_state[f"cp_rem_{idx}"]  = ""
             st.session_state["_cp_rows"] = ints
             st.rerun()
+    
+    # --- Add controls (outside the form; allowed) ---
+    # helper to keep row indices contiguous ints
+    def _cp_coerce_indices(obj):
+        out = []
+        try:
+            for x in list(obj) if isinstance(obj, (list, tuple)) else []:
+                try:
+                    out.append(int(x))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return out or [0]
+    
+    st.session_state["_cp_rows"] = _cp_coerce_indices(st.session_state.get("_cp_rows", [0]))
+    rows = st.session_state["_cp_rows"]
+    
+    top_left, top_right = st.columns([1, 3])
+    
+    # Single add
+    with top_left:
+        if st.button("➕ Add item", key="cp_add_one"):
+            ints = _cp_coerce_indices(st.session_state.get("_cp_rows", [0]))
+            nxt = (max(ints) if ints else -1) + 1
+            st.session_state["_cp_rows"] = ints + [nxt]
+            st.rerun()
+    
+    # Bulk add
+    with top_right.expander("Add multiple items", expanded=False):
+        all_items = sorted(list(price_map.keys()))
+        sel_items = st.multiselect("Select items", all_items, key="cp_bulk_items")
+        copies    = st.number_input("Rows per item", 1, 20, 1, step=1, key="cp_bulk_copies")
+        if st.button("Add selected items", key="cp_bulk_add"):
+            ints = _cp_coerce_indices(st.session_state.get("_cp_rows", [0]))
+            next_idx = (max(ints) if ints else -1) + 1
+            for it in sel_items:
+                for _ in range(int(copies)):
+                    idx = next_idx
+                    next_idx += 1
+                    ints.append(idx)
+                    # prefill sensible defaults
+                    st.session_state[f"cp_item_{idx}"] = it
+                    st.session_state[f"cp_cqty_{idx}"] = 0.0
+                    st.session_state[f"cp_spqty_{idx}"] = 0.0
+                    st.session_state[f"cp_util_{idx}"] = 0.0
+                    st.session_state[f"cp_clst_{idx}"] = status_opts[0]
+                    st.session_state[f"cp_spst_{idx}"] = status_opts[0]
+                    st.session_state[f"cp_rem_{idx}"]  = ""
+            st.session_state["_cp_rows"] = ints
+            st.rerun()
 
     # ── The form (only form_submit_button inside) ─────────────────────────────
     with st.form("cp_form", clear_on_submit=False):
@@ -2015,6 +2066,13 @@ def _render_clinic_purchase_unified():
 
         # The one/only submit control INSIDE the form
         submitted = st.form_submit_button("Save", type="primary", use_container_width=True)
+
+    # --- Bottom add controls (outside the form) ---
+    if st.button("➕ Add another item", key="cp_add_bottom"):
+        ints = _cp_coerce_indices(st.session_state.get("_cp_rows", [0]))
+        nxt = (max(ints) if ints else -1) + 1
+        st.session_state["_cp_rows"] = ints + [nxt]
+        st.rerun()
 
     # ── Handle deletes (after the form) ────────────────────────────────────────
     to_delete = [i for i in list(st.session_state["_cp_rows"]) if st.session_state.get(f"cp_del_{i}", False)]
