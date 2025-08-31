@@ -1857,159 +1857,169 @@ def _rt_update_opening_stock_delta(item_name: str, delta_qty: float, unit_price:
     return new_qty, new_val
 
 def _render_clinic_purchase_unified():
-    st.markdown("### Clinic Purchase")
-    st.caption("Create / update entry")
-    st.markdown('<div class="intake-topbar"><small>Intake · Unified Layout</small></div>', unsafe_allow_html=True)
+    """
+    Clinic Purchase unified intake (multi-row), safe for Streamlit forms:
+      - No st.button() inside the form (uses only st.form_submit_button)
+      - Never returns/prints a DeltaGenerator
+      - Computes values from MS:Items price list
+      - Updates OpeningStock running balance
+    """
+    # masters
+    price_map = _clinic_items_price_map()  # {item_name: unit_price}
+    status_df = read_sheet_df(MS_STATUS, ["Value"]).fillna("")
+    status_opts = [str(x) for x in status_df["Value"].tolist() if str(x).strip()] or ["Submitted"]
 
-    # Masters
-    ph_df = pharmacies_list_df() if "pharmacies_list_df" in globals() else pharm_master()
+    # pharmacy picker (outside the form is fine too, but we keep it in-form for one-shot submit)
+    ph_df = pharm_master()
     if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"]:
-        ph_df = ph_df[ph_df["ID"].isin(ALLOWED_PHARM_IDS)]
+        ph_df = ph_df[ph_df["ID"].astype(str).isin([str(x) for x in ALLOWED_PHARM_IDS])]
     pharm_choices = ph_df["Display"].tolist() if not ph_df.empty else ["—"]
 
-    status_opts = _sheet_df(TAB_STATUS, ["Value"])["Value"].tolist() if "TAB_STATUS" in globals() else ["Submitted","Approved","Rejected","Pending","RA Pending"]
-    prices = items_price_map() if "items_price_map" in globals() else {}
+    # row indices we render
+    rows = st.session_state.setdefault("_cp_rows", [0])
+    # "Add line" (outside any form is OK)
+    if st.button("+ Add item", key="cp_add"):
+        rows.append(max(rows) + 1 if rows else 0)
+        st.rerun()
 
-    with st.form("clinic_purchase_multirow", clear_on_submit=False):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            ph_display = st.selectbox("Pharmacy (ID - Name)*", pharm_choices, key="cp_pharmacy_display")
-        with c2:
-            d = st.date_input("Date*", value=date.today(), key="cp_date")
-        with c3:
-            emp = st.text_input("Emp Name*", key="cp_emp")
+    # quick helpers
+    def _pn(v, d=0.0):
+        try:
+            return float(v)
+        except Exception:
+            return d
 
-        # rows in session
-        if "_cp_rows" not in st.session_state:
-            st.session_state["_cp_rows"] = [{
-                "item":"",
-                "clinic_qty":0.0,
-                "sp_qty":0.0,
-                "sp_status":"Submitted",
-                "clinic_status":"Submitted",
-                "remark":"",
-                "util_qty":0.0,
-            }]
+    # form
+    with st.form("cp_form", clear_on_submit=False):
+        # header
+        st.markdown("### Clinic Purchase")
+        st.caption("Create / update entry")
 
-        rows = st.session_state["_cp_rows"]
+        st.selectbox("Pharmacy (ID - Name)*", pharm_choices, key="cp_pharmacy_display")
 
-        
+        # keep a date/employee at top
+        st.date_input("Date", value=st.session_state.get("cp_date") or date.today(), key="cp_date")
+        st.text_input("Employee", value=st.session_state.get("cp_emp", ""), key="cp_emp")
 
-        # Header row
-        st.markdown("**Clinic Employee**  →  **Next Employee (Received)**  →  **Clinic Employee (Status/Remark & Used)**")
-        for idx, r in enumerate(rows):
-            st.divider() if idx==0 else None
-            c1,c2,c3,c4,c5,c6,c7 = st.columns((3,1,1,1.4,1.4,2,1))
-            with c1:
-                item_keys = list(prices.keys())
-                default_idx = item_keys.index(r["item"]) if r["item"] in item_keys else (0 if item_keys else 0)
-                item = st.selectbox(f"Item {idx+1}", item_keys, index=default_idx if item_keys else 0, key=f"cp_item_{idx}")
-            with c2:
-                r["clinic_qty"] = st.number_input("Clinic Qty", min_value=0.0, step=1.0, format="%.2f", key=f"cp_cqty_{idx}")
-            with c3:
-                r["sp_qty"] = st.number_input("Received Qty", min_value=0.0, step=1.0, format="%.2f", key=f"cp_spqty_{idx}")
-            with c4:
-                r["sp_status"] = st.selectbox("Received Status", status_opts, index=(status_opts.index(r["sp_status"]) if r["sp_status"] in status_opts else 0), key=f"cp_spst_{idx}")
-            with c5:
-                r["clinic_status"] = st.selectbox("Clinic Status", status_opts, index=(status_opts.index(r["clinic_status"]) if r["clinic_status"] in status_opts else 0), key=f"cp_clst_{idx}")
-            with c6:
-                r["remark"] = st.text_input("Remark", value=r.get("remark",""), key=f"cp_rem_{idx}")
-            with c7:
-                r["util_qty"] = st.number_input("Used Qty", min_value=0.0, step=1.0, format="%.2f", key=f"cp_util_{idx}")
+        # per-line UI
+        for idx in list(rows):
+            with st.container(border=True):
+                c1, c2, c3, c4 = st.columns([3, 1.5, 1.5, 1.2])
+                with c1:
+                    item = st.selectbox(
+                        f"Item (#{idx+1})",
+                        [""] + sorted(price_map.keys()),
+                        index=0,
+                        key=f"cp_item_{idx}",
+                    )
+                    unit = float(price_map.get(item, 0.0))
+                    st.caption(f"Unit price: {unit:g}" if unit else "Unit price: –")
 
-            # second row with computed amounts and pending
-            u = float(prices.get(st.session_state.get(f"cp_item_{idx}", ""), 0.0) or 0.0)
-            clinic_val = float(st.session_state.get(f"cp_cqty_{idx}", 0.0)) * u
-            sp_val = float(st.session_state.get(f"cp_spqty_{idx}", 0.0)) * u
-            pending = float(st.session_state.get(f"cp_spqty_{idx}", 0.0)) - float(st.session_state.get(f"cp_util_{idx}", 0.0))
+                with c2:
+                    st.number_input("Clinic Qty", min_value=0.0, step=1.0, key=f"cp_cqty_{idx}")
+                    st.selectbox("Clinic Status", status_opts, key=f"cp_clst_{idx}")
+                with c3:
+                    st.number_input("Second Party Qty", min_value=0.0, step=1.0, key=f"cp_spqty_{idx}")
+                    st.selectbox("SP Status", status_opts, key=f"cp_spst_{idx}")
+                with c4:
+                    st.number_input("Utilization Qty", min_value=0.0, step=1.0, key=f"cp_util_{idx}")
+                    st.text_input("Remark", value=st.session_state.get(f"cp_rem_{idx}", ""), key=f"cp_rem_{idx}")
+                    # delete marker (checkbox is allowed inside forms)
+                    st.checkbox("Delete line", key=f"cp_del_{idx}")
 
-            cc1, cc2, cc3, cc4 = st.columns((2,2,2,2))
-            with cc1: st.write(f"**Unit Price:** {u:,.2f}")
-            with cc2: st.write(f"**Clinic Amount:** {clinic_val:,.2f}")
-            with cc3: st.write(f"**Received Amount:** {sp_val:,.2f}")
-            with cc4: st.write(f"**Pending (Rec - Used):** {pending:,.2f}")
+                # show computed values (disabled inputs)
+                c5, c6, c7 = st.columns(3)
+                cqty = _pn(st.session_state.get(f"cp_cqty_{idx}", 0))
+                spq  = _pn(st.session_state.get(f"cp_spqty_{idx}", 0))
+                util = _pn(st.session_state.get(f"cp_util_{idx}", 0))
+                with c5:
+                    st.number_input("Clinic Value", value=float(cqty * unit), disabled=True, key=f"cp_cval_ro_{idx}")
+                with c6:
+                    st.number_input("SP Value", value=float(spq * unit), disabled=True, key=f"cp_spval_ro_{idx}")
+                with c7:
+                    st.number_input("Util Value", value=float(util * unit), disabled=True, key=f"cp_uval_ro_{idx}")
 
-            # Remove row?
-            rc1, rc2 = st.columns([1,9])
-            with rc1:
-                if st.form_submit_button("🗑️", key=f"cp_del_{idx}") and len(rows)>1:
-                    st.session_state["_cp_delete_idx"] = idx
+        submitted = st.form_submit_button("Save", type="primary", use_container_width=True)
 
-        # AFTER (still inside the with st.form(...): block)
-        st.write("")
-        add, save = st.columns([1,6])
-        with add:
-            add_clicked = st.form_submit_button("+ Add item")
-        with save:
-            submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
-    
-        if add_clicked:
-            item_keys = list(prices.keys())
-            rows.append({
-                "item": item_keys[0] if item_keys else "",
-                "clinic_qty": 0.0,
-                "sp_qty": 0.0,
-                "sp_status": status_opts[0] if status_opts else "Submitted",
-                "clinic_status": status_opts[0] if status_opts else "Submitted",
-                "remark": "",
-                "util_qty": 0.0,
-            })
-            st.rerun()  # refresh to show the new row
-    
-    # Handle row delete after form submit of a delete button
-    del_idx = st.session_state.pop("_cp_delete_idx", None)
-    if del_idx is not None and isinstance(del_idx, int):
-        if 0 <= del_idx < len(st.session_state.get("_cp_rows", [])):
-            st.session_state["_cp_rows"].pop(del_idx)
+    # handle deletes (after submit)
+    # Note: no st.button inside the form. We act on checkboxes here.
+    to_delete = [i for i in rows if st.session_state.get(f"cp_del_{i}", False)]
+    if to_delete:
+        for i in to_delete:
+            for k in list(st.session_state.keys()):
+                if k.startswith(f"cp_item_{i}") or k.startswith(f"cp_cqty_{i}") or k.startswith(f"cp_spqty_{i}") \
+                   or k.startswith(f"cp_util_{i}") or k.startswith(f"cp_clst_{i}") or k.startswith(f"cp_spst_{i}") \
+                   or k.startswith(f"cp_rem_{i}"):
+                    st.session_state.pop(k, None)
+            if i in rows:
+                rows.remove(i)
         st.rerun()
 
     if not submitted:
         return
 
-    # Save each row as an entry in ClinicPurchase (one row per item)
-    ph_id, ph_name = ("","")
+    # validate pharmacy
     ph_disp = st.session_state.get("cp_pharmacy_display", "")
-    if " - " in ph_disp: ph_id, ph_name = ph_disp.split(" - ", 1)
+    if " - " not in ph_disp:
+        st.error("Please select a Pharmacy before submitting.")
+        return
+    ph_id, ph_name = [x.strip() for x in ph_disp.split(" - ", 1)]
+    if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"] and ph_id not in [str(x) for x in ALLOWED_PHARM_IDS]:
+        st.error("You are not allowed to submit for this pharmacy.")
+        return
 
-    _ensure_headers(TAB_CP, CP_HEADERS)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # build & append rows
+    now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    entered_by = st.session_state.get("username") or st.session_state.get("name") or ""
+    any_saved = False
 
-    for idx, _ in enumerate(st.session_state["_cp_rows"]):
-        item = st.session_state.get(f"cp_item_{idx}", "")
-        unit = float(prices.get(item, 0.0) or 0.0)
-        cqty = float(st.session_state.get(f"cp_cqty_{idx}", 0.0) or 0.0)
-        spq  = float(st.session_state.get(f"cp_spqty_{idx}", 0.0) or 0.0)
-        util = float(st.session_state.get(f"cp_util_{idx}", 0.0) or 0.0)
-        if not item or (cqty<=0 and spq<=0 and util<=0):
-            continue  # skip completely empty lines
+    for idx in list(rows):
+        item = str(st.session_state.get(f"cp_item_{idx}", "")).strip()
+        if not item:
+            continue
+        unit = float(price_map.get(item, 0.0))
+        cqty = _pn(st.session_state.get(f"cp_cqty_{idx}", 0))
+        spq  = _pn(st.session_state.get(f"cp_spqty_{idx}", 0))
+        util = _pn(st.session_state.get(f"cp_util_{idx}", 0))
+        if cqty <= 0 and spq <= 0 and util <= 0:
+            continue  # empty line
 
-        prev_opening_qty = _rt_opening_qty_for_item(item)
-        new_instock_qty = prev_opening_qty + spq - util
+        new_instock_qty = _rt_opening_qty_for_item(item) + spq - util
+
         row = [
-            now, (st.session_state.get("username") or st.session_state.get("name") or ""),
-            ph_id, ph_name,
+            now, entered_by,
             st.session_state.get("cp_date").strftime("%Y-%m-%d") if st.session_state.get("cp_date") else "",
-            st.session_state.get("cp_emp",""),
+            st.session_state.get("cp_emp", ""),
             item,
-            cqty, cqty*unit, st.session_state.get(f"cp_clst_{idx}", "Submitted"), "SecondParty",
+            # clinic band
+            cqty, cqty * unit, st.session_state.get(f"cp_clst_{idx}", "Submitted"), "SecondParty",
             st.session_state.get(f"cp_rem_{idx}", ""),
-            spq, spq*unit, st.session_state.get(f"cp_spst_{idx}", "Submitted"),
-            util, util*unit,
-            new_instock_qty, new_instock_qty*unit,
-            str(uuid.uuid4())
+            # SP band
+            st.session_state.get(f"cp_spst_{idx}", "Submitted"), spq, spq * unit,
+            # Utilization
+            util, util * unit,
+            # computed stock
+            new_instock_qty, new_instock_qty * unit,
         ]
-        _append_row(TAB_CP, [str(x) for x in row])
-        # Apply delta to OpeningStock (running balance)
-        _rt_update_opening_stock_delta(item, spq - util, unit)
 
-    st.success("Saved.")
-    return
+        _append_row(CLINIC_PURCHASE_SHEET, [str(x) for x in row])
+        _rt_update_opening_stock_delta(item, spq - util, unit)
+        any_saved = True
+
+    if any_saved:
+        st.success("Saved.")
+        # reset lines
+        st.session_state["_cp_rows"] = [0]
+        for k in [k for k in list(st.session_state.keys()) if k.startswith("cp_")]:
+            st.session_state.pop(k, None)
+    else:
+        st.info("Nothing to save (all lines were empty).")
 
 def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role: str):
     """
     Dynamic form renderer (fixed):
       - No st.button() inside forms (only st.form_submit_button)
-      - Does not return the form/DeltaGenerator (prevents docs printing)
+      - Does not return the form/DeltaGenerator (prevents docs being shown)
       - Handlers run outside the form block
     """
     # Fast routes
@@ -2025,7 +2035,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
     # Load schema rows
     sdf = schema_df()
     rows = (
-        sdf[(sdf["Module"] == module_name) & (sdf["ClientID"].isin([client_id, "DEFAULT", "ALL"]))]  # noqa: E501
+        sdf[(sdf["Module"] == module_name) & (sdf["ClientID"].isin([client_id, "DEFAULT", "ALL"]))]
         .sort_values("Order")
     )
     if rows.empty:
@@ -2033,7 +2043,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
         schema_df.clear()
         sdf = schema_df()
         rows = (
-            sdf[(sdf["Module"] == module_name) & (sdf["ClientID"].isin([client_id, "DEFAULT", "ALL"]))]  # noqa: E501
+            sdf[(sdf["Module"] == module_name) & (sdf["ClientID"].isin([client_id, "DEFAULT", "ALL"]))]
             .sort_values("Order")
         )
         if rows.empty:
@@ -2053,14 +2063,14 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
 
         with frame:
             with st.form(f"dyn_form_{module_name}", clear_on_submit=True):
-                # --- Common pharmacy picker at the top (still inside the form) ---
+                # Pharmacy selector at the top
                 ph_df = pharm_master()
                 if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"]:
                     ph_df = ph_df[ph_df["ID"].isin(ALLOWED_PHARM_IDS)]
                 pharm_choices = ph_df["Display"].tolist() if not ph_df.empty else ["—"]
                 st.selectbox("Pharmacy (ID - Name)*", pharm_choices, key=f"{module_name}_pharmacy_display")
 
-                # Keep module + selected pharmacy id in state
+                # Remember module + pharmacy id in session
                 st.session_state["_current_module"] = module_name
                 ph_disp = st.session_state.get(f"{module_name}_pharmacy_display", "")
                 st.session_state["_current_pharmacy_id"] = ph_disp.split(" - ", 1)[0].strip() if " - " in ph_disp else ""
@@ -2068,7 +2078,7 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                 cols = st.columns(3, gap="large")
                 values = {}
 
-                # ----- Render fields from FormSchema (INSIDE THE FORM) -----
+                # ----- Render all fields from FormSchema (INSIDE THE FORM) -----
                 for i, (_, r) in enumerate(rows.iterrows()):
                     if not _role_visible(r["RoleVisibility"], role):
                         continue
@@ -2081,69 +2091,72 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
                     opts     = _options_from_token(r["Options"])
                     readonly = _is_readonly(r.get("ReadOnlyRoles", ""), role)
 
-                    # Clinic Purchase fields are editable in the unified UI only
-                    if str(module_name).strip() == CLINIC_PURCHASE_MODULE_KEY and fkey in {"clinic_value","sp_value","util_value"}:
-                        readonly = False
-
-                    widget_key = f"{module_name}_{fkey}"
-                    label_req  = label + ("*" if required else "")
-                    target     = cols[i % 3]
+                    # Clinic Purchase values are editable only in unified UI; keep RO here
+                    key       = f"{module_name}_{fkey}"
+                    label_req = label + ("*" if required else "")
+                    target    = cols[i % 3]
 
                     with target:
                         if readonly:
-                            # Show disabled input but capture the value in 'values'
+                            # render disabled controls but still capture a value
                             if typ in ("integer", "int") or _is_int_field(fkey):
                                 try:
                                     dv = int(float(default)) if str(default).strip() else 0
                                 except Exception:
                                     dv = 0
-                                st.number_input(label_req, value=int(dv), step=1, min_value=0, key=widget_key+"_ro", disabled=True)
+                                st.number_input(label_req, value=int(dv), step=1, min_value=0, key=key+"_ro", disabled=True)
                                 values[fkey] = dv
-                            elif typ in ("phone", "tel") or _is_phone_field(fkey):
-                                st.text_input(label_req, value=str(default or ""), key=widget_key+"_ro", disabled=True)
-                                values[fkey] = str(default or "")
                             elif typ == "number":
                                 try:
                                     dv = float(default) if str(default).strip() else 0.0
                                 except Exception:
                                     dv = 0.0
-                                st.number_input(label_req, value=float(dv), key=widget_key+"_ro", disabled=True)
+                                st.number_input(label_req, value=float(dv), key=key+"_ro", disabled=True)
                                 values[fkey] = dv
                             elif typ == "date":
                                 d = parse_date(default)
-                                st.date_input(label_req, value=(d.date() if pd.notna(d) else date.today()), key=widget_key+"_ro", disabled=True)
+                                st.date_input(label_req, value=(d.date() if pd.notna(d) else date.today()), key=key+"_ro", disabled=True)
                                 values[fkey] = format_date(d) if pd.notna(d) else ""
+                            elif typ in ("phone", "tel") or _is_phone_field(fkey):
+                                st.text_input(label_req, value=str(default or ""), key=key+"_ro", disabled=True)
+                                values[fkey] = str(default or "")
                             else:
-                                st.text_input(label_req, value=str(default or ""), key=widget_key+"_ro", disabled=True)
+                                st.text_input(label_req, value=str(default or ""), key=key+"_ro", disabled=True)
                                 values[fkey] = str(default or "")
                             continue
 
-                        # Editable inputs
+                        # editable widgets
                         if typ in ("integer", "int") or _is_int_field(fkey):
                             try:
                                 dv = int(float(default)) if str(default).strip() else 0
                             except Exception:
                                 dv = 0
-                            values[fkey] = st.number_input(label_req, value=int(dv), step=1, key=widget_key)
+                            values[fkey] = st.number_input(label_req, value=int(dv), step=1, key=key)
 
                         elif typ == "number":
                             try:
                                 dv = float(default) if str(default).strip() else 0.0
                             except Exception:
                                 dv = 0.0
-                            values[fkey] = st.number_input(label_req, value=float(dv), key=widget_key)
+                            values[fkey] = st.number_input(label_req, value=float(dv), key=key)
 
                         elif typ == "date":
                             d = parse_date(default)
-                            values[fkey] = st.date_input(label_req, value=(d.date() if pd.notna(d) else date.today()), key=widget_key)
+                            values[fkey] = st.date_input(label_req, value=(d.date() if pd.notna(d) else date.today()), key=key)
 
                         elif typ == "select":
-                            # Avoid raw key "type" conflicts in session_state
-                            wkey = widget_key if fkey != "type" else f"{module_name}_submission_type"
+                            wkey = f"{module_name}_{fkey}"
+                            if fkey == "type":  # avoid using raw "type" as a key
+                                wkey = f"{module_name}_submission_type"
+
                             if wkey not in st.session_state:
-                                if default and default in opts: st.session_state[wkey] = default
-                                elif opts:                      st.session_state[wkey] = opts[0]
-                                else:                           st.session_state[wkey] = ""
+                                if default and default in opts:
+                                    st.session_state[wkey] = default
+                                elif opts:
+                                    st.session_state[wkey] = opts[0]
+                                else:
+                                    st.session_state[wkey] = ""
+
                             values[fkey] = st.selectbox(
                                 label_req,
                                 opts,
@@ -2153,63 +2166,52 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
 
                         elif typ == "multiselect":
                             defaults = [o for o in opts if o in str(default or "").split(",")]
-                            values[fkey] = st.multiselect(label_req, opts, default=defaults, key=widget_key)
+                            values[fkey] = st.multiselect(label_req, opts, default=defaults, key=key)
 
                         elif typ in ("phone", "tel") or _is_phone_field(fkey):
-                            values[fkey] = st.text_input(label_req, value=str(default or ""), key=widget_key)
+                            values[fkey] = st.text_input(label_req, value=str(default or ""), key=key)
 
                         elif typ == "textarea":
-                            values[fkey] = st.text_area(label_req, value=str(default or ""), key=widget_key)
+                            values[fkey] = st.text_area(label_req, value=str(default or ""), key=key)
 
                         else:
-                            values[fkey] = st.text_input(label_req, value=str(default or ""), key=widget_key)
+                            values[fkey] = st.text_input(label_req, value=str(default or ""), key=key)
 
-                # Submit widgets (STAY inside the form)
-                allow_dup_key = f"{module_name}_dup_override"
-                st.checkbox("Allow duplicate override", key=allow_dup_key)
+                # duplicate override (inside the form is fine)
+                dup_override_key = f"{module_name}_dup_override"
+                st.checkbox("Allow duplicate override", key=dup_override_key)
                 submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
-
-    # Handle post-submit actions OUTSIDE the form
-    del_idx = st.session_state.pop("_cp_delete_idx", None)
-    if del_idx is not None and isinstance(del_idx, int):
-        if 0 <= del_idx < len(st.session_state.get("_cp_rows", [])):
-            st.session_state["_cp_rows"].pop(del_idx)
-        st.rerun()
 
     if not submitted:
         return
 
-    # Pharmacy required
+    # require pharmacy
     ph_disp = st.session_state.get(f"{module_name}_pharmacy_display", "")
     if " - " not in ph_disp:
         st.error("Please select a Pharmacy before submitting.")
         return
+    ph_id, ph_name = [x.strip() for x in ph_disp.split(" - ", 1)]
+    if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"] and ph_id not in [str(x) for x in ALLOWED_PHARM_IDS]:
+        st.error("You are not allowed to submit for this pharmacy.")
+        return
 
-    # In case "type" was namespaced above
+    # make sure values["type"] reflects select widget (namespaced)
     values["type"] = st.session_state.get(f"{module_name}_submission_type", values.get("type", ""))
 
-    # Required field check
+    # validate required fields
     missing = []
     for _, r in rows.iterrows():
         if not _role_visible(r["RoleVisibility"], role):
             continue
         if bool(r["Required"]):
-            val = values.get(r["FieldKey"])
-            if (isinstance(val, str) and not val.strip()) or val is None or (isinstance(val, list) and not val):
+            v = values.get(r["FieldKey"])
+            if v is None or (isinstance(v, str) and not v.strip()) or (isinstance(v, list) and not v):
                 missing.append(r["Label"])
     if missing:
         st.error("Missing required fields: " + ", ".join(missing))
         return
 
-    # ACL check for the chosen pharmacy
-    ph_id, ph_name = "", ""
-    if " - " in ph_disp:
-        ph_id, ph_name = [x.strip() for x in ph_disp.split(" - ", 1)]
-    if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"] and ph_id not in ALLOWED_PHARM_IDS:
-        st.error("You are not allowed to submit for this pharmacy.")
-        return
-
-    # Build & ensure headers
+    # ensure headers on target sheet
     meta = ["Timestamp","SubmittedBy","Role","ClientID","PharmacyID","PharmacyName","Module","RecordID"]
     save_map = {r["FieldKey"]: (r["SaveTo"] or r["FieldKey"]) for _, r in rows.iterrows()
                 if _role_visible(r["RoleVisibility"], role)}
@@ -2222,12 +2224,12 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
         retry(lambda: wsx.update("A1", [merged]))
         target_headers = merged
 
-    # Row values
+    # build row for save
     data_map = {
         "Timestamp": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-        "SubmittedBy": (username or name),
+        "SubmittedBy": (st.session_state.get("username") or st.session_state.get("name") or ""),
         "Role": role,
-        "ClientID": CLIENT_ID,
+        "ClientID": client_id,
         "PharmacyID": ph_id,
         "PharmacyName": ph_name,
         "Module": module_name,
@@ -2237,12 +2239,14 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
 
     for fk, col in save_map.items():
         val = values.get(fk)
-        if isinstance(val, (date, datetime)): val = format_date(val)
-        if isinstance(val, list):             val = ", ".join([str(x) for x in val])
-        if isinstance(val, float) and fk in {"net_amount","patient_share","clinic_value","sp_value","util_value"}:
+        if isinstance(val, (date, datetime)):
+            val = format_date(val)
+        if isinstance(val, list):
+            val = ", ".join([str(x) for x in val])
+        if isinstance(val, float) and fk in {"net_amount","patient_share"}:
             try: val = f"{float(val):.2f}"
             except Exception: pass
-        if typ_map.get(fk) in ("integer","int") or _is_int_field(fk):
+        if typ_map.get(fk) in ("integer", "int") or _is_int_field(fk):
             if str(val).strip() != "":
                 try: val = str(int(float(val)))
                 except Exception: val = ""
@@ -2251,18 +2255,18 @@ def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role
             val = f"'{phone}" if phone else ""
         data_map[col] = val
 
-    # Duplicate check (respects override + superadmin)
+    # duplicate check
     try:
         if _check_duplicate_if_needed(sheet_name, module_name, data_map):
-            allow_override = st.session_state.get(allow_dup_key, False)
-            is_super = str(role).strip().lower() in ("super admin", "superadmin")
-            if not (allow_override or is_super):
+            allow_override = st.session_state.get(f"{module_name}_dup_override", False)
+            is_superadmin = str(role).strip().lower() in ("super admin","superadmin")
+            if not (allow_override or is_superadmin):
                 st.warning("Possible duplicate detected. Tick 'Allow duplicate override' or ask Super Admin.")
                 return
     except Exception as e:
         st.info(f"Duplicate check skipped: {e}")
 
-    # Save
+    # save
     for k in list(data_map.keys()):
         if isinstance(data_map[k], str):
             data_map[k] = _sanitize_cell(data_map[k])
