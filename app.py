@@ -1415,12 +1415,20 @@ def _load_for_editor(title: str, headers: list[str]) -> pd.DataFrame:
         df["Order"] = pd.to_numeric(df["Order"], errors="coerce").fillna(0).astype(int)
     return df
 
-def _data_editor(df: pd.DataFrame, key: str, column_config: dict | None = None, help_text: str = "", height: int | None = None):
+def _data_editor(df, key, column_config=None, help_text: str = "", height: int | None = None):
+    # Build kwargs so we don't pass an invalid height
+    editor_kwargs = dict(
+        key=key,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        column_config=(column_config or {})
+    )
+    if isinstance(height, int) and height > 0:
+        editor_kwargs["height"] = height
+
     try:
-        return st.data_editor(
-            df, key=key, num_rows="dynamic", use_container_width=True, hide_index=True,
-            column_config=column_config or {}, height=height
-        )
+        return st.data_editor(df, **editor_kwargs)
     finally:
         if help_text:
             st.caption(help_text)
