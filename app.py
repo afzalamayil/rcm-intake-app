@@ -1326,16 +1326,26 @@ def _sheet_title_to_table(title: str) -> str:
     t = re.sub(r"_{2,}", "_", t).strip("_") # collapse __
     return t
 
+def _engine():
+    # always read a fresh DSN; pool_pre_ping avoids stale sockets
+    dsn = st.secrets["postgres"]["url"]
+    return create_engine(dsn, pool_pre_ping=True)
+
 def _table_exists(table: str) -> bool:
-    eng = _get_engine()
-    q = text("""
-        SELECT EXISTS (
-          SELECT FROM information_schema.tables
-          WHERE table_schema = 'public' AND table_name = :t
-        )
-    """)
-    with eng.connect() as con:
-        return bool(con.execute(q, {"t": table}).scalar())
+    try:
+        eng = _engine()
+        with eng.connect() as con:
+            return bool(con.execute(
+                text("select to_regclass(:t) is not null"),
+                {"t": table}
+            ).scalar())
+    except OperationalError as e:
+        # show the real driver error so we know if it's bad password / SSL / host, etc.
+        st.error(f"DB connect failed: {getattr(e, 'orig', e)}")
+        raise
+    except SQLAlchemyError as e:
+        st.error(f"SQLAlchemy error: {e}")
+        raise
 
 def pg_read_sheet_df(title: str, required_headers=None) -> pd.DataFrame:
     """
