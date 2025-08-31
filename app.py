@@ -378,6 +378,12 @@ SMTP = st.secrets.get("smtp", {})
 GS    = st.secrets.get("gsheets", {})
 UI_BRAND = st.secrets.get("ui", {}).get("brand", "")
 
+SUPER_ADMINS = {
+    x.strip().lower()
+    for x in (auth.get("super_admins", "").split(","))
+    if x.strip()
+}
+
 with st.sidebar:
     if os.path.exists(LOGO_PATH):
         st.image(LOGO_PATH, use_container_width=True)
@@ -456,7 +462,8 @@ else:
 
 # Robust reader: ALWAYS returns a DataFrame with the requested headers (even when sheet is empty/missing)
 def read_sheet_df(title: str, required_headers: list[str] | None = None) -> pd.DataFrame:
-    vals = retry(lambda: ws(title).get_all_values())
+    if USE_POSTGRES:
+        return pg_read_sheet_df(title, required_headers)    vals = retry(lambda: ws(title).get_all_values())
     if not vals:
         if required_headers:
             retry(lambda: ws(title).update("A1", [required_headers]))
@@ -1269,6 +1276,8 @@ def _to_bool_series(s):
 
 def _save_whole_sheet(sheet_title: str, df: pd.DataFrame, headers: list[str]):
     """Writes df back to the sheet with exactly the provided headers (sheet is replaced)."""
+    if USE_POSTGRES:
+        return pg_save_whole_sheet(sheet_title, df, headers) 
     if df is None:
         st.error("Nothing to save."); return False
     # Ensure all headers exist
