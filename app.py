@@ -1859,75 +1859,91 @@ def _rt_update_opening_stock_delta(item_name: str, delta_qty: float, unit_price:
 def _render_clinic_purchase_unified():
     """
     Clinic Purchase unified intake (multi-row), safe for Streamlit forms:
-      - No st.button() inside the form (uses only st.form_submit_button)
+      - No st.button() inside the form (only st.form_submit_button)
       - Never returns/prints a DeltaGenerator
       - Computes values from MS:Items price list
       - Updates OpeningStock running balance
     """
-    # masters
+    # ── Masters ────────────────────────────────────────────────────────────────
     price_map = _clinic_items_price_map()  # {item_name: unit_price}
     status_df = read_sheet_df(MS_STATUS, ["Value"]).fillna("")
     status_opts = [str(x) for x in status_df["Value"].tolist() if str(x).strip()] or ["Submitted"]
 
-    # pharmacy picker (outside the form is fine too, but we keep it in-form for one-shot submit)
     ph_df = pharm_master()
     if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"]:
         ph_df = ph_df[ph_df["ID"].astype(str).isin([str(x) for x in ALLOWED_PHARM_IDS])]
     pharm_choices = ph_df["Display"].tolist() if not ph_df.empty else ["—"]
 
-    # row indices we render
+    # Target sheet name (support both constants you’ve used in this repo)
+    CP_SHEET = (globals().get("CLINIC_PURCHASE_SHEET")
+                or globals().get("TAB_CP")
+                or "Clinic Purchase")
+
+    # ── Row indices we render (live in session) ───────────────────────────────
     rows = st.session_state.setdefault("_cp_rows", [0])
-    # "Add line" (outside any form is OK)
+
+    # NOTE: The “Add item” button is intentionally OUTSIDE the form
+    # so it’s allowed by Streamlit’s form rules.
     if st.button("+ Add item", key="cp_add"):
         rows.append(max(rows) + 1 if rows else 0)
         st.rerun()
 
-    # quick helpers
+    # Small helper for safe floats
     def _pn(v, d=0.0):
         try:
             return float(v)
         except Exception:
             return d
 
-    # form
+    # ── The form (only form_submit_button inside) ─────────────────────────────
     with st.form("cp_form", clear_on_submit=False):
-        # header
         st.markdown("### Clinic Purchase")
         st.caption("Create / update entry")
 
+        # Header controls
         st.selectbox("Pharmacy (ID - Name)*", pharm_choices, key="cp_pharmacy_display")
-
-        # keep a date/employee at top
         st.date_input("Date", value=st.session_state.get("cp_date") or date.today(), key="cp_date")
         st.text_input("Employee", value=st.session_state.get("cp_emp", ""), key="cp_emp")
 
-        # per-line UI
+        # Per-line UI
         for idx in list(rows):
-            with st.container(border=True):
+            # (border=...) is available on newer Streamlit; ignore if not
+            try:
+                line_box = st.container(border=True)
+            except TypeError:
+                line_box = st.container()
+
+            with line_box:
                 c1, c2, c3, c4 = st.columns([3, 1.5, 1.5, 1.2])
+
+                # ── Item & unit price
                 with c1:
+                    # Avoid the old “(# …)” label which triggers TypeError on some builds
                     item = st.selectbox(
-                        f"Item (#{idx+1})",
-                        [""] + sorted(price_map.keys()),
+                        f"Item {idx+1}",
+                        [""] + sorted(list(price_map.keys())),
                         index=0,
                         key=f"cp_item_{idx}",
                     )
                     unit = float(price_map.get(item, 0.0))
                     st.caption(f"Unit price: {unit:g}" if unit else "Unit price: –")
 
+                # ── Quantities & statuses
                 with c2:
                     st.number_input("Clinic Qty", min_value=0.0, step=1.0, key=f"cp_cqty_{idx}")
                     st.selectbox("Clinic Status", status_opts, key=f"cp_clst_{idx}")
+
                 with c3:
                     st.number_input("Second Party Qty", min_value=0.0, step=1.0, key=f"cp_spqty_{idx}")
                     st.selectbox("SP Status", status_opts, key=f"cp_spst_{idx}")
+
                 with c4:
                     st.number_input("Utilization Qty", min_value=0.0, step=1.0, key=f"cp_util_{idx}")
                     st.text_input("Remark", value=st.session_state.get(f"cp_rem_{idx}", ""), key=f"cp_rem_{idx}")
-                    # delete marker (checkbox is allowed inside forms)
+                    # Delete marker (checkbox is allowed inside forms)
                     st.checkbox("Delete line", key=f"cp_del_{idx}")
 
-                # show computed values (disabled inputs)
+                # ── Computed values (disabled inputs, for clarity)
                 c5, c6, c7 = st.columns(3)
                 cqty = _pn(st.session_state.get(f"cp_cqty_{idx}", 0))
                 spq  = _pn(st.session_state.get(f"cp_spqty_{idx}", 0))
@@ -1939,17 +1955,18 @@ def _render_clinic_purchase_unified():
                 with c7:
                     st.number_input("Util Value", value=float(util * unit), disabled=True, key=f"cp_uval_ro_{idx}")
 
+        # The one/only control that submits the form:
         submitted = st.form_submit_button("Save", type="primary", use_container_width=True)
 
-    # handle deletes (after submit)
-    # Note: no st.button inside the form. We act on checkboxes here.
+    # ── Handle deletes (after the form context) ───────────────────────────────
     to_delete = [i for i in rows if st.session_state.get(f"cp_del_{i}", False)]
     if to_delete:
         for i in to_delete:
             for k in list(st.session_state.keys()):
-                if k.startswith(f"cp_item_{i}") or k.startswith(f"cp_cqty_{i}") or k.startswith(f"cp_spqty_{i}") \
-                   or k.startswith(f"cp_util_{i}") or k.startswith(f"cp_clst_{i}") or k.startswith(f"cp_spst_{i}") \
-                   or k.startswith(f"cp_rem_{i}"):
+                if (k.startswith(f"cp_item_{i}") or k.startswith(f"cp_cqty_{i}") or
+                    k.startswith(f"cp_spqty_{i}") or k.startswith(f"cp_util_{i}") or
+                    k.startswith(f"cp_clst_{i}") or k.startswith(f"cp_spst_{i}") or
+                    k.startswith(f"cp_rem_{i}")):
                     st.session_state.pop(k, None)
             if i in rows:
                 rows.remove(i)
@@ -1958,7 +1975,7 @@ def _render_clinic_purchase_unified():
     if not submitted:
         return
 
-    # validate pharmacy
+    # ── Validation & ACL ──────────────────────────────────────────────────────
     ph_disp = st.session_state.get("cp_pharmacy_display", "")
     if " - " not in ph_disp:
         st.error("Please select a Pharmacy before submitting.")
@@ -1968,7 +1985,7 @@ def _render_clinic_purchase_unified():
         st.error("You are not allowed to submit for this pharmacy.")
         return
 
-    # build & append rows
+    # ── Build rows & append to sheet; update opening-stock delta ──────────────
     now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     entered_by = st.session_state.get("username") or st.session_state.get("name") or ""
     any_saved = False
@@ -2002,7 +2019,7 @@ def _render_clinic_purchase_unified():
             new_instock_qty, new_instock_qty * unit,
         ]
 
-        _append_row(CLINIC_PURCHASE_SHEET, [str(x) for x in row])
+        _append_row(CP_SHEET, [str(x) for x in row])
         _rt_update_opening_stock_delta(item, spq - util, unit)
         any_saved = True
 
