@@ -2001,6 +2001,7 @@ def _render_clinic_purchase_unified():
         _rt_update_opening_stock_delta(item, spq - util, unit)
 
     st.success("Saved.")
+        return
 
 def _render_dynamic_form(module_name: str, sheet_name: str, client_id: str, role: str):
     """
