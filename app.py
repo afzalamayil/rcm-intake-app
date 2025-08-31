@@ -1859,13 +1859,12 @@ def _rt_update_opening_stock_delta(item_name: str, delta_qty: float, unit_price:
 def _render_clinic_purchase_unified():
     """
     Clinic Purchase unified intake (multi-row):
-      - Bulk add multiple items at once
+      - Single add + bulk add outside the form
+      - Unique keys for every widget (no duplicate-key crashes)
       - Heals stale _cp_rows from older builds
-      - Only st.form_submit_button() inside the form
-      - Never returns/prints a DeltaGenerator
       - Computes values from MS:Items and updates OpeningStock
     """
-    # ── Masters ────────────────────────────────────────────────────────────────
+    # ── Masters ───────────────────────────────────────────────────────────────
     price_map = _clinic_items_price_map()  # {item_name: unit_price}
     status_df = read_sheet_df(MS_STATUS, ["Value"]).fillna("")
     status_opts = [str(x) for x in status_df["Value"].tolist() if str(x).strip()] or ["Submitted"]
@@ -1879,9 +1878,7 @@ def _render_clinic_purchase_unified():
                 or globals().get("TAB_CP")
                 or "Clinic Purchase")
 
-    # ── Heal/normalize _cp_rows from older versions ────────────────────────────
-    raw_rows = st.session_state.get("_cp_rows", [0])
-
+    # ── Heal/normalize _cp_rows from older versions ───────────────────────────
     def _coerce_indices(obj):
         out = []
         try:
@@ -1889,93 +1886,36 @@ def _render_clinic_purchase_unified():
                 try:
                     out.append(int(x))  # ints/str-ints → int
                 except Exception:
-                    # ignore dicts/others from old builds
-                    pass
+                    pass  # ignore dicts/others from old builds
         except Exception:
             pass
         return out or [0]
 
-    if not isinstance(raw_rows, list) or any(isinstance(x, dict) for x in raw_rows):
-        st.session_state["_cp_rows"] = [0]
-    else:
-        st.session_state["_cp_rows"] = _coerce_indices(raw_rows)
-
+    st.session_state["_cp_rows"] = _coerce_indices(st.session_state.get("_cp_rows", [0]))
     rows = st.session_state["_cp_rows"]
 
-    # Small helper for safe floats
     def _pn(v, d=0.0):
         try:
             return float(v)
         except Exception:
             return d
 
-    # ── SINGLE add (one blank line) — OUTSIDE the form ────────────────────────
+    # ── Add controls (outside the form; unique keys) ─────────────────────────
     top_left, top_right = st.columns([1, 3])
-    with top_left:
-        if st.button("+ Add item", key="cp_add_one"):
-            ints = _coerce_indices(st.session_state.get("_cp_rows", [0]))
-            nxt = (max(ints) if ints else 0) + 1
-            st.session_state["_cp_rows"] = ints + [nxt]
-            st.rerun()
 
-    # ── BULK add multiple items at once — OUTSIDE the form ────────────────────
-    with top_right.expander("Add multiple items", expanded=False):
-        all_items = sorted(list(price_map.keys()))
-        sel_items = st.multiselect("Select items", all_items, key="cp_bulk_items")
-        copies    = st.number_input("Rows per item", 1, 20, 1, step=1, key="cp_bulk_copies")
-        if st.button("Add selected items", key="cp_bulk_add"):
-            ints = _coerce_indices(st.session_state.get("_cp_rows", [0]))
-            next_idx = (max(ints) + 1) if ints else 0
-            # add rows and prefill item for each
-            for it in sel_items:
-                for _ in range(int(copies)):
-                    idx = next_idx
-                    next_idx += 1
-                    ints.append(idx)
-                    st.session_state[f"cp_item_{idx}"] = it
-                    st.session_state[f"cp_cqty_{idx}"] = 0.0
-                    st.session_state[f"cp_spqty_{idx}"] = 0.0
-                    st.session_state[f"cp_util_{idx}"] = 0.0
-                    st.session_state[f"cp_clst_{idx}"] = status_opts[0]
-                    st.session_state[f"cp_spst_{idx}"] = status_opts[0]
-                    st.session_state[f"cp_rem_{idx}"]  = ""
-            st.session_state["_cp_rows"] = ints
-            st.rerun()
-    
-    # --- Add controls (outside the form; allowed) ---
-    # helper to keep row indices contiguous ints
-    def _cp_coerce_indices(obj):
-        out = []
-        try:
-            for x in list(obj) if isinstance(obj, (list, tuple)) else []:
-                try:
-                    out.append(int(x))
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        return out or [0]
-    
-    st.session_state["_cp_rows"] = _cp_coerce_indices(st.session_state.get("_cp_rows", [0]))
-    rows = st.session_state["_cp_rows"]
-    
-    top_left, top_right = st.columns([1, 3])
-    
-    # Single add
     with top_left:
-        if st.button("➕ Add item", key="cp_add_one"):
-            ints = _cp_coerce_indices(st.session_state.get("_cp_rows", [0]))
+        if st.button("➕ Add item", key="cp_add_top"):
+            ints = _coerce_indices(st.session_state.get("_cp_rows", [0]))
             nxt = (max(ints) if ints else -1) + 1
             st.session_state["_cp_rows"] = ints + [nxt]
             st.rerun()
-    
-    # Bulk add
+
     with top_right.expander("Add multiple items", expanded=False):
         all_items = sorted(list(price_map.keys()))
         sel_items = st.multiselect("Select items", all_items, key="cp_bulk_items")
         copies    = st.number_input("Rows per item", 1, 20, 1, step=1, key="cp_bulk_copies")
         if st.button("Add selected items", key="cp_bulk_add"):
-            ints = _cp_coerce_indices(st.session_state.get("_cp_rows", [0]))
+            ints = _coerce_indices(st.session_state.get("_cp_rows", [0]))
             next_idx = (max(ints) if ints else -1) + 1
             for it in sel_items:
                 for _ in range(int(copies)):
@@ -1998,14 +1938,11 @@ def _render_clinic_purchase_unified():
         st.markdown("### Clinic Purchase")
         st.caption("Create / update entry")
 
-        # Header controls
         st.selectbox("Pharmacy (ID - Name)*", pharm_choices, key="cp_pharmacy_display")
         st.date_input("Date", value=st.session_state.get("cp_date") or date.today(), key="cp_date")
         st.text_input("Employee", value=st.session_state.get("cp_emp", ""), key="cp_emp")
 
-        # Per-line UI
         for idx in list(rows):
-            # robust line number (handles string indices too)
             try:
                 line_no = int(idx) + 1
             except Exception:
@@ -2017,10 +1954,8 @@ def _render_clinic_purchase_unified():
                 box = st.container()
 
             with box:
-                # Layout: Item | Clinic (Qty/Status) | SP (Qty/Status) | Util+Remark
                 c1, c2, c3, c4 = st.columns([3, 1.7, 1.7, 2])
 
-                # Item + unit price
                 with c1:
                     item = st.selectbox(
                         f"Item {line_no}",
@@ -2031,30 +1966,24 @@ def _render_clinic_purchase_unified():
                     unit = float(price_map.get(item, 0.0))
                     st.caption(f"Unit price: {unit:g}" if unit else "Unit price: –")
 
-                # Clinic band
                 with c2:
                     st.number_input("Clinic Qty", min_value=0.0, step=1.0, key=f"cp_cqty_{idx}")
                     st.selectbox("Clinic Status", status_opts, key=f"cp_clst_{idx}")
 
-                # Second Party band (Received)
                 with c3:
                     st.number_input("Received Qty", min_value=0.0, step=1.0, key=f"cp_spqty_{idx}")
                     st.selectbox("Received Status", status_opts, key=f"cp_spst_{idx}")
 
-                # Utilization + remark
                 with c4:
                     st.number_input("Used Qty", min_value=0.0, step=1.0, key=f"cp_util_{idx}")
                     st.text_input("Remark", value=st.session_state.get(f"cp_rem_{idx}", ""), key=f"cp_rem_{idx}")
-                    # mark for delete (checkbox inside form is allowed)
-                    st.checkbox("Delete line", key=f"cp_del_{idx}")
+                    st.checkbox("Delete line", key=f"cp_del_{idx}")  # ok inside form
 
-                # Computed values row: Amounts + Pending
                 c5, c6, c7, c8 = st.columns([1.2, 1.2, 1.2, 1.2])
                 cqty = _pn(st.session_state.get(f"cp_cqty_{idx}", 0))
                 spq  = _pn(st.session_state.get(f"cp_spqty_{idx}", 0))
                 util = _pn(st.session_state.get(f"cp_util_{idx}", 0))
                 pending_qty = spq - util
-
                 with c5:
                     st.number_input("Clinic Amount", value=float(cqty * unit), disabled=True, key=f"cp_cval_ro_{idx}")
                 with c6:
@@ -2064,17 +1993,16 @@ def _render_clinic_purchase_unified():
                 with c8:
                     st.number_input("Pending (Rec-Used)", value=float(pending_qty), disabled=True, key=f"cp_pending_ro_{idx}")
 
-        # The one/only submit control INSIDE the form
         submitted = st.form_submit_button("Save", type="primary", use_container_width=True)
 
-    # --- Bottom add controls (outside the form) ---
+    # Bottom add (outside the form; unique key)
     if st.button("➕ Add another item", key="cp_add_bottom"):
-        ints = _cp_coerce_indices(st.session_state.get("_cp_rows", [0]))
+        ints = _coerce_indices(st.session_state.get("_cp_rows", [0]))
         nxt = (max(ints) if ints else -1) + 1
         st.session_state["_cp_rows"] = ints + [nxt]
         st.rerun()
 
-    # ── Handle deletes (after the form) ────────────────────────────────────────
+    # Handle deletes after the form
     to_delete = [i for i in list(st.session_state["_cp_rows"]) if st.session_state.get(f"cp_del_{i}", False)]
     if to_delete:
         for i in to_delete:
@@ -2093,7 +2021,7 @@ def _render_clinic_purchase_unified():
     if not submitted:
         return
 
-    # ── Validate pharmacy & ACL ────────────────────────────────────────────────
+    # Validate pharmacy & ACL
     ph_disp = st.session_state.get("cp_pharmacy_display", "")
     if " - " not in ph_disp:
         st.error("Please select a Pharmacy before submitting."); return
@@ -2101,7 +2029,7 @@ def _render_clinic_purchase_unified():
     if ALLOWED_PHARM_IDS and ALLOWED_PHARM_IDS != ["ALL"] and ph_id not in [str(x) for x in ALLOWED_PHARM_IDS]:
         st.error("You are not allowed to submit for this pharmacy."); return
 
-    # ── Append rows + update opening stock ─────────────────────────────────────
+    # Append rows + update opening stock
     now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     entered_by = st.session_state.get("username") or st.session_state.get("name") or ""
     any_saved = False
