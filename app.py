@@ -463,7 +463,8 @@ else:
 # Robust reader: ALWAYS returns a DataFrame with the requested headers (even when sheet is empty/missing)
 def read_sheet_df(title: str, required_headers: list[str] | None = None) -> pd.DataFrame:
     if USE_POSTGRES:
-        return pg_read_sheet_df(title, required_headers)    vals = retry(lambda: ws(title).get_all_values())
+        return pg_read_sheet_df(title, required_headers)
+        vals = retry(lambda: ws(title).get_all_values())
     if not vals:
         if required_headers:
             retry(lambda: ws(title).update("A1", [required_headers]))
