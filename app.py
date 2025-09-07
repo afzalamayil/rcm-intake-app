@@ -85,8 +85,6 @@ def retry(fn, tries: int = 3, delay: float = 0.3):
 # ADMIN UTILITIES (Cloud)
 # =========================
 from sqlalchemy import text
-from pg_adapter import save_whole_sheet as pg_save_whole_sheet
-from pg_adapter import _get_engine  # used by the health check
 
 def run_cloud_migration_ui():
     import re, pandas as pd, gspread, time
